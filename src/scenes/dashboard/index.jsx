@@ -32,11 +32,11 @@ const AnnotatedMachineImage = ({ colorMap, gateData }) => {
         style={{
           position: 'absolute',
           top: '53%',
-          left: '50%',
+          left: '52%',
           transform: 'translate(-50%, -50%)',
           maxHeight: '120%'
         }}
-        src="../../assets/Marelec_Grader_8.png"
+        src="../../assets/BatchMind2.png"
       />
       <Box
         component="svg"
