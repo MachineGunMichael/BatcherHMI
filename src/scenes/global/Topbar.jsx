@@ -2,7 +2,6 @@ import {Box, IconButton, useTheme, Dialog, DialogTitle, DialogContent, DialogCon
 import {useContext, useState} from "react";
 import {ColorModeContext, tokens} from "../../theme";
 import { useAuth } from "../../auth/AuthContext";
-// import InputBase from "@mui/material/InputBase";
 import LightModeOutlinedIcon from "@mui/icons-material/LightModeOutlined";
 import DarkModeOutlinedIcon from "@mui/icons-material/DarkModeOutlined";
 import SettingsOutlinedIcon from "@mui/icons-material/SettingsOutlined";
@@ -13,7 +12,11 @@ const Topbar = () => {
     const theme = useTheme();
     const colors = tokens(theme.palette.mode);
     const colorMode = useContext(ColorModeContext);
-    const { logout } = useAuth();
+    
+    // Handle potential undefined return from useAuth
+    const authContext = useAuth();
+    const logout = authContext?.logout || (() => {});
+    
     const [logoutDialogOpen, setLogoutDialogOpen] = useState(false);
 
     const handleLogoutClick = () => {
@@ -33,18 +36,16 @@ const Topbar = () => {
       <Box 
         display="flex" 
         justifyContent="space-between" 
-        alignItems="center"  // Add this to vertically center content
-        height="140px"       // Match the height with your logo area
-        px={4}               // Horizontal padding
-        py={2}               // Vertical padding
+        alignItems="center"
+        height="140px"
+        px={4}
+        py={2}
       >
-        {/* Left side - you could add something here */}
         <Box></Box>
   
-        {/* ICONS */}
         <Box display="flex">
           <IconButton 
-          onClick={colorMode.toggleColorMode}
+          onClick={colorMode?.toggleColorMode || (() => {})}
           sx={{ color: colors.primary[800] }}>
             {theme.palette.mode === "light" ? (
               <DarkModeOutlinedIcon />
@@ -67,7 +68,6 @@ const Topbar = () => {
           </IconButton>
         </Box>
 
-        {/* Logout Confirmation Dialog */}
         <Dialog
           open={logoutDialogOpen}
           onClose={handleLogoutCancel}
@@ -113,4 +113,3 @@ const Topbar = () => {
   };
   
   export default Topbar;
-  

@@ -7,6 +7,7 @@ import {
   InputAdornment,
   IconButton,
   useTheme,
+  Alert,
 } from "@mui/material";
 import { Formik } from "formik";
 import * as yup from "yup";
@@ -28,7 +29,10 @@ const LoginForm = ({ role, onBack, onLogin, isLoading, hideTitle = false }) => {
   const theme = useTheme();
   const colors = tokens(theme.palette.mode);
   const [showPassword, setShowPassword] = useState(false);
-  const { error } = useAuth();
+  const [localError, setLocalError] = useState("");
+  const authContext = useAuth();
+  const loading = authContext?.loading || false;
+  const error = authContext?.error;
 
   // Get role-specific data
   const roleData = {
@@ -125,13 +129,13 @@ const LoginForm = ({ role, onBack, onLogin, isLoading, hideTitle = false }) => {
                 name="username"
                 error={!!touched.username && !!errors.username}
                 helperText={touched.username && errors.username}
-                sx={{ 
+                sx={{
                   gridColumn: "span 2",
                   "& .MuiInputLabel-root": {
                     color: colors.grey[600] || "#666",
                     "&.Mui-focused": {
                       color: roleData.color,
-                    }
+                    },
                   },
                   "& .MuiFilledInput-root": {
                     "&:before": {
@@ -142,8 +146,8 @@ const LoginForm = ({ role, onBack, onLogin, isLoading, hideTitle = false }) => {
                     },
                     "&.Mui-focused": {
                       backgroundColor: "rgba(0, 0, 0, 0.06)",
-                    }
-                  }
+                    },
+                  },
                 }}
                 InputProps={{
                   startAdornment: (
@@ -169,7 +173,7 @@ const LoginForm = ({ role, onBack, onLogin, isLoading, hideTitle = false }) => {
                     color: colors.grey[600] || "#666",
                     "&.Mui-focused": {
                       color: roleData.color,
-                    }
+                    },
                   },
                   "& .MuiFilledInput-root": {
                     "&:before": {
@@ -180,8 +184,8 @@ const LoginForm = ({ role, onBack, onLogin, isLoading, hideTitle = false }) => {
                     },
                     "&.Mui-focused": {
                       backgroundColor: "rgba(0, 0, 0, 0.06)",
-                    }
-                  }
+                    },
+                  },
                 }}
                 InputProps={{
                   startAdornment: (
@@ -218,36 +222,20 @@ const LoginForm = ({ role, onBack, onLogin, isLoading, hideTitle = false }) => {
                   color: colors.grey[100],
                   fontWeight: "bold",
                   "&:hover": {
-                    backgroundColor: theme.palette.mode === "dark"
-                      ? `${roleData.color}80` // Add transparency
-                      : roleData.color,
+                    backgroundColor:
+                      theme.palette.mode === "dark"
+                        ? `${roleData.color}80` // Add transparency
+                        : roleData.color,
                   },
                 }}
               >
                 {isLoading ? "Logging in..." : "Login"}
               </Button>
 
-              {error && (
-                <Box 
-                  sx={{
-                    padding: "12px",
-                    backgroundColor: "#ffeaea",
-                    border: "1px solid #d32f2f",
-                    borderRadius: "8px",
-                    textAlign: "center",
-                    marginTop: "8px",
-                    width: "100%", // Match the button width
-                    boxSizing: "border-box"
-                  }}
-                >
-                  <Typography 
-                    color="#d32f2f"
-                    variant="body2"
-                    fontWeight="medium"
-                  >
-                    Login failed: {error}
-                  </Typography>
-                </Box>
+              {(error || localError) && (
+                <Alert severity="error" sx={{ mb: 2 }}>
+                  {error || localError}
+                </Alert>
               )}
             </Box>
           </form>

@@ -81,8 +81,19 @@ const Simulation = () => {
     // Add other mappings as needed
   };
 
-  // Use context state instead of local state
-  const { selectedSimulation, setSelectedSimulation, sliderValue, setSliderValue } = useAppContext();
+  // Add safer context access with console logging to debug
+  const context = useAppContext();
+  console.log("Simulation context:", context);
+  
+  // Use safe fallbacks if context isn't available
+  const selectedSimulation = context?.selectedSimulation || "";
+  const setSelectedSimulation = context?.setSelectedSimulation || (() => {
+    console.log("Warning: setSelectedSimulation is not available");
+  });
+  const sliderValue = context?.sliderValue || 0;
+  const setSliderValue = context?.setSliderValue || (() => {
+    console.log("Warning: setSliderValue is not available");
+  });
 
   // Find the selected simulation object
   const simulation = selectedSimulation 
@@ -344,17 +355,11 @@ const Simulation = () => {
   };
 
   return (
-    <Box 
-      m="20px"
-      sx={{
-        width: "100%",
-        overflow: "hidden",
-      }}
-    >
+    <Box m="20px">
       <Header title="Simulation" subtitle="Real-time digital twin" />
 
       <Box 
-        mt="70px" 
+        mt="70px" // Reduced from 70px to 40px
         display="flex" 
         flexDirection="column" 
         gap={4}

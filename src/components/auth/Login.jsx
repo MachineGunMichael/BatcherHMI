@@ -12,7 +12,10 @@ const Login = () => {
   const theme = useTheme();
   const colors = tokens(theme.palette.mode);
   const [selectedRole, setSelectedRole] = useState(null);
-  const { login, error, clearError } = useAuth();
+  const authContext = useAuth();
+  const login = authContext?.login || (() => {});
+  const error = authContext?.error;
+  const clearError = authContext?.clearError || (() => {});
 
   const handleRoleSelect = (role) => {
     setSelectedRole(role);
@@ -27,7 +30,6 @@ const Login = () => {
     setSelectedRole(null);
     clearError(); // Clear any login errors when going back to role selection
   };
-
 
   return (
     <div style={{ 

@@ -1,93 +1,77 @@
-import { useState } from "react";
 import { ColorModeContext, useMode } from "./theme";
-import { CssBaseline, ThemeProvider, CircularProgress, Box } from "@mui/material";
-import { Routes, Route, Navigate, useLocation } from "react-router-dom";
+import { CssBaseline, ThemeProvider } from "@mui/material";
+import { Routes, Route } from "react-router-dom";
 import Topbar from "./scenes/global/Topbar";
 import Sidebar from "./scenes/global/Sidebar";
-import Dashboard from "./scenes/dashboard";
-import Settings from "./scenes/settings";
-import Simulator from "./scenes/simulation";
-import Login from "./components/auth/Login";
-import Unauthorized from "./components/auth/Unauthorized";
-import { AppProvider } from "./context/AppContext";
-import { useAuth } from "./auth/AuthContext";
-
-// Protected route component
-const ProtectedRoute = ({ children, allowedRoles = [] }) => {
-  const { user, isAuthenticated, loading } = useAuth();
-  const location = useLocation();
-
-  if (loading) {
-    return (
-      <Box display="flex" justifyContent="center" alignItems="center" height="100vh">
-        <CircularProgress />
-      </Box>
-    );
-  }
-
-  if (!isAuthenticated) {
-    // Redirect to login if not authenticated
-    return <Navigate to="/login" state={{ from: location }} replace />;
-  }
-
-  // Check if user's role is allowed
-  if (allowedRoles.length > 0 && !allowedRoles.includes(user.role)) {
-    return <Navigate to="/unauthorized" replace />;
-  }
-
-  return children;
-};
+import AdminView from './scenes/AdminView';
+import ManagerView from './scenes/ManagerView';
+import OperatorView from './scenes/OperatorView';
+import { useAppContext } from './context/AppContext';
+import { useAuth } from './auth/AuthContext';
+import Login from './components/auth/Login';
 
 function App() {
-  const [theme, colorMode] = useMode();
-  const [isSidebar, setIsSidebar] = useState(true);
-  const { isAuthenticated, loading } = useAuth();
+  // Call all hooks at the top level - never conditionally
+  const modeResult = useMode();
+  const context = useAppContext();
+  const authContext = useAuth();
+  
+  // Extract values with defaults
+  const [theme, colorMode] = modeResult || [null, null];
+  const { currentRole = 'admin' } = context || {};
+  const { isAuthenticated = false } = authContext || {};
 
-  if (loading) {
+  // Add debugging
+  console.log('App render - isAuthenticated:', isAuthenticated, 'currentRole:', currentRole);
+
+  // Early return only after all hooks are called
+  if (!theme || !colorMode) {
+    return <div>Loading theme...</div>;
+  }
+
+  if (!context) {
+    return <div>Loading context...</div>;
+  }
+
+  // Show login page if not authenticated
+  if (!isAuthenticated) {
+    console.log('Showing login page');
     return (
-      <Box display="flex" justifyContent="center" alignItems="center" height="100vh">
-        <CircularProgress />
-      </Box>
+      <ColorModeContext.Provider value={colorMode}>
+        <ThemeProvider theme={theme}>
+          <CssBaseline />
+          <Login />
+        </ThemeProvider>
+      </ColorModeContext.Provider>
     );
   }
+
+  console.log('Showing authenticated view for role:', currentRole);
+  
+  const getRoleView = () => {
+    switch (currentRole) {
+      case 'admin':
+        return <AdminView />;
+      case 'manager':
+        return <ManagerView />;
+      case 'operator':
+        return <OperatorView />;
+      default:
+        return <AdminView />;
+    }
+  };
 
   return (
     <ColorModeContext.Provider value={colorMode}>
       <ThemeProvider theme={theme}>
-        <AppProvider>
-          <CssBaseline />
-          <div className="app">
-            {isAuthenticated && <Sidebar isSidebar={isSidebar} />}
-            <main className="content">
-              {isAuthenticated && <Topbar setIsSidebar={setIsSidebar} />}
-              <Routes>
-                {/* Public routes */}
-                <Route path="/login" element={isAuthenticated ? <Navigate to="/" /> : <Login />} />
-                <Route path="/unauthorized" element={<Unauthorized />} />
-
-                {/* Protected routes */}
-                <Route path="/" element={
-                  <ProtectedRoute>
-                    <Dashboard />
-                  </ProtectedRoute>
-                } />
-                <Route path="/settings" element={
-                  <ProtectedRoute allowedRoles={['admin', 'manager']}>
-                    <Settings />
-                  </ProtectedRoute>
-                } />
-                <Route path="/simulation" element={
-                  <ProtectedRoute allowedRoles={['admin', 'manager']}>
-                    <Simulator />
-                  </ProtectedRoute>
-                } />
-
-                {/* Fallback */}
-                <Route path="*" element={<Navigate to="/" />} />
-              </Routes>
-            </main>
-          </div>
-        </AppProvider>
+        <CssBaseline />
+        <div className="app">
+          <Sidebar />
+          <main className="content">
+            <Topbar />
+            {getRoleView()}
+          </main>
+        </div>
       </ThemeProvider>
     </ColorModeContext.Provider>
   );

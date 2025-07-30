@@ -6,7 +6,12 @@ import { tokens } from "../../theme";
 import SettingsIcon from "@mui/icons-material/TuneOutlined";
 import SimulationIcon from '@mui/icons-material/ShapeLineOutlined';
 import DashboardIcon from '@mui/icons-material/DashboardOutlined';
-import MenuOutlinedIcon from "@mui/icons-material/MenuOutlined";
+// import MenuOutlinedIcon from "@mui/icons-material/MenuOutlined";
+import HomeOutlinedIcon from '@mui/icons-material/HomeOutlined';
+// import PeopleOutlinedIcon from '@mui/icons-material/PeopleOutlined';
+// import ReceiptOutlinedIcon from '@mui/icons-material/ReceiptOutlined';
+import { useAppContext } from "../../context/AppContext";
+import { getRoutesForRole } from "../../config/roleRoutes";
 
 const Item = ({ title, to, icon, selected, setSelected }) => {
   return (
@@ -26,6 +31,24 @@ const Sidebar = () => {
   const colors = tokens(theme.palette.mode);
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [selected, setSelected] = useState("Dashboard");
+  const { currentRole } = useAppContext();
+
+  // Get routes available for current role
+  const availableRoutes = getRoutesForRole(currentRole);
+
+  // Map route icons to MUI icons
+  const getIcon = (iconName) => {
+    switch (iconName) {
+      case 'dashboard':
+        return <DashboardIcon />;
+      case 'simulation':
+        return <SimulationIcon />;
+      case 'settings':
+        return <SettingsIcon />;
+      default:
+        return <HomeOutlinedIcon />;
+    }
+  };
 
   return (
     <Box
@@ -130,7 +153,7 @@ const Sidebar = () => {
         {/* Toggle collapse button */}
             <MenuItem
             onClick={() => setIsCollapsed(!isCollapsed)}
-            icon={isCollapsed ? <MenuOutlinedIcon /> : undefined}
+            icon={isCollapsed ? <HomeOutlinedIcon /> : undefined}
             style={{
               margin: "30px 0 50px 0",
               color: colors.tealAccent[500],
@@ -164,27 +187,16 @@ const Sidebar = () => {
               width: "100%",
             }}
           >
-            <Item
-              title="Dashboard"
-              to="/"
-              icon={<DashboardIcon />}
-              selected={selected}
-              setSelected={setSelected}
-            />
-            <Item
-              title="Simulation"
-              to="/simulation"
-              icon={<SimulationIcon />}
-              selected={selected}
-              setSelected={setSelected}
-            />
-            <Item
-              title="Settings"
-              to="/settings"
-              icon={<SettingsIcon />}
-              selected={selected}
-              setSelected={setSelected}
-            />
+            {availableRoutes.map((route) => (
+              <Item
+                key={route.path}
+                title={route.name}
+                to={route.path}
+                icon={getIcon(route.icon)}
+                selected={selected}
+                setSelected={setSelected}
+              />
+            ))}
           </Box>
         </Menu>
       </ProSidebar>

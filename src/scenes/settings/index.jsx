@@ -73,13 +73,14 @@ const Settings = () => {
   const theme = useTheme();
   const colors = tokens(theme.palette.mode);
 
-  // Use context state instead of local state
-  const { 
-    settingsMode, 
-    setSettingsMode, 
-    assignedPrograms, 
-    setAssignedPrograms 
-  } = useAppContext();
+  // Get context with more explicit error handling and logging
+  const context = useAppContext();
+  
+  // Log what we're receiving from context
+  console.log("Settings received context:", {
+    settingsMode: context?.settingsMode,
+    assignedPrograms: context?.assignedPrograms?.length || 0
+  });
 
   // Keep local states for form fields
   const [selectedProgram, setSelectedProgram] = useState("");
@@ -105,9 +106,10 @@ const Settings = () => {
     return () => clearTimeout(timer);
   }, [sendSubmitted]);
 
-  // Updated handlers to use context state
+  // Event handlers
   const handleModeChange = (e) => {
-    setSettingsMode(e.target.value);
+    console.log("Settings - Mode change:", e.target.value);
+    context?.setSettingsMode?.(e.target.value);
     setAddError(false);
   };
 
@@ -116,19 +118,31 @@ const Settings = () => {
   const handleManualName = (e) => setManualName(e.target.value);
   const handleManualChange = (field) => (e) =>
     setManualValues({ ...manualValues, [field]: e.target.value });
-  const toggleGate = (gate) => () =>
+  const toggleGate = (gate) => () => {
     setManualGates((prev) =>
       prev.includes(gate) ? prev.filter((g) => g !== gate) : [...prev, gate]
     );
+  };
 
-  // Update these handlers to use context state for assignedPrograms
+  // Direct handlers using context methods
   const handleAddPreset = () => {
     if (!selectedProgram) return;
+    
+    console.log("Settings - Adding preset program:", selectedProgram);
     const prog = presetPrograms[selectedProgram];
-    setAssignedPrograms([
-      ...assignedPrograms,
-      { type: "preset", name: prog.name, params: prog.params, gates: prog.gates },
-    ]);
+    
+    if (context?.setAssignedPrograms) {
+      context.setAssignedPrograms([
+        ...(context.assignedPrograms || []),
+        { 
+          type: "preset", 
+          name: prog.name, 
+          params: prog.params, 
+          gates: prog.gates 
+        }
+      ]);
+    }
+    
     setSelectedProgram("");
   };
 
@@ -137,14 +151,21 @@ const Settings = () => {
       manualName &&
       Object.values(manualValues).every((v) => v !== "") &&
       manualGates.length > 0;
+      
     if (!allFilled) {
       setAddError(true);
       return;
     }
-    setAssignedPrograms([
-      ...assignedPrograms,
-      { type: "manual", name: manualName, params: manualValues, gates: manualGates },
-    ]);
+    
+    console.log("Settings: Adding manual program", manualName);
+    
+    if (context?.setAssignedPrograms) {
+      context.setAssignedPrograms([
+        ...(context.assignedPrograms || []),
+        { type: "manual", name: manualName, params: manualValues, gates: manualGates },
+      ]);
+    }
+    
     setManualName("");
     setManualValues({
       pieceMinWeight: "",
@@ -159,19 +180,33 @@ const Settings = () => {
   };
 
   const handleRemove = (index) => () => {
-    setAssignedPrograms(assignedPrograms.filter((_, i) => i !== index));
+    console.log("Settings: Removing program at index", index);
+    
+    if (context?.setAssignedPrograms) {
+      context.setAssignedPrograms(
+        (context.assignedPrograms || []).filter((_, i) => i !== index)
+      );
+    }
   };
 
   const handleSendPrograms = () => setSendSubmitted(true);
-
-  // Disable logic remains the same, but uses context state
-  const usedPresetKeys = assignedPrograms
-    .filter((p) => p.type === "preset")
+  
+  // Safe access to context values
+  const safeAssignedPrograms = context?.assignedPrograms || [];
+  const safeSettingsMode = context?.settingsMode || "preset";
+  
+  // Disable logic with safe access to context
+  const usedPresetKeys = safeAssignedPrograms
+    .filter((p) => p && p.type === "preset")
     .map((p) =>
       Object.keys(presetPrograms).find((key) => presetPrograms[key].name === p.name)
     );
-  const usedGates = assignedPrograms.flatMap((p) => p.gates);
+    
+  const usedGates = safeAssignedPrograms.flatMap((p) => p?.gates || []);
 
+  console.log("Settings render - mode:", safeSettingsMode, 
+              "programs:", safeAssignedPrograms.length);
+  
   return (
     <Box m="20px">
       <Header title="Settings" subtitle="Set up production settings" />
@@ -189,7 +224,12 @@ const Settings = () => {
                 Program Selection
               </Typography>
             </FormLabel>
-            <RadioGroup row value={settingsMode} onChange={handleModeChange} name="program-mode">
+            <RadioGroup 
+              row 
+              value={safeSettingsMode} 
+              onChange={handleModeChange} 
+              name="program-mode"
+            >
               <FormControlLabel
                 value="preset"
                 control={<Radio color="secondary" />}
@@ -204,7 +244,7 @@ const Settings = () => {
           </FormControl>
 
           {/* Preset Programs */}
-          {settingsMode === "preset" && (
+          {safeSettingsMode === "preset" && (
             <Box mt={2} display="flex" flexDirection="column" gap={2}>
               <FormControl fullWidth>
                 <InputLabel id="preset-label" color="secondary">
@@ -238,7 +278,7 @@ const Settings = () => {
           )}
 
           {/* Manual Setup */}
-          {settingsMode === "manual" && (
+          {safeSettingsMode === "manual" && (
             <Box mt={2} display="flex" flexDirection="column" gap={2}>
               <TextField
                 label="Program Name"
@@ -306,10 +346,10 @@ const Settings = () => {
             Assigned Programs
           </Typography>
 
-          {assignedPrograms.length === 0 ? (
+          {safeAssignedPrograms.length === 0 ? (
             <Typography>No programs assigned.</Typography>
           ) : (
-            assignedPrograms.map((p, i) => (
+            safeAssignedPrograms.map((p, i) => (
               <Box
                 key={i}
                 mb={2}
@@ -338,7 +378,7 @@ const Settings = () => {
             ))
           )}
 
-          {assignedPrograms.length > 0 && (
+          {safeAssignedPrograms.length > 0 && (
             <Button variant="contained" color="secondary" onClick={handleSendPrograms}>
               Send Programs
             </Button>
