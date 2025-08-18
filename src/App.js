@@ -1,3 +1,4 @@
+import React, { useMemo } from "react";
 import { ColorModeContext, useMode } from "./theme";
 import { CssBaseline, ThemeProvider } from "@mui/material";
 import { Routes, Route } from "react-router-dom";
@@ -20,6 +21,22 @@ function App() {
   const [theme, colorMode] = modeResult || [null, null];
   const { currentRole = 'admin' } = context || {};
   const { isAuthenticated = false } = authContext || {};
+
+  // Use useMemo for expensive components
+  const MemoizedRoleView = useMemo(() => {
+    console.log('Recalculating role view for:', currentRole);
+    
+    switch (currentRole) {
+      case 'admin':
+        return <AdminView />;
+      case 'manager':
+        return <ManagerView />;
+      case 'operator':
+        return <OperatorView />;
+      default:
+        return <AdminView />;
+    }
+  }, [currentRole]); // Only recalculate when role changes
 
   // Add debugging
   console.log('App render - isAuthenticated:', isAuthenticated, 'currentRole:', currentRole);
@@ -48,18 +65,6 @@ function App() {
 
   console.log('Showing authenticated view for role:', currentRole);
   
-  const getRoleView = () => {
-    switch (currentRole) {
-      case 'admin':
-        return <AdminView />;
-      case 'manager':
-        return <ManagerView />;
-      case 'operator':
-        return <OperatorView />;
-      default:
-        return <AdminView />;
-    }
-  };
 
   return (
     <ColorModeContext.Provider value={colorMode}>
@@ -69,7 +74,7 @@ function App() {
           <Sidebar />
           <main className="content">
             <Topbar />
-            {getRoleView()}
+            {MemoizedRoleView}
           </main>
         </div>
       </ThemeProvider>
@@ -77,4 +82,4 @@ function App() {
   );
 }
 
-export default App;
+export default React.memo(App); // Memoize the entire App component

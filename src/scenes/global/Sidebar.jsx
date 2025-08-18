@@ -6,6 +6,7 @@ import { tokens } from "../../theme";
 import SettingsIcon from "@mui/icons-material/TuneOutlined";
 import SimulationIcon from '@mui/icons-material/ShapeLineOutlined';
 import DashboardIcon from '@mui/icons-material/DashboardOutlined';
+import PlanAssistIcon from '@mui/icons-material/MoreTimeOutlined';
 // import MenuOutlinedIcon from "@mui/icons-material/MenuOutlined";
 import HomeOutlinedIcon from '@mui/icons-material/HomeOutlined';
 // import PeopleOutlinedIcon from '@mui/icons-material/PeopleOutlined';
@@ -41,10 +42,12 @@ const Sidebar = () => {
     switch (iconName) {
       case 'dashboard':
         return <DashboardIcon />;
-      case 'simulation':
-        return <SimulationIcon />;
+      case 'planAssist':
+        return <PlanAssistIcon />;
       case 'settings':
         return <SettingsIcon />;
+      case 'simulation':
+        return <SimulationIcon />;
       default:
         return <HomeOutlinedIcon />;
     }
