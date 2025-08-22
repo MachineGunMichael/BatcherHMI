@@ -10,6 +10,7 @@ import OperatorView from './scenes/OperatorView';
 import { useAppContext } from './context/AppContext';
 import { useAuth } from './auth/AuthContext';
 import Login from './components/auth/Login';
+import PlanAssist from "./scenes/planAssist";
 
 function App() {
   // Call all hooks at the top level - never conditionally
