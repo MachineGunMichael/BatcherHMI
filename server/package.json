@@ -1,18 +1,23 @@
 {
-  "name": "batching-auth-server",
+  "name": "batcher-auth-server",
   "version": "1.0.0",
-  "description": "Authentication server for Batching HMI",
+  "description": "Auth + metadata server (SQLite + InfluxDB3) for Batching HMI",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "db:setup": "node scripts/sqlite-setup.js",
+    "db:reset": "rm -f db/sqlite/batching_app.sqlite && node scripts/sqlite-setup.js",
+    "ts:seed": "node scripts/influx-seed-demo.js"
   },
   "dependencies": {
+    "@influxdata/influxdb3-client": "^1.0.0",
     "bcryptjs": "^2.4.3",
-    "body-parser": "^1.20.3",
+    "body-parser": "^1.20.2",
+    "better-sqlite3": "^9.4.0",
     "cors": "^2.8.5",
-    "express": "^4.21.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.18.2",
     "jsonwebtoken": "^9.0.2"
   },
   "devDependencies": {

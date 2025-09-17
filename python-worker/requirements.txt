@@ -1,0 +1,15 @@
+# InfluxDB 3 client
+influxdb3-python==0.15.0
+
+# Arrow/columnar IO (Flight SQL depends on this)
+pyarrow>=16,<18
+
+# Numerics
+numpy>=1.26,<2.0
+
+# DataFrames (optional; remove if you don't use it)
+pandas>=2.2
+
+# HTTP + .env
+requests>=2.32
+python-dotenv>=1.0

@@ -1,108 +1,86 @@
-const express = require('express');
-const bodyParser = require('body-parser');
-const cors = require('cors');
-const jwt = require('jsonwebtoken');
-const app = express();
-const { findUserByCredentials, findUserById, getSafeUser, users } = require('./userDatabase');
+require('dotenv').config();
 
-// Middleware
+const express = require('express');
+const cors = require('cors');
+const bodyParser = require('body-parser');
+
+const influx = require('./services/influx');
+
+const authRoutes = require('./routes/auth');
+const programRoutes = require('./routes/programs');
+const settingsRoutes = require('./routes/settings');
+const tsRoutes = require('./routes/ts');
+const kpiRoutes = require('./routes/kpi');
+const streamRoutes = require('./routes/stream'); // { router, broadcast }
+const ingestRoutes = require('./routes/ingest');
+
+const outbox = require('./workers/outboxDispatcher');
+
+const app = express();
+const PORT = process.env.PORT || 5001;
+
 app.use(cors());
 app.use(bodyParser.json());
 
-// Secret for JWT
-const JWT_SECRET = 'batching-system-secret-key';
+// ------------ health -------------
+app.get('/', async (_req, res) => {
+  const tsOk = await influx.ping().catch(() => false);
+  res.json({
+    ok: true,
+    service: 'batcher-auth',
+    sqlite: true,
+    influx: { ok: !!tsOk, host: influx.host, database: influx.database },
+    port: PORT
+  });
+});
 
-// Authentication endpoint
-app.post('/api/auth/login', async (req, res) => {
+// ----------- mount routes --------
+app.use('/api/auth', authRoutes);
+app.use('/api/programs', programRoutes);
+app.use('/api/settings', settingsRoutes);
+app.use('/api/stream', streamRoutes.router);
+app.use('/api/ingest', ingestRoutes);
+app.use('/api/ts', tsRoutes);
+app.use('/api/kpi', kpiRoutes);
+
+
+// (optional) keep your earlier debug TS endpoints for convenience:
+app.get('/api/ts/health', async (_req, res) => {
+  const ok = await influx.ping().catch(() => false);
+  res.json({ ok, host: influx.host, database: influx.database });
+});
+
+const { verifyToken } = require('./utils/authMiddleware');
+app.post('/api/ts/write', verifyToken, async (req, res) => {
   try {
-    const { username, password, role } = req.body;
-    
-    console.log('Login attempt:', { username, role }); // Debug log
-    
-    // Find user by credentials
-    const user = await findUserByCredentials(username, password, role);
-    
-    if (!user) {
-      // Check if user exists with that username and role
-      const userExists = users.find(u => u.username === username && u.role === role);
-      if (userExists) {
-        return res.status(401).json({ message: 'Wrong password' });
-      }
-      
-      // Check if user exists with that username but different role
-      const userWithDifferentRole = users.find(u => u.username === username);
-      if (userWithDifferentRole) {
-        return res.status(401).json({ message: 'Wrong role selected' });
-      }
-      
-      // User doesn't exist at all
-      return res.status(401).json({ message: 'Wrong username' });
+    const { measurement, tags, fields, timestamp } = req.body || {};
+    if (!measurement || !fields) {
+      return res.status(400).json({ message: 'measurement and fields are required' });
     }
-    
-    // Generate JWT token
-    const token = jwt.sign(
-      { userId: user.id, username: user.username, role: user.role },
-      JWT_SECRET,
-      { expiresIn: '8h' }
-    );
-    
-    // Return user info and token (without password)
-    return res.status(200).json({
-      token,
-      user: getSafeUser(user)
-    });
-  } catch (error) {
-    console.error('Login error:', error);
-    return res.status(500).json({ message: 'Server error' });
+    await influx.writePoint({ measurement, tags, fields, timestamp });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('Influx write error:', e);
+    res.status(500).json({ message: 'Influx write failed' });
   }
 });
 
-// Middleware to verify token
-const verifyToken = (req, res, next) => {
-  const token = req.headers.authorization?.split(' ')[1];
-  
-  if (!token) {
-    return res.status(403).json({ message: 'No token provided' });
-  }
-  
+app.get('/api/ts/query', verifyToken, async (req, res) => {
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
-    next();
-  } catch (error) {
-    return res.status(401).json({ message: 'Unauthorized' });
+    const sql = String(req.query.sql || '');
+    if (!sql.toLowerCase().trim().startsWith('select')) {
+      return res.status(400).json({ message: 'Only SELECT queries are allowed' });
+    }
+    const rows = await influx.query(sql);
+    res.json({ rows });
+  } catch (e) {
+    console.error('Influx query error:', e);
+    res.status(500).json({ message: 'Influx query failed' });
   }
-};
-
-// Protected route example
-app.get('/api/auth/user', verifyToken, (req, res) => {
-  const user = findUserById(req.user.userId);
-  
-  if (!user) {
-    return res.status(404).json({ message: 'User not found' });
-  }
-  
-  return res.status(200).json(getSafeUser(user));
 });
 
-// Verify token endpoint (for frontend to check token validity)
-app.get('/api/auth/verify', verifyToken, (req, res) => {
-  return res.status(200).json({ valid: true });
-});
-
-// Validate token and return user data (for persistent login)
-app.post('/api/auth/validate', verifyToken, (req, res) => {
-  const user = findUserById(req.user.userId);
-  
-  if (!user) {
-    return res.status(404).json({ message: 'User not found' });
-  }
-  
-  return res.status(200).json({ user: getSafeUser(user) });
-});
-
-// Server setup
-const PORT = process.env.PORT || 5001;
+// ---------- start server ----------
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Server running on http://localhost:${PORT} (SQLite + InfluxDB3)`);
+  outbox.start(); // begin polling outbox & broadcasting
 });
