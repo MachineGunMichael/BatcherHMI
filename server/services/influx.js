@@ -1,15 +1,16 @@
 // server/services/influx.js
-// InfluxDB 3 helper using the official Node SDK (no hardcoded HTTP paths)
+// InfluxDB 3 helper using the official Node SDK for WRITES (Line Protocol).
+// We also export Flux query builders for convenience, but do not execute them here.
 
 const { InfluxDBClient } = require('@influxdata/influxdb3-client');
 
 // --- env ----------------------------------------------------------------
 const host = process.env.INFLUXDB3_HOST_URL || 'http://127.0.0.1:8181';
-const token = process.env.INFLUXDB3_AUTH_TOKEN;           // do NOT hardcode a token here
+const token = process.env.INFLUXDB3_AUTH_TOKEN;   // do NOT hardcode a token here
 const database = process.env.INFLUXDB3_DATABASE || 'batching';
 
 if (!token) {
-  console.warn('[influx] INFLUXDB3_AUTH_TOKEN is not set. Source .influxdb3/env before running.');
+  console.warn('[influx] INFLUXDB3_AUTH_TOKEN is not set. Source server/.influxdb3/env before running.');
 }
 
 const client = new InfluxDBClient({ host, token, database });
@@ -17,7 +18,6 @@ const client = new InfluxDBClient({ host, token, database });
 // --- basic health --------------------------------------------------------
 async function ping() {
   try {
-    // SDK has no ping function; simple HEAD on /health works
     const res = await fetch(`${host}/health`).catch(() => null);
     return !!(res && res.ok);
   } catch {
@@ -25,10 +25,11 @@ async function ping() {
   }
 }
 
-// --- line protocol helpers (we keep these for the M1–M5 writers) --------
+// --- line protocol helpers ----------------------------------------------
 function escKey(s)     { return String(s).replace(/ /g,'\\ ').replace(/,/g,'\\,').replace(/=/g,'\\='); }
 function escTagVal(s)  { return String(s).replace(/ /g,'\\ ').replace(/,/g,'\\,').replace(/=/g,'\\='); }
 function escFieldStr(s){ return `"${String(s).replace(/\\/g,'\\\\').replace(/"/g,'\\"')}"`; }
+
 function toNanos(ts) {
   if (ts == null) return undefined;
   if (typeof ts === 'number') {
@@ -40,6 +41,7 @@ function toNanos(ts) {
   if (Number.isNaN(ms)) return undefined;
   return Math.floor(ms * 1e6);
 }
+
 function toLineProtocol({ measurement, tags = {}, fields = {}, timestamp }) {
   if (!measurement) throw new Error('measurement required');
   const meas = escKey(measurement);
@@ -66,30 +68,34 @@ function toLineProtocol({ measurement, tags = {}, fields = {}, timestamp }) {
   return ns ? `${meas}${tagsPart} ${fieldPairs} ${ns}` : `${meas}${tagsPart} ${fieldPairs}`;
 }
 
-// --- query & write via SDK ----------------------------------------------
-async function query(/* sql */) {
-  throw new Error('Influx query is not available on this local build. Use SSE/REST-backed data for the HMI, or point env to InfluxDB Cloud for queries.');
-}
+// --- write helpers -------------------------------------------------------
 async function writeLineProtocol(lines) {
   const body = Array.isArray(lines) ? lines.join('\n') : String(lines);
-  await client.write(body); // SDK takes LP text directly
+  await client.write(body);
   return 'ok';
 }
+
 async function writePoint({ measurement, tags, fields, timestamp }) {
   const lp = toLineProtocol({ measurement, tags, fields, timestamp });
   return writeLineProtocol(lp);
 }
 
-// --- M1..M5 convenience writers -----------------------------------------
-async function writePiece({ piece_id, weight_g, ts }) {
+// --- M1..M5 writers ------------------------------------------------------
+// M1: pieces — now with piece_id and gate tags
+async function writePiece({ piece_id, gate, weight_g, ts }) {
   return writePoint({
     measurement: 'pieces',
-    tags: piece_id ? { piece_id } : {},
+    tags: {
+      ...(piece_id ? { piece_id: String(piece_id) } : {}),
+      ...(gate != null ? { gate: String(gate) } : {}),
+    },
     fields: { weight_g: Number(weight_g) },
     timestamp: ts,
   });
 }
 
+// M2: gate_state — cumulative rows produced by Python importer.
+// This writer is here in case you need to write from Node as well.
 async function writeGateState({ gate, pieces_in_gate, weight_sum_g, ts }) {
   return writePoint({
     measurement: 'gate_state',
@@ -102,37 +108,47 @@ async function writeGateState({ gate, pieces_in_gate, weight_sum_g, ts }) {
   });
 }
 
-// Per-recipe per-minute metrics (and we’ll also provide a combined variant)
-async function writeKpiMinute({ recipe, batches_min, giveaway_pct, rejects_per_min, ts }) {
-  const fields = {
-    batches_min: Number(batches_min),
-    giveaway_pct: Number(giveaway_pct),
-  };
-  if (rejects_per_min != null) fields.rejects_per_min = Number(rejects_per_min);
-
+// M3: per-recipe per-minute KPI (no rejects_per_min here), program tagged
+async function writeKpiMinute({ program, recipe, batches_min, giveaway_pct, ts }) {
   return writePoint({
     measurement: 'kpi_minute',
-    tags: { recipe: String(recipe) },
-    fields,
+    tags: {
+      ...(program != null ? { program: String(program) } : {}),
+      recipe: String(recipe),
+    },
+    fields: {
+      batches_min: Number(batches_min),
+      giveaway_pct: Number(giveaway_pct),
+    },
     timestamp: ts,
   });
 }
 
-// UI “white line” totals/averages
-async function writeKpiMinuteCombined({ batches_min, giveaway_pct, rejects_per_min, ts }) {
-  return writeKpiMinute({
-    recipe: '__combined',
-    batches_min,
-    giveaway_pct,
-    rejects_per_min,
-    ts,
+// M3 combined: includes rejects_per_min (from Gate 0), program tagged
+async function writeKpiMinuteCombined({ program, batches_min, giveaway_pct, rejects_per_min, ts }) {
+  return writePoint({
+    measurement: 'kpi_minute',
+    tags: {
+      ...(program != null ? { program: String(program) } : {}),
+      recipe: '__combined',
+    },
+    fields: {
+      batches_min: Number(batches_min),
+      giveaway_pct: Number(giveaway_pct),
+      rejects_per_min: Number(rejects_per_min ?? 0),
+    },
+    timestamp: ts,
   });
 }
 
-async function writeKpiTotals({ recipe, total_batches, giveaway_g_per_batch, giveaway_pct_avg, ts }) {
+// M4: rolling per-minute totals, program tagged
+async function writeKpiTotals({ program, recipe, total_batches, giveaway_g_per_batch, giveaway_pct_avg, ts }) {
   return writePoint({
     measurement: 'kpi_totals',
-    tags: { recipe: String(recipe) },
+    tags: {
+      ...(program != null ? { program: String(program) } : {}),
+      recipe: String(recipe),
+    },
     fields: {
       total_batches: Number(total_batches),
       giveaway_g_per_batch: Number(giveaway_g_per_batch),
@@ -142,29 +158,101 @@ async function writeKpiTotals({ recipe, total_batches, giveaway_g_per_batch, giv
   });
 }
 
-async function writeAssignment({ piece_id, gate, recipe, ts }) {
+// M5: assignments — program tagged
+async function writeAssignment({ piece_id, gate, recipe, program, ts }) {
   return writePoint({
     measurement: 'assignments',
     tags: {
       ...(piece_id ? { piece_id: String(piece_id) } : {}),
       ...(gate != null ? { gate: String(gate) } : {}),
       ...(recipe ? { recipe: String(recipe) } : {}),
+      ...(program != null ? { program: String(program) } : {}),
     },
     fields: { assigned: 1 },
     timestamp: ts,
   });
 }
 
+// --- OPTIONAL: Flux query builders (strings only) ------------------------
+// Use these in your route/controllers when you're ready to enable queries.
+function buildQueryPieces(startISO, endISO) {
+  return `
+from(bucket: "${database}")
+  |> range(start: ${JSON.stringify(startISO)}, stop: ${JSON.stringify(endISO)})
+  |> filter(fn: (r) => r._measurement == "pieces")
+  |> keep(columns: ["_time","piece_id","gate","_value"])
+  |> rename(columns: {_value: "weight_g"})
+`;
+}
+
+function buildQueryGateState(startISO, endISO) {
+  return `
+from(bucket: "${database}")
+  |> range(start: ${JSON.stringify(startISO)}, stop: ${JSON.stringify(endISO)})
+  |> filter(fn: (r) => r._measurement == "gate_state")
+  |> keep(columns: ["_time","gate","pieces_in_gate","weight_sum_g"])
+`;
+}
+
+function buildQueryRecipeKpiMinute(startISO, endISO, programId) {
+  return `
+from(bucket: "${database}")
+  |> range(start: ${JSON.stringify(startISO)}, stop: ${JSON.stringify(endISO)})
+  |> filter(fn: (r) => r._measurement == "kpi_minute" and r.program == "${String(programId)}" and r.recipe != "__combined")
+  |> keep(columns: ["_time","program","recipe","batches_min","giveaway_pct"])
+`;
+}
+
+function buildQueryCombinedKpiMinute(startISO, endISO, programId) {
+  return `
+from(bucket: "${database}")
+  |> range(start: ${JSON.stringify(startISO)}, stop: ${JSON.stringify(endISO)})
+  |> filter(fn: (r) => r._measurement == "kpi_minute" and r.program == "${String(programId)}" and r.recipe == "__combined")
+  |> keep(columns: ["_time","program","recipe","batches_min","giveaway_pct","rejects_per_min"])
+`;
+}
+
+function buildQueryKpiTotalsRolling(startISO, endISO, programId) {
+  return `
+from(bucket: "${database}")
+  |> range(start: ${JSON.stringify(startISO)}, stop: ${JSON.stringify(endISO)})
+  |> filter(fn: (r) => r._measurement == "kpi_totals" and r.program == "${String(programId)}")
+  |> keep(columns: ["_time","program","recipe","total_batches","giveaway_g_per_batch","giveaway_pct_avg"])
+`;
+}
+
+function buildQueryAssignments(startISO, endISO, programId) {
+  return `
+from(bucket: "${database}")
+  |> range(start: ${JSON.stringify(startISO)}, stop: ${JSON.stringify(endISO)})
+  |> filter(fn: (r) => r._measurement == "assignments" and r.program == "${String(programId)}")
+  |> keep(columns: ["_time","program","gate","recipe","assigned"])
+`;
+}
+
+// Placeholder executor — left disabled on purpose.
+// If you wire up a Flux-capable endpoint, implement this.
+async function queryFlux(/* flux */) {
+  throw new Error('queryFlux() not enabled in this build. Provide a Flux endpoint or use Flight SQL for InfluxDB 3.');
+}
+
 module.exports = {
   // config
   host, token, database,
-  // basics
-  ping, query, writeLineProtocol, writePoint,
-  // M1..M5
-  writePiece,
-  writeGateState,
-  writeKpiMinute,
-  writeKpiMinuteCombined,
-  writeKpiTotals,
-  writeAssignment,
+  // health
+  ping,
+  // writes
+  writeLineProtocol, writePoint,
+  writePiece, writeGateState,
+  writeKpiMinute, writeKpiMinuteCombined,
+  writeKpiTotals, writeAssignment,
+  // query builders
+  buildQueryPieces,
+  buildQueryGateState,
+  buildQueryRecipeKpiMinute,
+  buildQueryCombinedKpiMinute,
+  buildQueryKpiTotalsRolling,
+  buildQueryAssignments,
+  // executor stub
+  queryFlux,
 };

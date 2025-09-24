@@ -1,58 +1,50 @@
-import os, time, random
+# python-worker/main.py
+import os
+import time
+import datetime as dt
+import json
 import requests
-from influxdb_client import InfluxDBClient, Point, WritePrecision
+from dotenv import load_dotenv
 
-INFLUX_URL = os.getenv("INFLUX_URL", "http://localhost:8181")
-INFLUX_TOKEN = os.getenv("INFLUX_TOKEN", "")
-INFLUX_ORG = os.getenv("INFLUX_ORG", "HMI")
-INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "hmi")
-NODE_URL = os.getenv("NODE_URL", "http://localhost:5001")
+# IMPORTANT: This is the InfluxDB **3** client
+from influxdb_client_3 import InfluxDBClient3, Point  # <- note the _3 module name
 
-client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
-write_api = client.write_api()
+load_dotenv()
 
-def compute_kpis():
-    # TODO: replace with real KPI calculations
-    return {
-        "throughput_bpm_total": random.randint(400, 600),
-        "rejects_per_min": random.randint(0, 20),
-        "giveaway_pct_avg": round(random.uniform(0.8, 2.0), 2),
-        "per_recipe": [
-            {"program_id": 1, "recipe_id": 1, "throughput_bpm": random.randint(100,200), "giveaway_pct": round(random.uniform(0.5,2.5),2)},
-            {"program_id": 1, "recipe_id": 2, "throughput_bpm": random.randint(80,160), "giveaway_pct": round(random.uniform(0.5,2.5),2)},
-        ]
-    }
+INFLUX_HOST = os.getenv("INFLUXDB3_HOST_URL", "http://127.0.0.1:8181")
+INFLUX_TOKEN = os.getenv("INFLUXDB3_AUTH_TOKEN")
+INFLUX_DB    = os.getenv("INFLUXDB3_DATABASE", "batching")
 
-def write_kpis_to_influx(kpis):
-    p = (Point("kpi")
-         .field("throughput_bpm_total", int(kpis["throughput_bpm_total"]))
-         .field("rejects_per_min", int(kpis["rejects_per_min"]))
-         .field("giveaway_pct_avg", float(kpis["giveaway_pct_avg"]))
-         .time(time.time_ns(), WritePrecision.NS))
-    write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=p)
+API_BASE      = os.getenv("API_BASE", "http://127.0.0.1:5001")
+WORKER_SECRET = os.getenv("WORKER_SECRET", "dev-worker-secret")
 
-    for item in kpis.get("per_recipe", []):
-        pr = (Point("kpi")
-              .tag("program_id", str(item["program_id"]))
-              .tag("recipe_id", str(item["recipe_id"]))
-              .field("throughput_bpm", int(item["throughput_bpm"]))
-              .field("giveaway_pct", float(item["giveaway_pct"]))
-              .time(time.time_ns(), WritePrecision.NS))
-        write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=pr)
+def write_sample_point():
+    with InfluxDBClient3(host=INFLUX_HOST, token=INFLUX_TOKEN, database=INFLUX_DB) as client:
+        p = Point("kpi").tag("recipe", "A").field("giveaway_pct", 1.23).field("batches_min", 4)\
+                        .time(dt.datetime.utcnow())
+        client.write(p)
 
-def publish_snapshot_to_node(kpis):
-    try:
-        requests.post(f"{NODE_URL}/api/kpi/publish", json=kpis, timeout=2.0)
-    except Exception as e:
-        print("publish error:", e)
+def push_live_kpi(payload: dict):
+    # hit your Node route /api/kpi/publish guarded by x-worker-secret
+    r = requests.post(
+        f"{API_BASE}/api/kpi/publish",
+        headers={"Content-Type": "application/json", "x-worker-secret": WORKER_SECRET},
+        data=json.dumps(payload),
+        timeout=5,
+    )
+    r.raise_for_status()
 
 def main():
-    print("Python KPI worker started")
+    # Example loop
     while True:
-        k = compute_kpis()
-        write_kpis_to_influx(k)
-        publish_snapshot_to_node(k)
-        time.sleep(5)
+        write_sample_point()
+        push_live_kpi({
+            "ts": dt.datetime.utcnow().isoformat() + "Z",
+            "recipe": "A",
+            "giveaway_pct": 1.23,
+            "batches_min": 4,
+        })
+        time.sleep(15)
 
 if __name__ == "__main__":
     main()

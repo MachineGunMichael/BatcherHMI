@@ -1,5 +1,5 @@
 // server/scripts/sqlite-setup.js
-// One-shot SQLite setup: base schema + seed + active-config migration (idempotent)
+// One-shot SQLite setup: base schema + seed + active-config + KPI schema (idempotent)
 
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 const db = require('../db/sqlite');
@@ -7,14 +7,10 @@ const bcrypt = require('bcryptjs');
 
 /* ----------------- helpers ----------------- */
 function run(sql) { db.exec(sql); }
-
 function tableExists(name) {
-  const row = db.prepare(
-    `SELECT name FROM sqlite_master WHERE type='table' AND name = ?`
-  ).get(name);
+  const row = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name = ?`).get(name);
   return !!row;
 }
-
 function columnExists(table, column) {
   const rows = db.prepare(`PRAGMA table_info(${table})`).all();
   return rows.some(r => r.name === column);
@@ -29,13 +25,12 @@ function createBaseSchema() {
       password_hash TEXT NOT NULL,
       role          TEXT NOT NULL CHECK(role IN ('admin','manager','operator')),
       name          TEXT NOT NULL,
-      permissions   TEXT, -- JSON string
+      permissions   TEXT,
       created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     CREATE TRIGGER IF NOT EXISTS trg_users_updated_at
-    AFTER UPDATE ON users
-    FOR EACH ROW BEGIN
+    AFTER UPDATE ON users FOR EACH ROW BEGIN
       UPDATE users SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
     END;
 
@@ -52,8 +47,7 @@ function createBaseSchema() {
       updated_at            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     CREATE TRIGGER IF NOT EXISTS trg_recipes_updated_at
-    AFTER UPDATE ON recipes
-    FOR EACH ROW BEGIN
+    AFTER UPDATE ON recipes FOR EACH ROW BEGIN
       UPDATE recipes SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
     END;
 
@@ -65,8 +59,7 @@ function createBaseSchema() {
       updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     CREATE TRIGGER IF NOT EXISTS trg_programs_updated_at
-    AFTER UPDATE ON programs
-    FOR EACH ROW BEGIN
+    AFTER UPDATE ON programs FOR EACH ROW BEGIN
       UPDATE programs SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
     END;
 
@@ -88,8 +81,7 @@ function createBaseSchema() {
       FOREIGN KEY (active_program_id) REFERENCES programs(id) ON DELETE SET NULL
     );
     CREATE TRIGGER IF NOT EXISTS trg_settings_updated_at
-    AFTER UPDATE ON settings
-    FOR EACH ROW BEGIN
+    AFTER UPDATE ON settings FOR EACH ROW BEGIN
       UPDATE settings SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
     END;
   `);
@@ -153,16 +145,16 @@ function seedIfEmpty() {
     VALUES (?, ?, ?)
   `);
 
-  // Example mapping (adjust as you like)
-  insertPGR.run(programId, 0, recipeIdByName('Program A')); // you can treat gate 0 specially (reject)
-  insertPGR.run(programId, 1, recipeIdByName('Program A'));
-  insertPGR.run(programId, 2, recipeIdByName('Program B'));
-  insertPGR.run(programId, 3, recipeIdByName('Program C'));
-  insertPGR.run(programId, 4, recipeIdByName('Program D'));
-  insertPGR.run(programId, 5, recipeIdByName('Program A'));
-  insertPGR.run(programId, 6, recipeIdByName('Program B'));
-  insertPGR.run(programId, 7, recipeIdByName('Program C'));
-  insertPGR.run(programId, 8, recipeIdByName('Program D'));
+  // Example mapping
+  insertPGR.run(programId, 0,  recipeIdByName('Program A'));
+  insertPGR.run(programId, 1,  recipeIdByName('Program A'));
+  insertPGR.run(programId, 2,  recipeIdByName('Program B'));
+  insertPGR.run(programId, 3,  recipeIdByName('Program C'));
+  insertPGR.run(programId, 4,  recipeIdByName('Program D'));
+  insertPGR.run(programId, 5,  recipeIdByName('Program A'));
+  insertPGR.run(programId, 6,  recipeIdByName('Program B'));
+  insertPGR.run(programId, 7,  recipeIdByName('Program C'));
+  insertPGR.run(programId, 8,  recipeIdByName('Program D'));
 
   db.prepare(`INSERT INTO settings (mode, active_program_id) VALUES ('preset', ?)`).run(programId);
 
@@ -211,30 +203,17 @@ function createActiveConfigSchema() {
 
 function seedInitialActiveConfigIfMissing() {
   const s = db.prepare(`SELECT mode, active_program_id, active_config_id FROM settings LIMIT 1`).get();
-  if (!s) {
-    console.log('No settings row; skipping active config bootstrap.');
-    return;
-  }
-  if (s.active_config_id) {
-    console.log('active_config_id already set; skipping bootstrap.');
-    return;
-  }
-  if (!s.active_program_id) {
-    console.log('No active_program_id; skipping bootstrap.');
-    return;
-  }
+  if (!s) return;
+  if (s.active_config_id) return;
+  if (!s.active_program_id) return;
 
   const prog = db.prepare(`SELECT id, name FROM programs WHERE id = ?`).get(s.active_program_id);
-  if (!prog) {
-    console.log('active_program_id points to missing program; skipping.');
-    return;
-  }
+  if (!prog) return;
 
-  const insertConfig = db.prepare(`
+  const info = db.prepare(`
     INSERT INTO run_configs (name, source, program_id)
     VALUES (?, 'program', ?)
-  `);
-  const info = insertConfig.run(`Initial from ${prog.name}`, prog.id);
+  `).run(`Initial from ${prog.name}`, prog.id);
   const newConfigId = info.lastInsertRowid;
 
   const pgrRows = db.prepare(`
@@ -262,19 +241,219 @@ function seedInitialActiveConfigIfMissing() {
   console.log(`Seeded run_config #${newConfigId} from "${prog.name}".`);
 }
 
-/* ---------------------- main ---------------------- */
-function main() {
-  // Create base schema first
-  createBaseSchema();
+/* -------------- KPI schema (13 items + gate dwell) -------------- */
+function createStatisticsSchema() {
+  run(`
+    -- Totals per program
+    CREATE TABLE IF NOT EXISTS program_stats (
+      program_id INTEGER PRIMARY KEY,
+      total_batches INTEGER NOT NULL DEFAULT 0,                -- (1)
+      total_batched_weight_g INTEGER NOT NULL DEFAULT 0,       -- (2)
+      total_reject_weight_g INTEGER NOT NULL DEFAULT 0,        -- (3)
+      total_giveaway_weight_g INTEGER NOT NULL DEFAULT 0,      -- (4)
+      total_items_batched INTEGER NOT NULL DEFAULT 0,          -- (7)
+      total_items_rejected INTEGER NOT NULL DEFAULT 0,         -- (8)
+      start_ts TEXT,                                           -- new: window start (ISO minute)
+      end_ts   TEXT,                                           -- new: window end   (ISO minute)
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (program_id) REFERENCES programs(id) ON DELETE CASCADE
+    );
+  `);
 
-  // Seed only if empty
-  seedIfEmpty();
+  // add start/end if an existing DB is present
+  if (!columnExists('program_stats', 'start_ts')) {
+    run(`ALTER TABLE program_stats ADD COLUMN start_ts TEXT;`);
+  }
+  if (!columnExists('program_stats', 'end_ts')) {
+    run(`ALTER TABLE program_stats ADD COLUMN end_ts TEXT;`);
+  }
 
-  // Create active-config schema & seed initial config from program
-  createActiveConfigSchema();
-  seedInitialActiveConfigIfMissing();
+  run(`
+    -- Totals per (program, recipe)
+    CREATE TABLE IF NOT EXISTS recipe_stats (
+      program_id INTEGER NOT NULL,
+      recipe_id  INTEGER NOT NULL,
+      total_batches INTEGER NOT NULL DEFAULT 0,                -- (1)
+      total_batched_weight_g INTEGER NOT NULL DEFAULT 0,       -- (2)
+      total_reject_weight_g INTEGER NOT NULL DEFAULT 0,        -- (3)
+      total_giveaway_weight_g INTEGER NOT NULL DEFAULT 0,      -- (4)
+      total_items_batched INTEGER NOT NULL DEFAULT 0,          -- (7)
+      total_items_rejected INTEGER NOT NULL DEFAULT 0,         -- (8)
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (program_id, recipe_id),
+      FOREIGN KEY (program_id) REFERENCES programs(id) ON DELETE CASCADE,
+      FOREIGN KEY (recipe_id)  REFERENCES recipes(id)  ON DELETE CASCADE
+    );
 
-  console.log('✅ SQLite setup complete.');
+    -- Per-minute throughput (program)
+    CREATE TABLE IF NOT EXISTS program_throughput_minute (
+      program_id INTEGER NOT NULL,
+      ts_minute  TEXT NOT NULL,                                -- ISO 'YYYY-MM-DDTHH:MM:00Z'
+      batches_created INTEGER NOT NULL DEFAULT 0,              -- (11)
+      pieces_processed INTEGER NOT NULL DEFAULT 0,             -- (12)
+      weight_processed_g INTEGER NOT NULL DEFAULT 0,           -- (13)
+      PRIMARY KEY (program_id, ts_minute),
+      FOREIGN KEY (program_id) REFERENCES programs(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_ptm_ts ON program_throughput_minute (ts_minute);
+
+    -- Per-minute throughput (program + recipe)
+    CREATE TABLE IF NOT EXISTS recipe_throughput_minute (
+      program_id INTEGER NOT NULL,
+      recipe_id  INTEGER NOT NULL,
+      ts_minute  TEXT NOT NULL,
+      batches_created INTEGER NOT NULL DEFAULT 0,              -- (11)
+      pieces_processed INTEGER NOT NULL DEFAULT 0,             -- (12)
+      weight_processed_g INTEGER NOT NULL DEFAULT 0,           -- (13)
+      PRIMARY KEY (program_id, recipe_id, ts_minute),
+      FOREIGN KEY (program_id) REFERENCES programs(id) ON DELETE CASCADE,
+      FOREIGN KEY (recipe_id)  REFERENCES recipes(id)  ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_rtm_ts ON recipe_throughput_minute (ts_minute);
+
+    -- Gate dwell accumulators (min/max/avg/std via Welford)
+    CREATE TABLE IF NOT EXISTS gate_dwell_accumulators (
+      program_id    INTEGER NOT NULL,
+      gate_number   INTEGER NOT NULL,  -- 0..N (0 = reject)
+      sample_count  INTEGER NOT NULL DEFAULT 0,
+      mean_sec      REAL    NOT NULL DEFAULT 0,
+      m2_sec        REAL    NOT NULL DEFAULT 0,
+      min_sec       REAL,
+      max_sec       REAL,
+      updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (program_id, gate_number),
+      FOREIGN KEY (program_id) REFERENCES programs(id) ON DELETE CASCADE
+    );
+  `);
+
+  // ---------- Views ----------
+  run(`
+    DROP VIEW IF EXISTS program_stats_view;
+    CREATE VIEW program_stats_view AS
+    SELECT
+      ps.program_id,
+      p.name AS program_name,
+      ps.start_ts,
+      ps.end_ts,
+      ps.total_batches,                                        -- (1)
+      ps.total_batched_weight_g,                               -- (2)
+      ps.total_reject_weight_g,                                -- (3)
+      ps.total_giveaway_weight_g,                              -- (4)
+      (ps.total_batched_weight_g + ps.total_giveaway_weight_g)
+        AS total_weight_processed_g,                           -- (5)
+      (ps.total_batched_weight_g + ps.total_giveaway_weight_g + ps.total_reject_weight_g)
+        AS total_weight_g,                                     -- (6)
+      ps.total_items_batched,                                  -- (7)
+      ps.total_items_rejected,                                 -- (8)
+      (ps.total_items_batched + ps.total_items_rejected)
+        AS total_items_processed,                              -- (9)
+      CASE
+        WHEN (ps.total_batched_weight_g + ps.total_giveaway_weight_g + ps.total_reject_weight_g) > 0
+          THEN ROUND( (ps.total_giveaway_weight_g * 100.0)
+                     / (ps.total_batched_weight_g + ps.total_giveaway_weight_g + ps.total_reject_weight_g), 4)
+        ELSE 0
+      END AS total_giveaway_pct,                               -- (10)
+      ps.updated_at
+    FROM program_stats ps
+    JOIN programs p ON p.id = ps.program_id;
+
+    DROP VIEW IF EXISTS recipe_stats_view;
+    CREATE VIEW recipe_stats_view AS
+    WITH gates AS (
+      SELECT rc.program_id,
+             rca.recipe_id,
+             GROUP_CONCAT(gn, ',') AS gates_assigned
+      FROM (
+        SELECT config_id, recipe_id, gate_number AS gn
+        FROM run_config_assignments
+        ORDER BY gn
+      ) rca
+      JOIN run_configs rc ON rc.id = rca.config_id
+      GROUP BY rc.program_id, rca.recipe_id
+    )
+    SELECT
+      rs.program_id,
+      r.name AS recipe_name,
+      COALESCE(g.gates_assigned, '') AS gates_assigned,
+      rs.total_batches,                                        -- (1)
+      rs.total_batched_weight_g,                               -- (2)
+      rs.total_reject_weight_g,                                -- (3)
+      rs.total_giveaway_weight_g,                              -- (4)
+      (rs.total_batched_weight_g + rs.total_giveaway_weight_g)
+        AS total_weight_processed_g,                           -- (5)
+      (rs.total_batched_weight_g + rs.total_giveaway_weight_g + rs.total_reject_weight_g)
+        AS total_weight_g,                                     -- (6)
+      rs.total_items_batched,                                  -- (7)
+      rs.total_items_rejected,                                 -- (8)
+      (rs.total_items_batched + rs.total_items_rejected)
+        AS total_items_processed,                              -- (9)
+      CASE
+        WHEN (rs.total_batched_weight_g + rs.total_giveaway_weight_g + rs.total_reject_weight_g) > 0
+          THEN ROUND( (rs.total_giveaway_weight_g * 100.0)
+                     / (rs.total_batched_weight_g + rs.total_giveaway_weight_g + rs.total_reject_weight_g), 4)
+        ELSE 0
+      END AS total_giveaway_pct,                               -- (10)
+      rs.updated_at
+    FROM recipe_stats rs
+    JOIN recipes r ON r.id = rs.recipe_id
+    LEFT JOIN gates g ON g.program_id = rs.program_id AND g.recipe_id = rs.recipe_id;
+
+    DROP VIEW IF EXISTS recipe_stats_report;
+    CREATE VIEW recipe_stats_report AS SELECT * FROM recipe_stats_view;
+
+    -- Named helper view (used by some exports)
+    DROP VIEW IF EXISTS recipe_throughput_minute_named;
+    CREATE VIEW recipe_throughput_minute_named AS
+    SELECT
+      rtm.program_id,
+      r.name AS recipe_name,
+      rtm.ts_minute,
+      rtm.batches_created,
+      rtm.pieces_processed,
+      rtm.weight_processed_g
+    FROM recipe_throughput_minute rtm
+    JOIN recipes r ON r.id = rtm.recipe_id;
+
+    DROP VIEW IF EXISTS gate_dwell_stats;
+    CREATE VIEW gate_dwell_stats AS
+    SELECT
+      program_id,
+      gate_number,
+      min_sec,
+      max_sec,
+      mean_sec AS avg_sec,
+      CASE WHEN sample_count > 1 THEN sqrt(m2_sec / (sample_count - 1)) ELSE 0 END AS std_sec,
+      sample_count,
+      updated_at
+    FROM gate_dwell_accumulators;
+  `);
+
+  // ---------- Triggers to keep start/end in sync from minute data ----------
+  run(`
+    CREATE TRIGGER IF NOT EXISTS trg_ptm_update_program_bounds
+    AFTER INSERT ON program_throughput_minute
+    BEGIN
+      UPDATE program_stats
+      SET start_ts = CASE
+                       WHEN start_ts IS NULL OR NEW.ts_minute < start_ts THEN NEW.ts_minute
+                       ELSE start_ts
+                     END,
+          end_ts   = CASE
+                       WHEN end_ts   IS NULL OR NEW.ts_minute > end_ts   THEN NEW.ts_minute
+                       ELSE end_ts
+                     END
+      WHERE program_id = NEW.program_id;
+    END;
+  `);
 }
 
+/* ---------------------- main ---------------------- */
+function main() {
+  createBaseSchema();
+  seedIfEmpty();
+  createActiveConfigSchema();
+  seedInitialActiveConfigIfMissing();
+  createStatisticsSchema();
+  console.log('✅ SQLite setup complete.');
+}
 main();

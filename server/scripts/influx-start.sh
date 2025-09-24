@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ===================== EDIT THESE ONCE =====================
-TOKEN="${TOKEN:-apiv3_HwRpZ0eAicrD7zOmtdwXyu-m4NMRWJswHX_yI2jvfvlqQwnh5xbz20B4HmNEHXS2BIkIsCx9JbuTQHzFkiqxSQ}"   # your apiv3_* token
+TOKEN="${TOKEN:-apiv3_1ZtW2zfUSYo6oGo-tz1ruZs_zJ64bieGj301QB8MG34gnK_ExQq0fD_wGZn_CLKY2PzJJdNg4RLHhOifC-JKlQ}"   # your apiv3_* token
 DB_NAME="${DB_NAME:-batching}"                        # database name
 HTTP_BIND="${HTTP_BIND:-127.0.0.1:8181}"              # listen address:port
 LICENSE_EMAIL="${LICENSE_EMAIL:-michaelgeurtsen@protonmail.com}"  # email to verify

@@ -7,7 +7,7 @@
     "start": "node index.js",
     "dev": "nodemon index.js",
     "db:setup": "node scripts/sqlite-setup.js",
-    "db:reset": "rm -f db/sqlite/batching_app.sqlite && node scripts/sqlite-setup.js",
+    "db:reset": "node -e \"const fs=require('fs');['db/sqlite/batching_app.sqlite','db/sqlite/batching_app.sqlite-wal','db/sqlite/batching_app.sqlite-shm'].forEach(f=>{try{fs.unlinkSync(f);}catch(e){}});\" && node scripts/sqlite-setup.js",
     "ts:seed": "node scripts/influx-seed-demo.js"
   },
   "dependencies": {

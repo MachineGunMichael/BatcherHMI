@@ -1,231 +1,168 @@
-import React, { createContext, useState, useContext, useEffect } from 'react';
+import { createContext, useContext, useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
+import authService from '../services/authService';
+import { useAppContext } from '../context/AppContext';
 
-// Create the context
-const AppContext = createContext(null);
+const AuthContext = createContext();
 
-export function AppContextProvider({ children }) {
-  // User role
-  const [currentRole, setCurrentRole] = useState('admin');
+// Helper function to check server connectivity
+const checkServerConnectivity = async () => {
+  const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:5001';
+  console.log("Checking server connectivity at:", API_URL);
   
-  // Dashboard - Initialize with default values
-  const [dashboardVisibleSeries, setDashboardVisibleSeriesState] = useState({
-    "Program A": true,
-    "Program B": true,
-    "Program C": true,
-    "Program D": true,
-    "Total": true
-  });
-  
-  // Simulation - Initialize with default values
-  const [selectedSimulation, setSelectedSimulationState] = useState("");
-  const [sliderValue, setSliderValueState] = useState(0);
-  
-  // Settings - Initialize with default values
-  const [settingsMode, setSettingsModeState] = useState("preset");
-  const [assignedPrograms, setAssignedProgramsState] = useState([]);
-  
-  // DEBUG - Log state changes
-  useEffect(() => {
-    console.log("Context state changed:", {
-      currentRole,
-      dashboardVisibleSeries,
-      selectedSimulation,
-      sliderValue,
-      settingsMode,
-      assignedPrograms
+  try {
+    // Use a more direct approach - just ping the base URL
+    // Most servers will respond to this even without specific endpoint handling
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    
+    const response = await fetch(`${API_URL}`, {
+      method: 'GET',
+      signal: controller.signal,
+      // Skip content-type to avoid preflight CORS issues
+      mode: 'cors',
+      cache: 'no-cache'
     });
-  }, [currentRole, dashboardVisibleSeries, selectedSimulation, sliderValue, settingsMode, assignedPrograms]);
-
-  // Load persisted data on mount
-  useEffect(() => {
-    console.log("Loading persisted data");
     
-    try {
-      const dashboardData = localStorage.getItem('dashboard_visibleSeries');
-      if (dashboardData) {
-        const parsed = JSON.parse(dashboardData);
-        console.log("Loaded dashboard data:", parsed);
-        setDashboardVisibleSeriesState(parsed);
-      }
-    } catch (error) {
-      console.error("Error loading dashboard data:", error);
-    }
+    clearTimeout(timeoutId);
+    console.log("Server connectivity success - status:", response.status);
+    return true;
+  } catch (error) {
+    console.error("Server connectivity failed:", error.name, error.message);
     
+    // Try a second method if the first fails
     try {
-      const simulationData = localStorage.getItem('simulation_selectedSimulation');
-      if (simulationData) {
-        console.log("Loaded simulation selection:", simulationData);
-        setSelectedSimulationState(simulationData);
-      }
-    } catch (error) {
-      console.error("Error loading simulation selection:", error);
-    }
-    
-    try {
-      const sliderData = localStorage.getItem('simulation_sliderValue');
-      if (sliderData) {
-        console.log("Loaded slider value:", sliderData);
-        setSliderValueState(Number(sliderData));
-      }
-    } catch (error) {
-      console.error("Error loading slider value:", error);
-    }
-    
-    try {
-      const settingsModeData = localStorage.getItem('settings_mode');
-      if (settingsModeData) {
-        console.log("Loaded settings mode:", settingsModeData);
-        setSettingsModeState(settingsModeData);
-      }
-    } catch (error) {
-      console.error("Error loading settings mode:", error);
-    }
-    
-    try {
-      const assignedProgramsData = localStorage.getItem('settings_assignedPrograms');
-      if (assignedProgramsData) {
-        const parsed = JSON.parse(assignedProgramsData);
-        console.log("Loaded assigned programs:", parsed);
-        setAssignedProgramsState(parsed);
-      }
-    } catch (error) {
-      console.error("Error loading assigned programs:", error);
-    }
-  }, []);
-
-  // Update function with localStorage persistence
-  const setDashboardVisibleSeries = (value) => {
-    console.log("Setting dashboard visible series:", value);
-    if (typeof value === 'function') {
-      setDashboardVisibleSeriesState(prev => {
-        const updated = value(prev);
-        try {
-          localStorage.setItem('dashboard_visibleSeries', JSON.stringify(updated));
-        } catch (error) {
-          console.error("Error saving dashboard data:", error);
-        }
-        return updated;
+      console.log("Trying alternative connectivity check...");
+      // Use a very simple image request which often bypasses CORS
+      const img = document.createElement('img');
+      img.src = `${API_URL}/favicon.ico?_=${Date.now()}`;
+      
+      await new Promise((resolve, reject) => {
+        img.onload = () => {
+          console.log("Image load successful - server is running");
+          resolve();
+        };
+        img.onerror = () => {
+          // Even errors mean the server responded
+          console.log("Image errored but server responded");
+          resolve(); 
+        };
+        setTimeout(() => reject(new Error("Timeout")), 3000);
       });
-    } else {
-      setDashboardVisibleSeriesState(value);
-      try {
-        localStorage.setItem('dashboard_visibleSeries', JSON.stringify(value));
-      } catch (error) {
-        console.error("Error saving dashboard data:", error);
-      }
+      
+      return true;
+    } catch (secondError) {
+      console.error("All connectivity checks failed");
+      return false;
     }
-  };
-  
-  const setSelectedSimulation = (value) => {
-    console.log("Setting selected simulation:", value);
-    setSelectedSimulationState(value);
-    try {
-      localStorage.setItem('simulation_selectedSimulation', value);
-    } catch (error) {
-      console.error("Error saving simulation selection:", error);
-    }
-  };
-  
-  const setSliderValue = (value) => {
-    console.log("Setting slider value:", value);
-    setSliderValueState(value);
-    try {
-      localStorage.setItem('simulation_sliderValue', String(value));
-    } catch (error) {
-      console.error("Error saving slider value:", error);
-    }
-  };
-  
-  const setSettingsMode = (value) => {
-    console.log("Setting settings mode:", value);
-    setSettingsModeState(value);
-    try {
-      localStorage.setItem('settings_mode', value);
-    } catch (error) {
-      console.error("Error saving settings mode:", error);
-    }
-  };
-  
-  const setAssignedPrograms = (value) => {
-    console.log("Setting assigned programs:", value);
-    if (typeof value === 'function') {
-      setAssignedProgramsState(prev => {
-        const updated = value(prev);
-        try {
-          localStorage.setItem('settings_assignedPrograms', JSON.stringify(updated));
-        } catch (error) {
-          console.error("Error saving assigned programs:", error);
-        }
-        return updated;
-      });
-    } else {
-      setAssignedProgramsState(value);
-      try {
-        localStorage.setItem('settings_assignedPrograms', JSON.stringify(value));
-      } catch (error) {
-        console.error("Error saving assigned programs:", error);
-      }
-    }
-  };
-
-  const contextValue = {
-    // Role
-    currentRole,
-    setCurrentRole,
-    
-    // Dashboard
-    dashboardVisibleSeries,
-    setDashboardVisibleSeries,
-    
-    // Simulation
-    selectedSimulation,
-    setSelectedSimulation,
-    sliderValue,
-    setSliderValue,
-    
-    // Settings
-    settingsMode,
-    setSettingsMode,
-    assignedPrograms,
-    setAssignedPrograms,
-  };
-
-  return (
-    <AppContext.Provider value={contextValue}>
-      {children}
-    </AppContext.Provider>
-  );
-}
-
-// Custom hook with error handling
-export function useAppContext() {
-  const context = useContext(AppContext);
-  if (context === null || context === undefined) {
-    console.error("useAppContext must be used within an AppContextProvider");
-    // Return default values instead of throwing - more resilient
-    return {
-      currentRole: 'admin',
-      setCurrentRole: () => {},
-      dashboardVisibleSeries: {
-        "Program A": true,
-        "Program B": true,
-        "Program C": true,
-        "Program D": true,
-        "Total": true
-      },
-      setDashboardVisibleSeries: () => {},
-      selectedSimulation: "",
-      setSelectedSimulation: () => {},
-      sliderValue: 0,
-      setSliderValue: () => {},
-      settingsMode: "preset",
-      setSettingsMode: () => {},
-      assignedPrograms: [],
-      setAssignedPrograms: () => {},
-    };
   }
-  return context;
-}
+};
 
-// For backward compatibility
-export { AppContextProvider as AppProvider };
+export const AuthProvider = ({ children }) => {
+  // Initialize state
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const navigate = useNavigate();
+  const { setCurrentRole } = useAppContext();
+
+  // Check if user is already logged in (token exists)
+  useEffect(() => {
+    const checkLoggedIn = async () => {
+      const token = localStorage.getItem('token');
+      if (token) {
+        try {
+          setLoading(true);
+          
+          // First verify server is available
+          const isServerAvailable = await checkServerConnectivity();
+          if (!isServerAvailable) {
+            throw new Error("Authentication server is not available");
+          }
+          
+          const userData = await authService.validateToken();
+          setUser(userData);
+          setCurrentRole(userData.role);
+          setIsAuthenticated(true);
+          console.log("User restored from token:", userData);
+        } catch (error) {
+          console.error("Token validation failed:", error);
+          localStorage.removeItem('token');
+          setIsAuthenticated(false);
+          setUser(null);
+          setError("Server unavailable or token invalid. Please log in again.");
+        } finally {
+          setLoading(false);
+        }
+      } else {
+        setLoading(false);
+        setIsAuthenticated(false);
+      }
+    };
+
+    checkLoggedIn();
+  }, [setCurrentRole]);
+
+  // Login function
+  const login = async (username, password, role) => {
+    setLoading(true);
+    setError('');
+    
+    try {
+      // First check server connectivity
+      const isServerAvailable = await checkServerConnectivity();
+      if (!isServerAvailable) {
+        throw new Error("Authentication server is not available. Please check if the server is running.");
+      }
+      
+      const data = await authService.login(username, password, role);
+      
+      // Verify we got a valid token from the server
+      if (!data || !data.token) {
+        throw new Error("Invalid authentication response");
+      }
+      
+      setUser(data.user);
+      localStorage.setItem('token', data.token);
+      setCurrentRole(role);
+      setIsAuthenticated(true);
+      
+      navigate('/');
+      
+      return { success: true, user: data.user };
+    } catch (error) {
+      const errorMessage = error.message || "Authentication failed";
+      console.error("Login error:", errorMessage);
+      setError(errorMessage);
+      setIsAuthenticated(false);
+      return { success: false, error: errorMessage };
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Logout function
+  const logout = () => {
+    setUser(null);
+    setIsAuthenticated(false);
+    localStorage.removeItem('token');
+    navigate('/login');
+  };
+
+  const value = { 
+    user, 
+    login, 
+    logout, 
+    loading, 
+    error,
+    isAuthenticated, // Use the explicit state variable
+    clearError: () => setError(null)
+  };
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+};
+
+export const useAuth = () => useContext(AuthContext);
+
+export default AuthContext;
