@@ -228,18 +228,7 @@ class SqliteWriter:
                 pass
 
     def _ensure_views(self):
-        # A view that exposes recipe name for minute throughput
-        self.conn.execute("""
-            CREATE VIEW IF NOT EXISTS recipe_throughput_minute_named AS
-            SELECT rtm.program_id,
-                r.name AS recipe_name,
-                rtm.ts_minute,
-                rtm.batches_created,
-                rtm.pieces_processed,
-                rtm.weight_processed_g
-            FROM recipe_throughput_minute rtm
-            JOIN recipes r ON r.id = rtm.recipe_id
-        """)
+        # No minute views to create anymore; keep method for idempotency/compatibility.
         self.conn.commit()
 
     def close(self):
@@ -333,21 +322,6 @@ class SqliteWriter:
               int(totals.get("total_items_rejected", 0))
         ))
 
-    def upsert_program_minute(self, program_id: int, ts_minute_z: str, v: Dict[str, float]):
-        self.conn.execute("""
-            INSERT INTO program_throughput_minute
-              (program_id, ts_minute, batches_created, pieces_processed, weight_processed_g)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(program_id, ts_minute) DO UPDATE SET
-              batches_created    = batches_created    + excluded.batches_created,
-              pieces_processed   = pieces_processed   + excluded.pieces_processed,
-              weight_processed_g = weight_processed_g + excluded.weight_processed_g
-        """, (program_id, ts_minute_z,
-              int(v.get("batches_created", 0)),
-              int(v.get("pieces_processed", 0)),
-              int(v.get("weight_processed_g", 0))
-        ))
-
     def write_program_totals(self, program_id: int, totals: Dict[str, float],
                             start_utc: pd.Timestamp, end_utc: pd.Timestamp):
         self.conn.execute("""
@@ -383,21 +357,6 @@ class SqliteWriter:
             int(totals.get("total_items_rejected", 0)),
             start_utc.strftime("%Y-%m-%dT%H:%M:00Z"),
             end_utc.strftime("%Y-%m-%dT%H:%M:00Z"),
-        ))
-
-    def upsert_recipe_minute(self, program_id: int, recipe_id: int, ts_minute_z: str, v: Dict[str, float]):
-        self.conn.execute("""
-            INSERT INTO recipe_throughput_minute
-              (program_id, recipe_id, ts_minute, batches_created, pieces_processed, weight_processed_g)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(program_id, recipe_id, ts_minute) DO UPDATE SET
-              batches_created    = batches_created    + excluded.batches_created,
-              pieces_processed   = pieces_processed   + excluded.pieces_processed,
-              weight_processed_g = weight_processed_g + excluded.weight_processed_g
-        """, (program_id, recipe_id, ts_minute_z,
-              int(v.get("batches_created", 0)),
-              int(v.get("pieces_processed", 0)),
-              int(v.get("weight_processed_g", 0))
         ))
 
     def update_gate_dwell(self, program_id: int, gate_number: int, durations_sec: List[float]):
@@ -692,47 +651,58 @@ class InfluxWriter:
                                giveaway_pct: float, rejects_per_min: Optional[float] = None):
         self.writeKpiMinute(t_minute_utc, "__combined", batches_min, giveaway_pct, rejects_per_min)
 
-    def writeKpiMinuteDF(self, recipe_kpi_minute, assignments: WindowAssignments, program_id: int):
+    def writeKpiMinuteDF(self, recipe_kpi_minute, recipe_minute, assignments: WindowAssignments, program_id: int):
+        """
+        Write per-recipe per-minute KPI rows with:
+        - batches_min
+        - giveaway_pct
+        - pieces_processed           <-- NEW
+        - weight_processed_g         <-- NEW
+        """
         import pandas as pd
+        if not self.client or not recipe_kpi_minute:
+            return pd.DataFrame(columns=['_time','program','recipe','batches_min','giveaway_pct','pieces_processed','weight_processed_g'])
 
-        if not self.client:
-            return pd.DataFrame(columns=['_time','program','recipe','batches_min','giveaway_pct'])
-
-        # 1) build DF only from real datapoints (no densify here)
         rows = []
         for (rid, ts_z), v in recipe_kpi_minute.items():
             gates = [g for g, rr in assignments.gate_to_recipe_id.items() if rr == rid]
             if not gates:
                 continue
             rname = assignments.gate_to_recipe_name[gates[0]] or f"recipe_{rid}"
+
+            # new fields from recipe_minute (same key)
+            rm = recipe_minute.get((rid, ts_z), {})
             rows.append({
-                '_time': pd.to_datetime(ts_z, utc=True),
+                '_time': pd.Timestamp(ts_z).tz_localize('UTC') if pd.Timestamp(ts_z).tzinfo is None else pd.Timestamp(ts_z).tz_convert('UTC'),
                 'program': str(program_id),
                 'recipe': str(rname),
                 'batches_min': float(v.get('batches_min', 0.0)),
                 'giveaway_pct': float(v.get('giveaway_pct', 0.0)),
+                'pieces_processed': float(rm.get('pieces_processed', 0.0)),
+                'weight_processed_g': float(rm.get('weight_processed_g', 0.0)),
             })
 
-        df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=['_time','program','recipe','batches_min','giveaway_pct'])
+        # Optional dense fill for every recipe and every minute in the window
+        full_minutes = None
+        if DENSE_INFLUX_MINUTES and '__full_minutes__' in assignments.gate_to_recipe_name:
+            full_minutes = assignments.gate_to_recipe_name['__full_minutes__']  # list[str iso Z]
+            all_recipes = [assignments.gate_to_recipe_name[g] for g in assignments.gate_to_recipe_name if isinstance(g, int) and assignments.gate_to_recipe_name[g]]
+            existing = {(r['recipe'], r['_time'].strftime("%Y-%m-%dT%H:%M:00Z")) for r in rows}
+            for rname in set(all_recipes):
+                for tsz in full_minutes:
+                    key = (rname, tsz)
+                    if key not in existing:
+                        rows.append({
+                            '_time': pd.Timestamp(tsz).tz_localize('UTC') if pd.Timestamp(tsz).tzinfo is None else pd.Timestamp(tsz).tz_convert('UTC'),
+                            'program': str(program_id),
+                            'recipe': str(rname),
+                            'batches_min': 0.0,
+                            'giveaway_pct': 0.0,
+                            'pieces_processed': 0.0,
+                            'weight_processed_g': 0.0,
+                        })
 
-        # 2) densify *after* building the DF (avoid duplicates)
-        if DENSE_INFLUX_MINUTES and '__full_minutes__' in assignments.gate_to_recipe_name and not df.empty:
-            full_idx = pd.to_datetime(assignments.gate_to_recipe_name['__full_minutes__'], utc=True)
-            recipes = sorted({
-                assignments.gate_to_recipe_name[g]
-                for g in assignments.gate_to_recipe_name
-                if isinstance(g, int) and assignments.gate_to_recipe_name[g]
-            })
-            mi = pd.MultiIndex.from_product([recipes, full_idx], names=['recipe', '_time'])
-
-            df = (
-                df.set_index(['recipe','_time'])
-                .reindex(mi)
-                .fillna({'batches_min': 0.0, 'giveaway_pct': 0.0})
-                .reset_index()
-            )
-            df['program'] = str(program_id)
-
+        df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=['_time','program','recipe','batches_min','giveaway_pct','pieces_processed','weight_processed_g'])
         if not df.empty:
             self.client.write(
                 df,
@@ -743,46 +713,38 @@ class InfluxWriter:
         return df
 
 
-    def writeKpiMinuteCombinedDF(self, combined_kpi_minute, program_id: int, gate0_counts_per_min: Dict[str, int], full_minutes_z=None):
+    def writeKpiMinuteCombinedDF(self, combined_kpi_minute, prog_minute, program_id: int, gate0_counts_per_min: Dict[str, int]):
+        """
+        combined: roll-up across recipes, tagged with program.
+        Adds:
+        - pieces_processed      (from prog_minute; counts ALL pieces incl rejects, same as old SQLite)
+        - weight_processed_g    (from prog_minute; non-reject weight per minute)
+        """
         import pandas as pd
+        if not self.client or not combined_kpi_minute:
+            return pd.DataFrame(columns=['_time','program','recipe','batches_min','giveaway_pct','rejects_per_min','pieces_processed','weight_processed_g'])
 
         rows = []
         for ts_z, v in combined_kpi_minute.items():
+            pm = prog_minute.get(ts_z, {})
             rows.append({
-                '_time': pd.to_datetime(ts_z, utc=True),
+                '_time': pd.Timestamp(ts_z).tz_localize('UTC') if pd.Timestamp(ts_z).tzinfo is None else pd.Timestamp(ts_z).tz_convert('UTC'),
                 'program': str(program_id),
                 'recipe': '__combined',
                 'batches_min': float(v.get('batches_min', 0.0)),
                 'giveaway_pct': float(v.get('giveaway_pct', 0.0)),
                 'rejects_per_min': float(gate0_counts_per_min.get(ts_z, 0)),
+                'pieces_processed': float(pm.get('pieces_processed', 0.0)),
+                'weight_processed_g': float(pm.get('weight_processed_g', 0.0)),
             })
-        df = pd.DataFrame(rows, columns=['_time','program','recipe','batches_min','giveaway_pct','rejects_per_min'])
 
-        # densify using the window’s minute index if provided
-        if full_minutes_z:
-            full_idx = pd.to_datetime(full_minutes_z, utc=True)
-            g0 = {pd.to_datetime(k, utc=True): float(v) for k, v in gate0_counts_per_min.items()}
-            df = (
-                df.set_index('_time')
-                .reindex(full_idx)
-                .assign(
-                    program=str(program_id),
-                    recipe='__combined',
-                    batches_min=lambda d: d['batches_min'].fillna(0.0),
-                    giveaway_pct=lambda d: d['giveaway_pct'].fillna(0.0),
-                    rejects_per_min=lambda d: d.index.map(lambda t: g0.get(t, 0.0))
-                )
-                .reset_index()
-                .rename(columns={'index':'_time'})
-            )
-
-        if self.client and not df.empty:
-            self.client.write(
-                df,
-                data_frame_measurement_name='kpi_minute',
-                data_frame_timestamp_column='_time',
-                data_frame_tag_columns=['program','recipe'],
-            )
+        df = pd.DataFrame(rows)
+        self.client.write(
+            df,
+            data_frame_measurement_name='kpi_minute',
+            data_frame_timestamp_column='_time',
+            data_frame_tag_columns=['program','recipe'],
+        )
         return df
     
     # --------- M4
@@ -933,26 +895,6 @@ def load_recipe_map(recipe_map_path: str) -> Dict[str, RecipeSpec]:
     return out
 
 # --------------------- KPI COMPUTATION ---------------------
-
-def densify_sql_minutes(prog_minute: Dict[str, Dict[str, float]],
-                        recipe_minute: Dict[tuple, Dict[str, float]],
-                        assignments: WindowAssignments,
-                        full_minutes_z: List[str]):
-    # Program minutes
-    for ts_z in full_minutes_z:
-        prog_minute.setdefault(ts_z, {"batches_created":0, "pieces_processed":0, "weight_processed_g":0})
-
-    # Recipe minutes (for every assigned recipe)
-    recipe_names = [assignments.gate_to_recipe_name[g]
-                    for g in assignments.gate_to_recipe_name
-                    if isinstance(g, int) and assignments.gate_to_recipe_name[g]]
-    # Map recipe_id -> exists
-    rid_set = set(assignments.recipe_id_to_gates.keys())
-    for rid in rid_set:
-        if rid is None:
-            continue
-        for ts_z in full_minutes_z:
-            recipe_minute.setdefault((rid, ts_z), {"batches_created":0, "pieces_processed":0, "weight_processed_g":0})
 
 def compute_window_kpis(df_slice: pd.DataFrame, assignments: WindowAssignments):
     """
@@ -1476,21 +1418,10 @@ def main():
             t1 = df_slice['Timestamp'].max().floor('T')
             full_minutes_z_sql = [m.strftime("%Y-%m-%dT%H:%M:00Z") for m in pd.date_range(t0, t1, freq='T')]
 
-            densify_sql_minutes(prog_minute, recipe_minute, assignments, full_minutes_z_sql)
-
             # --- WRITE SQLITE ---
             sw.write_program_totals(program_id, prog_totals, start_utc, end_utc)
             for rid, totals in recipe_totals.items():
                 sw.bump_recipe_totals(program_id, rid, totals)
-            zero_prog = {"batches_created":0, "pieces_processed":0, "weight_processed_g":0}
-            for ts_z in full_minutes_z_sql:
-                sw.upsert_program_minute(program_id, ts_z, prog_minute.get(ts_z, zero_prog))
-            zero_rec = {"batches_created":0, "pieces_processed":0, "weight_processed_g":0}
-            for rid in assignments.recipe_id_to_gates.keys():
-                if rid is None:
-                    continue
-                for ts_z in full_minutes_z_sql:
-                    sw.upsert_recipe_minute(program_id, rid, ts_z, recipe_minute.get((rid, ts_z), zero_rec))
             for gate, durations in dwell.items():
                 sw.update_gate_dwell(program_id, gate, durations)
 
@@ -1570,20 +1501,28 @@ def main():
                     )
 
                 # ---------- M3: recipe kpis per minute (fast DF) ----------
-                m3_recipe_df = iw.writeKpiMinuteDF(recipe_kpi_minute, assignments, program_id)
+                m3_recipe_df = iw.writeKpiMinuteDF(recipe_kpi_minute, recipe_minute, assignments, program_id)
                 if not m3_recipe_df.empty:
                     CSV_ROWS_INFLUX_M3_RECIPE.extend(
                         m3_recipe_df.assign(
                             ts_minute=lambda d: d['_time'].map(utc_iso)
-                        )[ ['ts_minute','program','recipe','batches_min','giveaway_pct'] ].to_dict('records')
+                        )[[
+                            'ts_minute', 'program', 'recipe',
+                            'batches_min', 'giveaway_pct',
+                            'pieces_processed', 'weight_processed_g'
+                        ]].to_dict('records')
                     )
 
-                m3_combined_df = iw.writeKpiMinuteCombinedDF(combined_kpi_minute, program_id, gate0_counts_per_min, full_minutes_z)
+                m3_combined_df = iw.writeKpiMinuteCombinedDF(combined_kpi_minute, prog_minute, program_id, gate0_counts_per_min)
                 if not m3_combined_df.empty:
                     CSV_ROWS_INFLUX_M3_COMBINED.extend(
                         m3_combined_df.assign(
                             ts_minute=lambda d: d['_time'].map(utc_iso)
-                        )[ ['ts_minute','program','recipe','batches_min','giveaway_pct','rejects_per_min'] ].to_dict('records')
+                        )[[
+                            'ts_minute', 'program', 'recipe',
+                            'batches_min', 'giveaway_pct', 'rejects_per_min',
+                            'pieces_processed', 'weight_processed_g'
+                        ]].to_dict('records')
                     )
 
                 print("[debug] M2 rows (gate_state):", 0 if m2_df is None else len(m2_df))
@@ -1668,8 +1607,6 @@ def main():
             jobs = [
                 ("program_stats_view",         "SELECT * FROM program_stats_view",                "sqlite_program_stats.csv"),
                 ("recipe_stats_report",        "SELECT * FROM recipe_stats_report",               "sqlite_recipe_stats.csv"),  # <-- changed
-                ("program_throughput_minute",  "SELECT * FROM program_throughput_minute",         "sqlite_program_throughput_minute.csv"),
-                ("recipe_throughput_minute",   "SELECT * FROM recipe_throughput_minute_named",    "sqlite_recipe_throughput_minute.csv"),
                 ("gate_dwell_stats",           "SELECT * FROM gate_dwell_stats",                  "sqlite_gate_dwell_stats.csv"),
             ]
             for _, sql, fname in jobs:

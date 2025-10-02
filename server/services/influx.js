@@ -109,7 +109,15 @@ async function writeGateState({ gate, pieces_in_gate, weight_sum_g, ts }) {
 }
 
 // M3: per-recipe per-minute KPI (no rejects_per_min here), program tagged
-async function writeKpiMinute({ program, recipe, batches_min, giveaway_pct, ts }) {
+async function writeKpiMinute({
+  program,
+  recipe,
+  batches_min,
+  giveaway_pct,
+  pieces_processed,    // NEW (optional)
+  weight_processed_g,  // NEW (optional)
+  ts,
+}) {
   return writePoint({
     measurement: 'kpi_minute',
     tags: {
@@ -117,15 +125,26 @@ async function writeKpiMinute({ program, recipe, batches_min, giveaway_pct, ts }
       recipe: String(recipe),
     },
     fields: {
-      batches_min: Number(batches_min),
-      giveaway_pct: Number(giveaway_pct),
+      batches_min: Number(batches_min ?? 0),
+      giveaway_pct: Number(giveaway_pct ?? 0),
+      // new fields; kept optional so existing callers don't break
+      pieces_processed: Number(pieces_processed ?? 0),
+      weight_processed_g: Number(weight_processed_g ?? 0),
     },
     timestamp: ts,
   });
 }
 
-// M3 combined: includes rejects_per_min (from Gate 0), program tagged
-async function writeKpiMinuteCombined({ program, batches_min, giveaway_pct, rejects_per_min, ts }) {
+// M3 combined: includes rejects_per_min + the two NEW fields, program tagged
+async function writeKpiMinuteCombined({
+  program,
+  batches_min,
+  giveaway_pct,
+  rejects_per_min,
+  pieces_processed,     // NEW (optional)
+  weight_processed_g,   // NEW (optional)
+  ts,
+}) {
   return writePoint({
     measurement: 'kpi_minute',
     tags: {
@@ -133,9 +152,12 @@ async function writeKpiMinuteCombined({ program, batches_min, giveaway_pct, reje
       recipe: '__combined',
     },
     fields: {
-      batches_min: Number(batches_min),
-      giveaway_pct: Number(giveaway_pct),
+      batches_min: Number(batches_min ?? 0),
+      giveaway_pct: Number(giveaway_pct ?? 0),
       rejects_per_min: Number(rejects_per_min ?? 0),
+      // new fields; optional and default to 0
+      pieces_processed: Number(pieces_processed ?? 0),
+      weight_processed_g: Number(weight_processed_g ?? 0),
     },
     timestamp: ts,
   });
@@ -199,7 +221,7 @@ function buildQueryRecipeKpiMinute(startISO, endISO, programId) {
 from(bucket: "${database}")
   |> range(start: ${JSON.stringify(startISO)}, stop: ${JSON.stringify(endISO)})
   |> filter(fn: (r) => r._measurement == "kpi_minute" and r.program == "${String(programId)}" and r.recipe != "__combined")
-  |> keep(columns: ["_time","program","recipe","batches_min","giveaway_pct"])
+  |> keep(columns: ["_time","program","recipe","batches_min","giveaway_pct","pieces_processed","weight_processed_g"])
 `;
 }
 
@@ -208,7 +230,7 @@ function buildQueryCombinedKpiMinute(startISO, endISO, programId) {
 from(bucket: "${database}")
   |> range(start: ${JSON.stringify(startISO)}, stop: ${JSON.stringify(endISO)})
   |> filter(fn: (r) => r._measurement == "kpi_minute" and r.program == "${String(programId)}" and r.recipe == "__combined")
-  |> keep(columns: ["_time","program","recipe","batches_min","giveaway_pct","rejects_per_min"])
+  |> keep(columns: ["_time","program","recipe","batches_min","giveaway_pct","rejects_per_min","pieces_processed","weight_processed_g"])
 `;
 }
 

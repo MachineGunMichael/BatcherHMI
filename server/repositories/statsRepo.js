@@ -71,40 +71,6 @@ function upsertRecipeTotals(programId, recipeId, delta) {
   });
 }
 
-function upsertProgramMinute(programId, ts_minute, v) {
-  const {
-    batches_created = 0,
-    pieces_processed = 0,
-    weight_processed_g = 0,
-  } = v || {};
-  db.prepare(`
-    INSERT INTO program_throughput_minute
-      (program_id, ts_minute, batches_created, pieces_processed, weight_processed_g)
-    VALUES (@pid, @ts, @bm, @pm, @wm)
-    ON CONFLICT(program_id, ts_minute) DO UPDATE SET
-      batches_created   = batches_created   + @bm,
-      pieces_processed  = pieces_processed  + @pm,
-      weight_processed_g= weight_processed_g+ @wm
-  `).run({ pid: programId, ts: ts_minute, bm: batches_created, pm: pieces_processed, wm: weight_processed_g });
-}
-
-function upsertRecipeMinute(programId, recipeId, ts_minute, v) {
-  const {
-    batches_created = 0,
-    pieces_processed = 0,
-    weight_processed_g = 0,
-  } = v || {};
-  db.prepare(`
-    INSERT INTO recipe_throughput_minute
-      (program_id, recipe_id, ts_minute, batches_created, pieces_processed, weight_processed_g)
-    VALUES (@pid, @rid, @ts, @bm, @pm, @wm)
-    ON CONFLICT(program_id, recipe_id, ts_minute) DO UPDATE SET
-      batches_created   = batches_created   + @bm,
-      pieces_processed  = pieces_processed  + @pm,
-      weight_processed_g= weight_processed_g+ @wm
-  `).run({ pid: programId, rid: recipeId, ts: ts_minute, bm: batches_created, pm: pieces_processed, wm: weight_processed_g });
-}
-
 function updateGateDwell(programId, gateNumber, durationSec) {
   const row = db.prepare(`
     SELECT sample_count, mean_sec, m2_sec, min_sec, max_sec
@@ -147,31 +113,13 @@ function getProgramSummary(programId) {
 function getRecipeSummaries(programId) {
   return db.prepare(`SELECT * FROM recipe_stats_view WHERE program_id = ? ORDER BY recipe_id`).all(programId);
 }
-function getThroughputSeries(programId, fromISO, toISO) {
-  const program = db.prepare(`
-    SELECT ts_minute, batches_created, pieces_processed, weight_processed_g
-    FROM program_throughput_minute
-    WHERE program_id=? AND ts_minute BETWEEN ? AND ?
-    ORDER BY ts_minute
-  `).all(programId, fromISO, toISO);
-
-  const recipes = db.prepare(`
-    SELECT recipe_id, ts_minute, batches_created, pieces_processed, weight_processed_g
-    FROM recipe_throughput_minute
-    WHERE program_id=? AND ts_minute BETWEEN ? AND ?
-    ORDER BY recipe_id, ts_minute
-  `).all(programId, fromISO, toISO);
-
-  return { program, recipes };
-}
 
 module.exports = {
   // writers (optional)
   upsertProgramTotals, upsertRecipeTotals,
-  upsertProgramMinute, upsertRecipeMinute,
   updateGateDwell,
   // readers
-  getProgramSummary, getRecipeSummaries, getThroughputSeries,
+  getProgramSummary, getRecipeSummaries,
   // helper
   toMinuteUTC,
 };
