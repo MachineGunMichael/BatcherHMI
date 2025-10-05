@@ -39,23 +39,10 @@ router.post('/piece', verifyToken, async (req, res) => {
 });
 
 /**
- * M5: assignments
- * body: { piece_id, gate, recipe, ts? }
- * (No weight_g here; matches services/influx.js writeAssignment signature.)
+ * M5 (assignments) REMOVED - now stored in SQLite only.
+ * Use /api/settings routes to change active configuration,
+ * which updates run_config_assignments and settings_history tables.
  */
-router.post('/assignment', verifyToken, async (req, res) => {
-  try {
-    const { piece_id, gate, recipe, ts } = req.body || {};
-    if (!piece_id || gate === undefined || !recipe) {
-      return res.status(400).json({ message: 'piece_id, gate, recipe are required' });
-    }
-    await influx.writeAssignment({ piece_id, gate, recipe, ts });
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error('writeAssignment error:', e);
-    return res.status(500).json({ message: 'writeAssignment failed' });
-  }
-});
 
 /**
  * M2: gate_state

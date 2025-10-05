@@ -68,7 +68,7 @@ CSV_ROWS_INFLUX_M3_COMBINED: List[dict] = []   # per-minute combined KPI
 CSV_ROWS_INFLUX_M4_TOTALS: List[dict]   = []   # per-recipe totals (end of window)
 CSV_ROWS_INFLUX_M2_GATE: List[dict]     = []   # per-minute gate_state
 CSV_ROWS_INFLUX_M1_PIECES: List[dict]   = []   # raw pieces stream (optional; handy for sanity)
-CSV_ROWS_INFLUX_M5_ASSIGNMENTS: List[dict] = []   # gate assignments at window start
+# M5 (assignments) removed - now stored in SQLite only (run_config_assignments + settings_history tables)
 
 # --------------------- TZ HELPERS ---------------------
 UTC = tz.UTC
@@ -407,7 +407,7 @@ class InfluxWriter:
       M3  writeKpiMinute      -> measurement 'kpi_minute', tags: {recipe}, fields: {batches_min, giveaway_pct, rejects_per_min?}
           writeKpiMinuteCombined -> same as M3 with recipe="__combined"
       M4  writeKpiTotals      -> measurement 'kpi_totals', tags: {recipe}, fields: {total_batches, giveaway_g_per_batch, giveaway_pct_avg}
-      M5  writeAssignment     -> measurement 'assignments', tags: {piece_id?, gate?, recipe?}, fields: {assigned:1}
+      M5  REMOVED - assignments now in SQLite (run_config_assignments + settings_history tables)
     """
     def __init__(self):
         if not HAS_INFLUX:
@@ -774,14 +774,8 @@ class InfluxWriter:
             )
         return df
 
-    # --------- M5
-    def writeAssignment(self, t_utc: pd.Timestamp, gate: Optional[int], recipe_name: Optional[str], piece_id: Optional[str] = None):
-        if not self.client: return
-        p = Point("assignments").time(self._to_dt(t_utc)).field("assigned", 1)
-        if piece_id: p = p.tag("piece_id", str(piece_id))
-        if gate is not None: p = p.tag("gate", str(int(gate)))
-        if recipe_name: p = p.tag("recipe", str(recipe_name))
-        self.client.write(p)
+    # --------- M5: REMOVED - assignments now stored in SQLite only
+    # (see run_config_assignments and settings_history tables)
 
 # --------------------- PARSERS FOR WINDOWS / RECIPE MAP ---------------------
 def _parse_pair_generic(s: Any) -> Tuple[int, int]:
@@ -1438,21 +1432,12 @@ def main():
             else:
                 gate0_counts_per_min = {}
 
-            # --- WRITE INFLUX (optional, v3 / M1–M5) ---
+            # --- WRITE INFLUX (optional, v3 / M1–M4) ---
             if HAS_INFLUX and iw.client:
                 print(f"[Influx] window '{program_name}' {disp_start_z}..{disp_end_z}")
 
-                # M5: per-gate assignments at window start (recipe tagged, no program tag)
-                for gate, rname in assignments.gate_to_recipe_name.items():
-                    if not isinstance(gate, int) or not rname:
-                        continue
-                    iw.writeAssignment(start_utc, gate=int(gate), recipe_name=rname)
-                    CSV_ROWS_INFLUX_M5_ASSIGNMENTS.append({
-                        "ts": utc_iso(start_utc),
-                        "program": int(program_id),
-                        "gate": int(gate),
-                        "recipe": str(rname),
-                    })
+                # M5 (assignments) removed - now stored in SQLite only via
+                # run_config_assignments and settings_history tables
 
                 # M1: raw pieces (no piece_id in historical xlsx)
                 pieces_all = df_slice[df_slice['Type'] == 'Piece'].copy()
@@ -1595,8 +1580,7 @@ def main():
             pd.DataFrame(CSV_ROWS_INFLUX_M3_COMBINED).sort_values(["ts_minute"]).to_csv(os.path.join(out_dir, "influx_m3_kpi_minute_combined.csv"), index=False)
         if CSV_ROWS_INFLUX_M4_TOTALS:
             pd.DataFrame(CSV_ROWS_INFLUX_M4_TOTALS).sort_values(["ts","recipe"]).to_csv(os.path.join(out_dir, "influx_m4_kpi_totals.csv"), index=False)
-        if CSV_ROWS_INFLUX_M5_ASSIGNMENTS:
-            pd.DataFrame(CSV_ROWS_INFLUX_M5_ASSIGNMENTS).sort_values(["ts","program","gate"]).to_csv(os.path.join(out_dir, "influx_m5_assignments.csv"), index=False)
+        # M5 (assignments) CSV export removed - query from SQLite instead
         print(f"[CSV] Influx exports written to ./{out_dir}/")
 
     def export_sqlite_csv(sqlite_path: str, out_dir: str = OUT_DIR):
@@ -1606,8 +1590,18 @@ def main():
         try:
             jobs = [
                 ("program_stats_view",         "SELECT * FROM program_stats_view",                "sqlite_program_stats.csv"),
-                ("recipe_stats_report",        "SELECT * FROM recipe_stats_report",               "sqlite_recipe_stats.csv"),  # <-- changed
+                ("recipe_stats_report",        "SELECT * FROM recipe_stats_report",               "sqlite_recipe_stats.csv"),
                 ("gate_dwell_stats",           "SELECT * FROM gate_dwell_stats",                  "sqlite_gate_dwell_stats.csv"),
+                ("assignment_history_view",    """
+                    SELECT 
+                        changed_at as ts,
+                        program_id as program,
+                        gate_number as gate,
+                        recipe_name as recipe
+                    FROM assignment_history_view
+                    WHERE gate_number IS NOT NULL
+                    ORDER BY changed_at, program_id, gate_number
+                """,                                                                               "sqlite_assignments.csv"),
             ]
             for _, sql, fname in jobs:
                 try:

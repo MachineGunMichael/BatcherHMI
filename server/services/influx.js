@@ -180,20 +180,9 @@ async function writeKpiTotals({ program, recipe, total_batches, giveaway_g_per_b
   });
 }
 
-// M5: assignments — program tagged
-async function writeAssignment({ piece_id, gate, recipe, program, ts }) {
-  return writePoint({
-    measurement: 'assignments',
-    tags: {
-      ...(piece_id ? { piece_id: String(piece_id) } : {}),
-      ...(gate != null ? { gate: String(gate) } : {}),
-      ...(recipe ? { recipe: String(recipe) } : {}),
-      ...(program != null ? { program: String(program) } : {}),
-    },
-    fields: { assigned: 1 },
-    timestamp: ts,
-  });
-}
+// M5: assignments REMOVED - now stored in SQLite only
+// (see run_config_assignments and settings_history tables)
+// Use /api/settings routes to manage configurations
 
 // --- OPTIONAL: Flux query builders (strings only) ------------------------
 // Use these in your route/controllers when you're ready to enable queries.
@@ -243,14 +232,8 @@ from(bucket: "${database}")
 `;
 }
 
-function buildQueryAssignments(startISO, endISO, programId) {
-  return `
-from(bucket: "${database}")
-  |> range(start: ${JSON.stringify(startISO)}, stop: ${JSON.stringify(endISO)})
-  |> filter(fn: (r) => r._measurement == "assignments" and r.program == "${String(programId)}")
-  |> keep(columns: ["_time","program","gate","recipe","assigned"])
-`;
-}
+// buildQueryAssignments REMOVED - assignments now in SQLite only
+// Query settings_history and run_config_assignments tables instead
 
 // Placeholder executor — left disabled on purpose.
 // If you wire up a Flux-capable endpoint, implement this.
@@ -267,14 +250,15 @@ module.exports = {
   writeLineProtocol, writePoint,
   writePiece, writeGateState,
   writeKpiMinute, writeKpiMinuteCombined,
-  writeKpiTotals, writeAssignment,
+  writeKpiTotals,
+  // writeAssignment removed - use SQLite (run_config_assignments + settings_history)
   // query builders
   buildQueryPieces,
   buildQueryGateState,
   buildQueryRecipeKpiMinute,
   buildQueryCombinedKpiMinute,
   buildQueryKpiTotalsRolling,
-  buildQueryAssignments,
+  // buildQueryAssignments removed - use SQLite instead
   // executor stub
   queryFlux,
 };

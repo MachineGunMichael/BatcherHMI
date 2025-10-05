@@ -366,6 +366,28 @@ function createStatisticsSchema() {
       sample_count,
       updated_at
     FROM gate_dwell_accumulators;
+
+    -- Assignment history view (replaces M5 from InfluxDB)
+    DROP VIEW IF EXISTS assignment_history_view;
+    CREATE VIEW assignment_history_view AS
+    SELECT
+      sh.changed_at,
+      sh.active_config_id AS config_id,
+      rc.name AS config_name,
+      rc.program_id,
+      p.name AS program_name,
+      rca.gate_number,
+      rca.recipe_id,
+      r.name AS recipe_name,
+      sh.note,
+      sh.user_id
+    FROM settings_history sh
+    LEFT JOIN run_configs rc ON rc.id = sh.active_config_id
+    LEFT JOIN programs p ON p.id = rc.program_id
+    LEFT JOIN run_config_assignments rca ON rca.config_id = rc.id
+    LEFT JOIN recipes r ON r.id = rca.recipe_id
+    WHERE sh.active_config_id IS NOT NULL
+    ORDER BY sh.changed_at DESC, rca.gate_number ASC;
   `);
 
   // NOTE: the old trigger that derived start/end from program_throughput_minute

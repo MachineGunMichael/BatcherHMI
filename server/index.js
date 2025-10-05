@@ -14,6 +14,7 @@ const kpiRoutes = require('./routes/kpi');
 const streamRoutes = require('./routes/stream'); // { router, broadcast }
 const ingestRoutes = require('./routes/ingest');
 const statsRoutes = require('./routes/stats');
+const assignmentsRoutes = require('./routes/assignments');
 
 const outbox = require('./workers/outboxDispatcher');
 
@@ -44,6 +45,7 @@ app.use('/api/ingest', ingestRoutes);
 app.use('/api/ts', tsRoutes);
 app.use('/api/kpi', kpiRoutes);
 app.use('/api/stats', statsRoutes);
+app.use('/api/assignments', assignmentsRoutes); // M5 moved from InfluxDB to SQLite
 
 
 // (optional) keep your earlier debug TS endpoints for convenience:
