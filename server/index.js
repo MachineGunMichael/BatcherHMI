@@ -11,10 +11,12 @@ const programRoutes = require('./routes/programs');
 const settingsRoutes = require('./routes/settings');
 const tsRoutes = require('./routes/ts');
 const kpiRoutes = require('./routes/kpi');
-const streamRoutes = require('./routes/stream'); // { router, broadcast }
-const ingestRoutes = require('./routes/ingest');
+const stream = require('./routes/stream');
+const ingest = require('./routes/ingest');
 const statsRoutes = require('./routes/stats');
 const assignmentsRoutes = require('./routes/assignments');
+const historyRoutes = require('./routes/history');
+const importRoutes = require('./routes/import');
 
 const outbox = require('./workers/outboxDispatcher');
 
@@ -40,13 +42,14 @@ app.get('/', async (_req, res) => {
 app.use('/api/auth', authRoutes);
 app.use('/api/programs', programRoutes);
 app.use('/api/settings', settingsRoutes);
-app.use('/api/stream', streamRoutes.router);
-app.use('/api/ingest', ingestRoutes);
+app.use('/api/stream', stream);
+app.use('/api/ingest', ingest);
 app.use('/api/ts', tsRoutes);
 app.use('/api/kpi', kpiRoutes);
 app.use('/api/stats', statsRoutes);
 app.use('/api/assignments', assignmentsRoutes); // M5 moved from InfluxDB to SQLite
-
+app.use('/api/history', historyRoutes);
+app.use('/api/import', importRoutes); // One-time data imports
 
 // (optional) keep your earlier debug TS endpoints for convenience:
 app.get('/api/ts/health', async (_req, res) => {
@@ -86,5 +89,7 @@ app.get('/api/ts/query', verifyToken, async (req, res) => {
 // ---------- start server ----------
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT} (SQLite + InfluxDB3)`);
-  outbox.start(); // begin polling outbox & broadcasting
+  if (outbox && typeof outbox.start === 'function') {
+    outbox.start();     // begin polling outbox & broadcasting
+  }
 });

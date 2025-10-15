@@ -54,8 +54,9 @@ router.get('/at-time', verifyToken, (req, res) => {
       return res.status(400).json({ message: 'timestamp query parameter is required' });
     }
     
-    const pid = programId ? parseInt(programId) : null;
-    const assignments = assignmentsRepo.getAssignmentsAtTime(timestamp, pid);
+    // Use snapshot function which reads from assignment_history_view
+    // This view should contain the per-gate snapshots over time
+    const assignments = assignmentsRepo.getAssignmentsSnapshotAt(timestamp);
     return res.json({ ok: true, timestamp, assignments });
   } catch (e) {
     console.error('Get assignments at time error:', e);

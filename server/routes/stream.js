@@ -1,34 +1,69 @@
-const express = require('express');
-const { verifyToken } = require('../utils/authMiddleware');
-
+// server/routes/stream.js
+const express = require("express");
 const router = express.Router();
-const clients = new Set();
 
-router.get('/events', verifyToken, (req, res) => {
-  // SSE headers
+let verifyToken = (_req, _res, next) => next(); // fallback if auth not present
+try {
+  ({ verifyToken } = require("../utils/authMiddleware"));
+} catch { /* auth is optional here */ }
+
+const { bus } = require("../lib/eventBus");
+const assignmentsRepo = require("../repositories/assignmentsRepo");
+const influx = require("../services/influx");
+
+// --- SSE helpers ---
+function openSSE(res) {
   res.set({
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    Connection: 'keep-alive'
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
   });
   res.flushHeaders?.();
+  res.write(`: connected\n\n`);
+}
+function send(res, event, payload) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
 
-  // greet
-  res.write(`event: ping\ndata: "ready"\n\n`);
+// GET /api/stream/dashboard?mode=live
+router.get("/dashboard", verifyToken, async (req, res) => {
+  openSSE(res);
 
-  clients.add(res);
-  req.on('close', () => {
-    clients.delete(res);
-    res.end();
+  // forward real-time piece events (for the scatter plot)
+  const onPiece = (payload) => send(res, "piece", payload);
+  bus.on("piece", onPiece);
+
+  // keepalive so proxies don’t kill the connection
+  const keepAlive = setInterval(() => res.write(": ping\n\n"), 30_000);
+
+  // once per second, push legend + overlay snapshot
+  const poll = setInterval(async () => {
+    try {
+      const now = new Date();
+      const tsISO = now.toISOString();
+
+      // from SQLite: which recipe is active per gate at this moment
+      const legend = assignmentsRepo.getAssignmentsSnapshotAt(tsISO);
+
+      // from Influx (M2): pieces and grams per gate over a small window
+      const overlay = await influx.queryM2GateOverlay({
+        ts: tsISO,
+        windowSec: 10,
+      });
+
+      send(res, "tick", { ts: tsISO, legend, overlay });
+    } catch (e) {
+      console.error("SSE tick error:", e);
+      // don’t crash the stream; next tick will try again
+    }
+  }, 1000);
+
+  req.on("close", () => {
+    clearInterval(keepAlive);
+    clearInterval(poll);
+    bus.off("piece", onPiece);
   });
 });
 
-// broadcast helper for other modules
-function broadcast(event, payload) {
-  const msg = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
-  for (const res of clients) {
-    try { res.write(msg); } catch { /* client probably closed */ }
-  }
-}
-
-module.exports = { router, broadcast };
+module.exports = router;

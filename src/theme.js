@@ -238,6 +238,7 @@ export const themeSettings = (mode) => {
       h5: { fontFamily: "Quarion, sans-serif", fontSize: 16 },
       h6: { fontFamily: "Quarion, sans-serif", fontSize: 14 },
       h7: { fontFamily: "Quarion, sans-serif", fontSize: 12 },
+      h8: { fontFamily: "Quarion, sans-serif", fontSize: 8 },
     },
   };
 };

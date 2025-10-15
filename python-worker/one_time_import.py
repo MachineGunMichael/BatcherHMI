@@ -156,14 +156,26 @@ def fix_window_slice(df_slice: pd.DataFrame) -> pd.DataFrame:
     # apply all drops at once
     cleaned = df.drop(index=to_drop, errors='ignore')
 
-    # 2) drop any gates that now have zero Batch rows
+    # apply all drops at once
+    cleaned = df.drop(index=to_drop, errors='ignore')
+
+    # 2) drop any gates (among the processed ones) that now have zero Batch rows
     remaining = cleaned
-    gates_with_batch = set(remaining[remaining['Type']=='Batch']['Gate'])
-    # for gates not in that set, drop all their Piece rows
+    processed_gates = set(batch_events['Gate'].unique())
+
+    gates_with_batch = set(
+        remaining[
+            (remaining['Type'] == 'Batch') &
+            (remaining['Gate'].isin(processed_gates))
+        ]['Gate']
+    )
+
     mask_orphan_pieces = (
-        (remaining['Type']=='Piece') &
+        (remaining['Type'] == 'Piece') &
+        (remaining['Gate'].isin(processed_gates)) &      # <- only gates we trimmed
         (~remaining['Gate'].isin(gates_with_batch))
     )
+
     cleaned = remaining.drop(index=remaining[mask_orphan_pieces].index)
 
     return cleaned.sort_values('Timestamp').reset_index(drop=True)
@@ -713,29 +725,49 @@ class InfluxWriter:
         return df
 
 
-    def writeKpiMinuteCombinedDF(self, combined_kpi_minute, prog_minute, program_id: int, gate0_counts_per_min: Dict[str, int]):
+    def writeKpiMinuteCombinedDF(self, combined_kpi_minute, prog_minute, program_id: int, gate0_counts_per_min: Dict[str, int], gate0_weights_per_min: Dict[str, float]):
         """
         combined: roll-up across recipes, tagged with program.
         Adds:
         - pieces_processed      (from prog_minute; counts ALL pieces incl rejects, same as old SQLite)
         - weight_processed_g    (from prog_minute; non-reject weight per minute)
+        - total_rejects_count   (cumulative reject count for this program)
+        - total_rejects_weight_g (cumulative reject weight for this program)
         """
         import pandas as pd
         if not self.client or not combined_kpi_minute:
-            return pd.DataFrame(columns=['_time','program','recipe','batches_min','giveaway_pct','rejects_per_min','pieces_processed','weight_processed_g'])
+            return pd.DataFrame(columns=['_time','program','recipe','batches_min','giveaway_pct','rejects_per_min','pieces_processed','weight_processed_g','total_rejects_count','total_rejects_weight_g'])
 
+        # Calculate cumulative rejects (reset to 0 at start of each program)
+        # First, collect all timestamps and sort them chronologically
+        all_timestamps = sorted(combined_kpi_minute.keys())
+        
+        cumulative_reject_count = 0
+        cumulative_reject_weight = 0.0
+        
         rows = []
-        for ts_z, v in combined_kpi_minute.items():
+        for ts_z in all_timestamps:
+            v = combined_kpi_minute[ts_z]
             pm = prog_minute.get(ts_z, {})
+            
+            # Add this minute's rejects to cumulative totals
+            minute_reject_count = int(gate0_counts_per_min.get(ts_z, 0))
+            minute_reject_weight = float(gate0_weights_per_min.get(ts_z, 0.0))
+            
+            cumulative_reject_count += minute_reject_count
+            cumulative_reject_weight += minute_reject_weight
+            
             rows.append({
                 '_time': pd.Timestamp(ts_z).tz_localize('UTC') if pd.Timestamp(ts_z).tzinfo is None else pd.Timestamp(ts_z).tz_convert('UTC'),
                 'program': str(program_id),
                 'recipe': '__combined',
                 'batches_min': float(v.get('batches_min', 0.0)),
                 'giveaway_pct': float(v.get('giveaway_pct', 0.0)),
-                'rejects_per_min': float(gate0_counts_per_min.get(ts_z, 0)),
+                'rejects_per_min': float(minute_reject_count),
                 'pieces_processed': float(pm.get('pieces_processed', 0.0)),
                 'weight_processed_g': float(pm.get('weight_processed_g', 0.0)),
+                'total_rejects_count': int(cumulative_reject_count),
+                'total_rejects_weight_g': float(cumulative_reject_weight),
             })
 
         df = pd.DataFrame(rows)
@@ -1420,17 +1452,19 @@ def main():
                 sw.update_gate_dwell(program_id, gate, durations)
 
 
-            # build Gate-0 (reject) piece-counts per minute for M3 combined
+            # build Gate-0 (reject) piece-counts and weights per minute for M3 combined
             g0 = df_slice[(df_slice['Type'] == 'Piece') & (df_slice['Gate'] == 0)].copy()
             if not g0.empty:
-                gate0_counts_per_min = (
-                    g0.assign(_min=g0['Timestamp'].dt.floor('T'))
-                    .groupby('_min').size()
-                )
+                g0_with_min = g0.assign(_min=g0['Timestamp'].dt.floor('T'))
+                gate0_counts_per_min = g0_with_min.groupby('_min').size()
+                gate0_weights_per_min = g0_with_min.groupby('_min')['Weight'].sum()
+                
                 # convert index->iso minute strings
                 gate0_counts_per_min = { iso_minute_z(k): int(v) for k, v in gate0_counts_per_min.items() }
+                gate0_weights_per_min = { iso_minute_z(k): float(v) for k, v in gate0_weights_per_min.items() }
             else:
                 gate0_counts_per_min = {}
+                gate0_weights_per_min = {}
 
             # --- WRITE INFLUX (optional, v3 / M1–M4) ---
             if HAS_INFLUX and iw.client:
@@ -1498,7 +1532,7 @@ def main():
                         ]].to_dict('records')
                     )
 
-                m3_combined_df = iw.writeKpiMinuteCombinedDF(combined_kpi_minute, prog_minute, program_id, gate0_counts_per_min)
+                m3_combined_df = iw.writeKpiMinuteCombinedDF(combined_kpi_minute, prog_minute, program_id, gate0_counts_per_min, gate0_weights_per_min)
                 if not m3_combined_df.empty:
                     CSV_ROWS_INFLUX_M3_COMBINED.extend(
                         m3_combined_df.assign(
@@ -1506,7 +1540,8 @@ def main():
                         )[[
                             'ts_minute', 'program', 'recipe',
                             'batches_min', 'giveaway_pct', 'rejects_per_min',
-                            'pieces_processed', 'weight_processed_g'
+                            'pieces_processed', 'weight_processed_g',
+                            'total_rejects_count', 'total_rejects_weight_g'
                         ]].to_dict('records')
                     )
 
