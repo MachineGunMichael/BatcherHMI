@@ -3,6 +3,7 @@ const express = require('express');
 const router = express.Router();
 const { verifyToken } = require('../utils/authMiddleware');
 const influx = require('../services/influx');
+const kpiRepo = require('../repositories/kpiRepo'); // SQLite for M3/M4
 
 // All endpoints require auth
 router.use(verifyToken);
@@ -21,33 +22,14 @@ router.get('/m3-all', async (req, res) => {
   try {
     const { from, to, bucket = '60s' } = req.query;
     
-    // Run all queries in parallel
-    const [
-      throughputPerRecipe,
-      throughputTotal,
-      giveawayPerRecipe,
-      giveawayTotal,
-      piecesProcessedPerRecipe,
-      piecesProcessedTotal,
-      weightProcessedPerRecipe,
-      weightProcessedTotal
-    ] = await Promise.all([
-      influx.queryM3ThroughputPerRecipe({ from, to, bucket }),
-      influx.queryM3CombinedTotal({ from, to, bucket, field: 'batches_min' }),
-      influx.queryM3GiveawayPerRecipe({ from, to, bucket }),
-      influx.queryM3CombinedTotal({ from, to, bucket, field: 'giveaway_pct' }),
-      influx.queryM3PiecesProcessedPerRecipe({ from, to, bucket }),
-      influx.queryM3CombinedTotal({ from, to, bucket, field: 'pieces_processed' }),
-      influx.queryM3WeightProcessedPerRecipe({ from, to, bucket }),
-      influx.queryM3CombinedTotal({ from, to, bucket, field: 'weight_processed_g' })
-    ]);
+    if (!from || !to) {
+      return res.status(400).json({ error: 'Missing from or to parameter' });
+    }
     
-    res.json({
-      throughput: { perRecipe: throughputPerRecipe, total: throughputTotal },
-      giveaway: { perRecipe: giveawayPerRecipe, total: giveawayTotal },
-      piecesProcessed: { perRecipe: piecesProcessedPerRecipe, total: piecesProcessedTotal },
-      weightProcessed: { perRecipe: weightProcessedPerRecipe, total: weightProcessedTotal }
-    });
+    // NOW USES SQLITE instead of InfluxDB for better performance
+    const data = kpiRepo.getM3AllCombined({ from, to });
+    
+    res.json(data);
   } catch (e) {
     console.error('m3-all history error', e);
     res.status(500).json({ error: 'Failed to fetch M3 history' });
@@ -141,14 +123,10 @@ router.get('/weight-processed', async (req, res) => {
 router.get('/rejects', async (req, res) => {
   try {
     const { from, to, bucket = '60s' } = req.query;
-    const rejectsData = await influx.queryM3CombinedRejects({ from, to, bucket });
-    // Transform to match expected format with additional cumulative data
-    const result = rejectsData.map(r => ({
-      t: r.t,
-      v: r.rejects_per_min,
-      total_rejects_count: r.total_rejects_count,
-      total_rejects_weight_g: r.total_rejects_weight_g
-    }));
+    
+    // NOW USES SQLITE instead of InfluxDB
+    const result = kpiRepo.getM3CombinedRejects({ from, to });
+    
     res.json(result);
   } catch (e) {
     console.error('rejects history error', e);
@@ -183,7 +161,10 @@ router.get('/weights', async (req, res) => {
 router.get('/pies', async (req, res) => {
   try {
     const { from, to } = req.query;
-    const pies = await influx.queryM4Pies({ from, to });
+    
+    // NOW USES SQLITE instead of InfluxDB
+    const pies = kpiRepo.getM4Pies({ from, to });
+    
     res.json(pies);
   } catch (e) {
     console.error('pies history error', e);

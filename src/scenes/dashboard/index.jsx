@@ -7,7 +7,7 @@ import { ResponsiveScatterPlot } from "@nivo/scatterplot";
 import Header from "../../components/Header";
 import { tokens } from "../../theme";
 import { useAppContext } from "../../context/AppContext";
-import { useDashboardData, MODE } from "./dataProvider";
+import { useDashboardData } from "./dataProvider";
 
 /* ---------- Recipe name formatter ---------- */
 const formatRecipeName = (name) => {
@@ -56,21 +56,21 @@ const sanitizeLineSeries = (arr) => {
     .filter(s => s.data.length > 0); // only include series with actual data
 };
 
+/* ---------- Custom scatter node to support per-point alpha (fade) ---------- */
+const ScatterNode = ({ node }) => {
+  const r = (node?.size ?? 3) / 2;           // keep original thickness from nodeSize
+  const a = typeof node?.data?.alpha === 'number' ? node.data.alpha : 1;
+  return (
+    <g transform={`translate(${node.x}, ${node.y})`}>
+      <circle r={r} fill={node.color} fillOpacity={a} stroke="none" />
+    </g>
+  );
+};
+
 /* ---------- Annotated machine image with per-gate overlay ---------- */
 const AnnotatedMachineImage = ({ colorMap, assignmentsByGate, overlayByGate }) => {
   const theme = useTheme();
   const colors = tokens(theme.palette.mode);
-
-  // const annotationPositions = [
-  //   { gate: 1, x1: '36%', y1: '70%', x2: '10%', y2: '15%' },
-  //   { gate: 2, x1: '34%', y1: '60%', x2: '20%', y2: '15%' },
-  //   { gate: 3, x1: '33%', y1: '50%', x2: '30%', y2: '15%' },
-  //   { gate: 4, x1: '43%', y1: '35%', x2: '40%', y2: '15%' },
-  //   { gate: 5, x1: '55%', y1: '75%', x2: '65%', y2: '85%' },
-  //   { gate: 6, x1: '50%', y1: '65%', x2: '75%', y2: '85%' },
-  //   { gate: 7, x1: '40%', y1: '75%', x2: '85%', y2: '85%' },
-  //   { gate: 8, x1: '68%', y1: '35%', x2: '95%', y2: '85%' },
-  // ];
 
   const annotationPositions = [
     { gate: 1, x1: '36%', y1: '70%', x2: '50%', y2: '15%' },
@@ -88,26 +88,26 @@ const AnnotatedMachineImage = ({ colorMap, assignmentsByGate, overlayByGate }) =
     // Gate 1 line - first segment (horizontal)
     {
       id: 'gate1-horizontal',
-      x1: 37, y1: 5,   // Start at Gate 1
-      x2: 41, y2: 5    // Go right horizontally
+      x1: 37, y1: 5,
+      x2: 41, y2: 5
     },
     // Gate 1 line - second segment (angled to machine)
     {
       id: 'gate1-angled',
-      x1: 37, y1: 5,   // Start at bend point
-      x2: 33, y2: 7    // Go to machine
+      x1: 37, y1: 5,
+      x2: 33, y2: 7
     },
     // Gate 5 line - first segment (horizontal)
     {
       id: 'gate5-horizontal',
-      x1: 37, y1: 55,   // Start at Gate 5
-      x2: 41, y2: 55    // Go right horizontally
+      x1: 37, y1: 55,
+      x2: 41, y2: 55
     },
     // Gate 5 line - second segment (angled to machine)
     {
       id: 'gate5-angled',
-      x1: 37, y1: 55,   // Start at bend point
-      x2: 21, y2: 51    // Go to machine
+      x1: 37, y1: 55,
+      x2: 21, y2: 51
     }
   ];
 
@@ -126,7 +126,7 @@ const AnnotatedMachineImage = ({ colorMap, assignmentsByGate, overlayByGate }) =
       />
       {annotationPositions.map((pos, idx) => {
         const program = assignmentsByGate[pos.gate] || "—";
-        const headColor = colorMap[program] || colors.primary[700];
+        const headColor = colorMap[program] || colors.primary[500];
         const gateInfo = overlayByGate[pos.gate] || { pieces: 0, grams: 0 };
 
         return (
@@ -239,6 +239,9 @@ const Dashboard = () => {
   const { dashboardVisibleSeries, setDashboardVisibleSeries } = useAppContext();
 
   const {
+    mode,
+    configError,
+    loading,
     colorMap,
     assignmentsByGate,
     overlayByGate,
@@ -259,6 +262,19 @@ const Dashboard = () => {
   // Debounced slider value to prevent rapid data fetching
   const [sliderValue, setSliderValue] = useState(currentTime);
   const [debounceTimeout, setDebounceTimeout] = useState(null);
+
+  // Force chart remount every 5 minutes to prevent memory leak
+  // Nivo charts accumulate internal objects (D3 scales, event listeners, animations)
+  // that aren't properly garbage collected. Remounting ensures complete cleanup.
+  const [chartKey, setChartKey] = useState(0);
+  useEffect(() => {
+    const remountInterval = setInterval(() => {
+      console.log('🔄 Forcing chart remount to release memory...');
+      setChartKey(prev => prev + 1);
+    }, 300000); // Every 5 minutes
+    
+    return () => clearInterval(remountInterval);
+  }, []);
 
   // Update slider value when currentTime changes (from replay)
   useEffect(() => {
@@ -292,16 +308,32 @@ const Dashboard = () => {
   }, [debounceTimeout]);
 
   // ensure toggles contain current legend keys (recipes + Total)
+  // Memoize colorMap keys to avoid infinite re-renders
+  const colorMapKeys = useMemo(() => JSON.stringify(Object.keys(colorMap || {}).sort()), [colorMap]);
+  
   useEffect(() => {
-    const keys = Object.keys(colorMap || {});
+    const keys = JSON.parse(colorMapKeys);
     if (!keys.length) return;
     setDashboardVisibleSeries(prev => {
       const next = { ...(prev || {}) };
-      keys.forEach(k => { if (next[k] === undefined) next[k] = true; });
-      Object.keys(next).forEach(k => { if (!keys.includes(k)) delete next[k]; });
-      return next;
+      // Check if there's actually a change before updating
+      let hasChanges = false;
+      keys.forEach(k => { 
+        if (next[k] === undefined) { 
+          next[k] = true; 
+          hasChanges = true;
+        } 
+      });
+      Object.keys(next).forEach(k => { 
+        if (!keys.includes(k)) { 
+          delete next[k]; 
+          hasChanges = true;
+        } 
+      });
+      // Only update if there are actual changes
+      return hasChanges ? next : prev;
     });
-  }, [colorMap, setDashboardVisibleSeries]);
+  }, [colorMapKeys, setDashboardVisibleSeries]);
 
   const legendKeys = useMemo(() => {
     const ks = Object.keys(colorMap || {}).filter(k => k !== "Total");
@@ -311,7 +343,7 @@ const Dashboard = () => {
   }, [colorMap]);
 
   const formatTimeLabel = (ts) =>
-    new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+    new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: 'UTC' });
 
   const chartTheme = {
     axis: {
@@ -399,7 +431,7 @@ const Dashboard = () => {
     yScale: { type: 'linear', min: 0, max: 'auto' },
   };
 
-  const sharedPieProps = {
+    const sharedPieProps = {
     margin: { top: 20, right: 5, bottom: 0, left: 5 },
     innerRadius: 0.65,
     padAngle: 3,
@@ -435,22 +467,36 @@ const Dashboard = () => {
     },
   };
 
+
+
+  // 👉 Scatter: use linear time axis (prevents reshuffle)
+  const HORIZON_MS = 60 * 60 * 1000;
+  const domainEnd = useMemo(
+    () => (mode === "live" ? Date.now() : (currentTime || Date.now())),
+    [mode, currentTime]
+  );
+  const domainStart = domainEnd - HORIZON_MS;
+
+  const fixedTicks = useMemo(() => {
+    const w = domainEnd - domainStart;
+    // 4 equally spaced positions; labels will update, positions won't
+    return [
+      Math.round(domainStart),
+      Math.round(domainStart + w / 3),
+      Math.round(domainStart + (2 * w) / 3),
+      Math.round(domainEnd)
+    ];
+  }, [domainStart, domainEnd]);
+
   const sharedScatterProps = {
     margin: { top: 10, right: 20, bottom: 20, left: 40 },
-    xScale: { type: 'point' },
+    xScale: { type: 'linear', min: domainStart, max: domainEnd },
     yScale: { type: 'linear', min: 'auto', max: 'auto' },
     axisBottom: {
       format: formatTimeLabel,
       tickRotation: 0,
       orient: "bottom",
-      tickValues: (() => {
-        const pts = (scatter?.[0]?.data || []);
-        const N = pts.length;
-        if (N === 0) return [];
-        if (N < 4) return pts.filter(p => p && p.x !== undefined).map(p => p.x);
-        const indices = [0, Math.floor(N * 0.33), Math.floor(N * 0.66), N - 1];
-        return indices.map(i => pts[i]).filter(p => p && p.x !== undefined).map(p => p.x);
-      })(),
+      tickValues: fixedTicks, // <- fixed positions
       tickSize: 5, tickPadding: 5,
       axis: { strokeWidth: 1 }, line: { strokeWidth: 1 },
     },
@@ -516,19 +562,57 @@ const Dashboard = () => {
 
   const toggleSeries = (name) => setDashboardVisibleSeries(prev => ({ ...(prev || {}), [name]: !prev?.[name] }));
 
+  // Show waiting screen if no configuration is set
+  if (mode === null) {
+    return (
+      <Box m="20px" display="flex" alignItems="center" justifyContent="center" height="calc(100vh - 200px)">
+        <Box textAlign="center">
+          <Header title="Dashboard" subtitle="Waiting for configuration..." />
+          <Typography variant="h4" color={colors.grey[300]} mt={4}>
+            {configError === 'waiting' 
+              ? 'Run one of the following scripts to start:'
+              : 'Loading configuration...'}
+          </Typography>
+          {configError === 'waiting' && (
+            <Box mt={3}>
+              <Typography variant="h5" color={colors.tealAccent[400]} fontFamily="monospace">
+                ./start_replay_mode.sh
+              </Typography>
+              <Typography variant="h6" color={colors.grey[400]} my={1}>
+                or
+              </Typography>
+              <Typography variant="h5" color={colors.tealAccent[400]} fontFamily="monospace">
+                ./start_live_mode_simple.sh
+              </Typography>
+            </Box>
+          )}
+          {configError && configError !== 'waiting' && (
+            <Typography variant="body1" color={colors.redAccent[400]} mt={2}>
+              Error: {configError}
+            </Typography>
+          )}
+          <Typography variant="body2" color={colors.grey[500]} mt={4}>
+            Checking for configuration every 2 seconds...
+          </Typography>
+        </Box>
+      </Box>
+    );
+  }
+
   return (
     <Box m="20px" height="calc(100vh - 200px)" maxHeight="calc(100vh - 200px)"
       sx={{ overflow: "visible", display: "flex", flexDirection: "column" }}>
       <Box display="flex" justifyContent="space-between" alignItems="center" mb="20px" sx={{ m: "0px 0 0 0" }}>
-        <Header title="Dashboard" subtitle="Performance Overview" />
+        <Header title="Dashboard" subtitle={`Performance Overview (${mode.toUpperCase()} mode)`} />
 
         {/* Time Slider (Replay mode only) */}
-        {MODE === "replay" && datasetStart && datasetEnd && currentTime && (
+        {mode === "replay" && datasetStart && datasetEnd && currentTime && (
           <Box display="flex" alignItems="center" gap="12px" px="20px">
             <Box flex="0 0 300px" display="flex" flexDirection="column" gap="2px">
               <Typography variant="body2" color={colors.primary[700]} fontSize="10px">
                 {new Date(currentTime).toLocaleString('en-US', { 
-                  month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' 
+                  month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+                  timeZone: 'UTC'
                 })}
               </Typography>
               <Slider
@@ -557,6 +641,7 @@ const Dashboard = () => {
       </Box>
 
       <Box
+        key={chartKey}
         display="grid"
         gridTemplateColumns="repeat(12, 1fr)"
         gridTemplateRows="repeat(12, 1fr)"
@@ -654,6 +739,8 @@ const Dashboard = () => {
                 <ResponsiveScatterPlot
                   data={scatter}
                   {...sharedScatterProps}
+                  nodeComponent={ScatterNode}
+                  animate={false}
                 />
               ) : (
                 <Box display="flex" alignItems="center" justifyContent="center" height="100%">

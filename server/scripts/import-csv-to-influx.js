@@ -21,12 +21,15 @@ const client = new InfluxDBClient({ host, token, database });
 const CSV_DIR = path.join(__dirname, '../../python-worker/one_time_output');
 
 // CSV file to measurement mapping
+// OPTIMIZED: Larger batch sizes to reduce Parquet file count
+// M3 (KPI minute) and M4 (KPI totals) are now stored in SQLite for better performance
+// Use import-kpi-to-sqlite.js for M3/M4 data
+// - Pieces: ~325K rows → 33 files
+// - Gate state: ~360K rows → 36 files
+// Total: ~69 files (M3/M4 moved to SQLite)
 const FILES = [
-  { file: 'influx_m1_pieces.csv', measurement: 'pieces', batchSize: 10000 },
-  { file: 'influx_m2_gate_state.csv', measurement: 'gate_state', batchSize: 10000 },
-  { file: 'influx_m3_kpi_minute_recipes.csv', measurement: 'kpi_minute', batchSize: 5000 },
-  { file: 'influx_m3_kpi_minute_combined.csv', measurement: 'kpi_minute', batchSize: 5000 },
-  { file: 'influx_m4_kpi_totals.csv', measurement: 'kpi_totals', batchSize: 5000 },
+  { file: 'influx_m1_pieces.csv', measurement: 'pieces', batchSize: 100000 },
+  { file: 'influx_m2_gate_state.csv', measurement: 'gate_state', batchSize: 100000 },
 ];
 
 async function importCSV(filePath, measurement, batchSize = 1000) {
@@ -107,8 +110,14 @@ function csvToLineProtocol(line, headers, measurement) {
   const tsCol = headers.find(h => h.includes('ts') || h.includes('time'));
   if (!tsCol || !row[tsCol]) return null;
   
-  const timestamp = new Date(row[tsCol]).getTime() * 1000000; // Convert to nanoseconds
-  if (isNaN(timestamp)) return null;
+  // FIXED: Convert milliseconds to nanoseconds correctly
+  // .getTime() returns milliseconds since epoch
+  // InfluxDB v3 expects nanoseconds by default
+  // Conversion: milliseconds × 1,000,000 = nanoseconds
+  // Use BigInt to avoid overflow for large timestamps
+  const timestampMs = new Date(row[tsCol]).getTime();
+  if (isNaN(timestampMs)) return null;
+  const timestamp = timestampMs * 1000000; // ms → ns
   
   // Separate tags and fields based on measurement type
   let tags = {};
@@ -125,30 +134,6 @@ function csvToLineProtocol(line, headers, measurement) {
     fields = {
       pieces_in_gate: parseFloat(row.pieces_in_gate || 0),
       weight_sum_g: parseFloat(row.weight_sum_g || 0)
-    };
-  } else if (measurement === 'kpi_minute') {
-    tags = {
-      ...(row.program ? { program: String(row.program) } : {}),
-      recipe: String(row.recipe || 'unknown')
-    };
-    fields = {
-      batches_min: parseFloat(row.batches_min || 0),
-      giveaway_pct: parseFloat(row.giveaway_pct || 0),
-      ...(row.rejects_per_min !== undefined ? { rejects_per_min: parseFloat(row.rejects_per_min || 0) } : {}),
-      ...(row.pieces_processed !== undefined ? { pieces_processed: parseFloat(row.pieces_processed || 0) } : {}),
-      ...(row.weight_processed_g !== undefined ? { weight_processed_g: parseFloat(row.weight_processed_g || 0) } : {}),
-      ...(row.total_rejects_count !== undefined ? { total_rejects_count: parseFloat(row.total_rejects_count || 0) } : {}),
-      ...(row.total_rejects_weight_g !== undefined ? { total_rejects_weight_g: parseFloat(row.total_rejects_weight_g || 0) } : {})
-    };
-  } else if (measurement === 'kpi_totals') {
-    tags = {
-      ...(row.program ? { program: String(row.program) } : {}),
-      recipe: String(row.recipe || 'unknown')
-    };
-    fields = {
-      total_batches: parseFloat(row.total_batches || 0),
-      giveaway_g_per_batch: parseFloat(row.giveaway_g_per_batch || 0),
-      giveaway_pct_avg: parseFloat(row.giveaway_pct_avg || 0)
     };
   }
   

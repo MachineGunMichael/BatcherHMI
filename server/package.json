@@ -8,12 +8,14 @@
     "dev": "nodemon index.js",
     "db:setup": "node scripts/sqlite-setup.js",
     "db:reset": "node -e \"const fs=require('fs');['db/sqlite/batching_app.sqlite','db/sqlite/batching_app.sqlite-wal','db/sqlite/batching_app.sqlite-shm'].forEach(f=>{try{fs.unlinkSync(f);}catch(e){}});\" && node scripts/sqlite-setup.js",
-    "ts:seed": "node scripts/influx-seed-demo.js"
+    "ts:seed": "node scripts/influx-seed-demo.js",
+    "influx:cleanup": "node scripts/cleanup-influx-retention.js",
+    "influx:cleanup-manual": "node scripts/cleanup-influx-retention.js --manual"
   },
   "dependencies": {
     "@influxdata/influxdb3-client": "^1.0.0",
     "bcryptjs": "^2.4.3",
-    "better-sqlite3": "^9.4.0",
+    "better-sqlite3": "^9.6.0",
     "body-parser": "^1.20.2",
     "cors": "^2.8.5",
     "csv-parser": "^3.2.0",

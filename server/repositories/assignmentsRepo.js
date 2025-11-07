@@ -48,10 +48,11 @@ function isProgramActiveAt(tsIso) {
   const tsNormalized = new Date(tsIso).toISOString().replace(/\.\d{3}Z$/, 'Z');
   
   // Check if we're within any program's active period (start_ts <= time <= end_ts)
+  // If end_ts is NULL, the program is still active, so treat it as "current time"
   const activeProgramSql = `
     SELECT COUNT(*) as count
     FROM program_stats
-    WHERE ? >= start_ts AND ? <= end_ts
+    WHERE ? >= start_ts AND (end_ts IS NULL OR ? <= end_ts)
   `;
   
   const result = db.prepare(activeProgramSql).get(tsNormalized, tsNormalized);
@@ -65,16 +66,11 @@ function isProgramActiveAt(tsIso) {
  * Returns empty array if no program is active at the given time.
  */
 function getAssignmentsSnapshotAt(tsIso) {
-  // Convert ISO timestamp to SQLite format: '2025-06-05T07:10:00.000Z' -> '2025-06-05 07:10:00'
-  // SQLite stores timestamps as 'YYYY-MM-DD HH:MM:SS' (no T, no Z)
-  const tsSqlite = new Date(tsIso).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+  // DON'T convert - use ISO format directly for timestamp comparison
+  // SQLite can compare ISO timestamps correctly if format is consistent
   
-  // First, check if any program is active at this time
-  if (!isProgramActiveAt(tsIso)) {
-    // No active program at this time, return empty assignments
-    return [];
-  }
-  
+  // Simply return the latest assignments at or before this timestamp
+  // No need to check program_stats - if settings_history exists, return it
   const sql = `
     SELECT DISTINCT
       v.gate_number AS gate,
@@ -87,7 +83,7 @@ function getAssignmentsSnapshotAt(tsIso) {
         WHERE v2.gate_number = v.gate_number AND v2.changed_at <= ?
       )
     ORDER BY v.gate_number ASC`;
-  return db.prepare(sql).all(tsSqlite, tsSqlite);
+  return db.prepare(sql).all(tsIso, tsIso);
 }
 
 /**

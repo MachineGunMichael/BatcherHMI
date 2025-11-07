@@ -52,13 +52,36 @@ function toLineProtocol({ measurement, tags = {}, fields = {}, timestamp }) {
     .map(([k,v]) => `${escKey(k)}=${escTagVal(v)}`)
     .join(',');
 
+  function formatNumberField(key, v) {
+    // Mark known integer fields with 'i'
+    const INT_KEYS = new Set([
+      'pieces_in_gate',
+      'total_batches',
+      'pieces_processed',
+      'total_rejects_count',
+    ]);
+
+    if (!Number.isFinite(v)) {
+      // reject NaN/Infinity immediately so we don't send a bad batch
+      throw new Error(`invalid numeric for ${key}: ${v}`);
+    }
+
+    if (INT_KEYS.has(key)) {
+      return `${escKey(key)}=${Math.trunc(v)}i`;
+    }
+
+    // Force floats to actually look like floats (avoid integer-looking floats)
+    const asFloat = (v % 1 === 0) ? `${v}.0` : String(v);
+    return `${escKey(key)}=${asFloat}`;
+  }
+
   const fieldPairs = Object.entries(fields)
     .filter(([,v]) => v !== undefined && v !== null)
     .map(([k,v]) => {
-      const key = escKey(k);
-      if (typeof v === 'number' && Number.isFinite(v)) return `${key}=${v}`;
-      if (typeof v === 'boolean') return `${key}=${v ? 'true' : 'false'}`;
-      return `${key}=${escFieldStr(v)}`;
+      if (typeof v === 'number') return formatNumberField(k, v);
+      if (typeof v === 'boolean') return `${escKey(k)}=${v ? 'true' : 'false'}`;
+      // strings stay strings
+      return `${escKey(k)}=${escFieldStr(v)}`;
     })
     .join(',');
 
@@ -97,12 +120,22 @@ async function writePiece({ piece_id, gate, weight_g, ts }) {
 
 // M2: gate_state — cumulative rows from your importer
 async function writeGateState({ gate, pieces_in_gate, weight_sum_g, ts }) {
+  // Ensure pieces_in_gate is a clean integer and weight_sum_g is a clean float
+  const pieces = Math.floor(Number(pieces_in_gate ?? 0));
+  const weight = Math.round((Number(weight_sum_g ?? 0)) * 10) / 10;
+  
+  // Validate values
+  if (!Number.isFinite(pieces) || !Number.isFinite(weight)) {
+    console.error(`❌ [M2 WRITE] Invalid values for gate ${gate}: pieces=${pieces}, weight=${weight}`);
+    throw new Error(`Invalid M2 values: pieces=${pieces}, weight=${weight}`);
+  }
+  
   return writePoint({
     measurement: 'gate_state',
     tags: gate != null ? { gate: String(gate) } : {},
     fields: {
-      pieces_in_gate: Number(pieces_in_gate ?? 0),
-      weight_sum_g: Number(weight_sum_g ?? 0),
+      pieces_in_gate: pieces,
+      weight_sum_g: weight,
     },
     timestamp: ts,
   });
@@ -387,45 +420,79 @@ async function queryM1Weights({ from, to, maxPoints = 1000 }) {
   const fromMs = Date.parse(from);
   const toMs = Date.parse(to);
   
-  // SIMPLE AND FAST: Just get all points and let client handle sampling
-  // For 60 min window with ~8000 points, this is acceptable
-  const sql = `
-    SELECT weight_g, EXTRACT(EPOCH FROM time) * 1000 AS t
-    FROM pieces
-    WHERE EXTRACT(EPOCH FROM time) * 1000 >= ${fromMs} AND EXTRACT(EPOCH FROM time) * 1000 <= ${toMs}
-    ORDER BY time ASC
-    LIMIT ${maxPoints * 10}
-  `;
+  // OPTIMIZED: Use sampling with LIMIT to get evenly distributed points
+  // Client will handle outlier preservation
+  // For 60 min window: ~7K pieces → sample to 2K points with even distribution
+  const limit = Math.min(maxPoints * 2, 5000);
   
-  const iterator = await client.query(sql);
-  const rows = [];
-  for await (const row of iterator) {
-    rows.push(row);
+  // Calculate sample rate to get ~limit points
+  // Get total count first to determine stride
+  const countSql = `SELECT COUNT(*) as count FROM pieces WHERE EXTRACT(EPOCH FROM time) * 1000 >= ${fromMs} AND EXTRACT(EPOCH FROM time) * 1000 <= ${toMs}`;
+  const countIterator = await client.query(countSql);
+  let totalCount = 0;
+  for await (const row of countIterator) {
+    totalCount = Number(row.count);
   }
-  const pieces = rows.map(r => ({ t: Number(r.t), weight_g: Number(r.weight_g) }));
-  return { all: pieces };
+  
+  // If total points <= limit, fetch all; otherwise sample
+  if (totalCount <= limit) {
+    const sql = `
+      SELECT weight_g, EXTRACT(EPOCH FROM time) * 1000 AS t
+      FROM pieces
+      WHERE EXTRACT(EPOCH FROM time) * 1000 >= ${fromMs} 
+        AND EXTRACT(EPOCH FROM time) * 1000 <= ${toMs}
+      ORDER BY time ASC
+    `;
+    const iterator = await client.query(sql);
+    const rows = [];
+    for await (const row of iterator) {
+      rows.push(row);
+    }
+    const pieces = rows.map(r => ({ t: Number(r.t), weight_g: Number(r.weight_g) }));
+    return { all: pieces };
+  } else {
+    // Sample evenly using ROW_NUMBER() to get ~limit points
+    const stride = Math.ceil(totalCount / limit);
+    const sql = `
+      SELECT weight_g, t FROM (
+        SELECT weight_g, EXTRACT(EPOCH FROM time) * 1000 AS t, ROW_NUMBER() OVER (ORDER BY time ASC) AS rn
+        FROM pieces
+        WHERE EXTRACT(EPOCH FROM time) * 1000 >= ${fromMs} 
+          AND EXTRACT(EPOCH FROM time) * 1000 <= ${toMs}
+      ) sampled
+      WHERE rn % ${stride} = 1
+      ORDER BY t ASC
+    `;
+    const iterator = await client.query(sql);
+    const rows = [];
+    for await (const row of iterator) {
+      rows.push(row);
+    }
+    const pieces = rows.map(r => ({ t: Number(r.t), weight_g: Number(r.weight_g) }));
+    return { all: pieces };
+  }
 }
 
 async function queryM2GateOverlay({ ts, windowSec }) {
   const tsMs = Date.parse(ts);
   const windowMs = windowSec * 1000;
   
-  // Get the LATEST value for each gate (not sum, just the most recent measurement)
-  // Use a subquery to find the max time per gate, then select those rows
+  // OPTIMIZED: Get the LATEST value for each gate using window function
+  // More efficient than subquery for large datasets
   const sql = `
-    SELECT
-      g.gate,
-      g.pieces_in_gate AS pieces,
-      g.weight_sum_g AS grams
-    FROM gate_state g
-    INNER JOIN (
-      SELECT gate, MAX(time) AS max_time
+    SELECT gate, pieces_in_gate AS pieces, weight_sum_g AS grams
+    FROM (
+      SELECT 
+        gate, 
+        pieces_in_gate, 
+        weight_sum_g,
+        ROW_NUMBER() OVER (PARTITION BY gate ORDER BY time DESC) AS rn
       FROM gate_state
       WHERE EXTRACT(EPOCH FROM time) * 1000 >= ${tsMs - windowMs}
         AND EXTRACT(EPOCH FROM time) * 1000 <= ${tsMs}
-      GROUP BY gate
-    ) latest ON g.gate = latest.gate AND g.time = latest.max_time
-    ORDER BY g.gate ASC
+    ) ranked
+    WHERE rn = 1
+    ORDER BY gate ASC
   `;
   const iterator = await client.query(sql);
   const rows = [];
@@ -499,6 +566,12 @@ async function queryFlux(/* flux */) {
   throw new Error('queryFlux() not enabled. Use Flight SQL helpers above.');
 }
 
+// --- generic query helper for custom SQL queries -------------------------
+async function query(sql) {
+  if (!client) throw new Error('InfluxDB client not initialized');
+  return await client.query(sql);
+}
+
 // --- exports -------------------------------------------------------------
 module.exports = {
   // config & health
@@ -520,6 +593,9 @@ module.exports = {
   queryM1Weights,
   queryM2GateOverlay,
   queryM4Pies,
+
+  // Generic query helper
+  query,
 
   // optional Flux builders (strings only)
   buildQueryPieces,

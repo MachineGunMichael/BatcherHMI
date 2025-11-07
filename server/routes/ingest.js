@@ -4,8 +4,11 @@ const router = express.Router();
 
 const { broadcast } = require("../lib/eventBus");
 const influx = require("../services/influx");
+const gates = require("../state/gates");
+const recipeManager = require("../lib/recipeManager");
+const db = require("../db/sqlite");
 
-// Simple shared-secret for PLCs (machines don’t send JWTs)
+// Simple shared-secret for PLCs (machines don't send JWTs)
 function verifyPlcSecret(req, res, next) {
   const expected = process.env.PLC_SHARED_SECRET || "";
   const got = req.headers["x-plc-secret"];
@@ -17,6 +20,24 @@ function verifyPlcSecret(req, res, next) {
     return res.status(401).json({ message: "Unauthorized (PLC secret invalid)" });
   }
   next();
+}
+
+// Get current program ID from settings_history
+function getCurrentProgramId() {
+  try {
+    const row = db.prepare(`
+      SELECT rc.program_id
+      FROM settings_history sh
+      JOIN run_configs rc ON rc.id = sh.active_config_id
+      WHERE sh.active_config_id IS NOT NULL
+      ORDER BY sh.changed_at DESC
+      LIMIT 1
+    `).get();
+    return row?.program_id || null;
+  } catch (err) {
+    console.error('Failed to get current program ID:', err);
+    return null;
+  }
 }
 
 function normalizeTs(ts) {
@@ -49,7 +70,7 @@ router.post("/weight", verifyPlcSecret, async (req, res) => {
       ts: tIso,
     });
 
-    // outbox → notify any listeners (e.g., the SSE stream)
+    // Scatter update
     broadcast("piece", { piece_id: piece_id ?? null, weight_g: w, ts: tIso });
 
     res.json({ ok: true });
@@ -67,9 +88,7 @@ router.post("/weight", verifyPlcSecret, async (req, res) => {
 router.post("/weight/batch", verifyPlcSecret, async (req, res) => {
   try {
     const arr = Array.isArray(req.body) ? req.body : [];
-    if (!arr.length) {
-      return res.status(400).json({ message: "Array of points required" });
-    }
+    if (!arr.length) return res.status(400).json({ message: "Array of points required" });
 
     let count = 0;
     for (const item of arr) {
@@ -92,6 +111,161 @@ router.post("/weight/batch", verifyPlcSecret, async (req, res) => {
   } catch (e) {
     console.error("ingest/weight/batch error:", e);
     res.status(500).json({ message: "Batch ingest failed" });
+  }
+});
+
+// Auto-incrementing piece ID (in-memory; fine for dev)
+let nextPieceId = 1;
+
+/**
+ * POST /api/ingest/piece
+ * For simulator/C# algorithm - receives pieces with gate assignment from simulator
+ * Headers: x-plc-secret: <secret>
+ * Body: { timestamp?: ISO/string/number, weight_g: number, gate: number (0-8) }
+ */
+router.post("/piece", verifyPlcSecret, async (req, res) => {
+  try {
+    const { weight_g, gate, timestamp } = req.body || {};
+    const w = Number(weight_g);
+    if (!Number.isFinite(w)) return res.status(400).json({ message: "weight_g must be a number" });
+    const g = Number(gate);
+    if (!Number.isFinite(g) || g < 0 || g > 8) return res.status(400).json({ message: "gate must be 0-8" });
+
+    const tsIso = normalizeTs(timestamp);
+    const piece_id = String(nextPieceId++);
+
+    // Per-piece scatter update
+    broadcast("piece", { piece_id, gate: g, weight_g: w, ts: tsIso });
+
+    // Write M1 to Influx (async)
+    influx.writePiece({ piece_id, weight_g: w, gate: g, ts: tsIso }).catch(err =>
+      console.error("M1 write error:", err)
+    );
+
+    // Update gate state (authoritative in-memory) + check for batch completion
+    if (g >= gates.GATE_MIN && g <= gates.GATE_MAX) {
+      // ✨ ATOMIC BATCH DETECTION WITH PROMISE QUEUE ✨
+      // This ensures pieces are ALWAYS processed sequentially, never lost
+      const result = await gates.processPieceAtomic(g, w, (pieces, grams) => {
+        return recipeManager.isBatchComplete(g, pieces, grams);
+      });
+      
+      if (result.batchComplete) {
+        console.log(`🎉 [BATCH COMPLETE] Gate ${g}: ${result.pieces} pieces, ${result.grams.toFixed(1)}g → RESET`);
+        
+        // ✅ Write batch completion to SQLite (single source of truth)
+        try {
+          const recipe = recipeManager.getRecipeForGate(g);
+          const programId = getCurrentProgramId();
+          
+          db.prepare(`
+            INSERT INTO batch_completions (gate, completed_at, pieces, weight_g, recipe_id, program_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+          `).run(g, tsIso, result.pieces, result.grams, recipe?.id || null, programId);
+          
+          console.log(`   📝 Batch completion written to SQLite (recipe: ${recipe?.name || 'unknown'})`);
+        } catch (err) {
+          console.error(`   ❌ Failed to write batch completion to SQLite:`, err);
+        }
+        
+        // Broadcast reset (pieces=0, grams=0)
+        broadcast("gate", { gate: g, pieces: 0, grams: 0, ts: tsIso });
+        
+        // Write M2 reset to InfluxDB (async)
+        influx.writeGateState({
+          gate: g,
+          pieces_in_gate: 0,
+          weight_sum_g: 0,
+          ts: tsIso,
+        }).catch(err => console.error("M2 reset write failed:", err.message));
+        
+        // Broadcast full snapshot for consistency
+        const snapshot = gates.getSnapshot();
+        broadcast("overlay", { ts: tsIso, overlay: snapshot });
+      } else {
+        // Normal increment - broadcast updated count
+        broadcast("gate", { gate: g, pieces: result.pieces, grams: result.grams, ts: tsIso });
+        
+        // Write M2 to Influx with rounded values (async)
+        influx.writeGateState({
+          gate: g,
+          pieces_in_gate: Math.floor(result.pieces), // Ensure integer
+          weight_sum_g: Math.round(result.grams * 10) / 10, // Round to 1 decimal
+          ts: tsIso,
+        }).catch(err => console.error("M2 write failed:", err.message));
+      }
+    }
+
+    res.json({ ok: true, piece_id });
+  } catch (e) {
+    console.error("ingest/piece error:", e);
+    res.status(500).json({ message: "Ingest failed", error: e.message });
+  }
+});
+
+/**
+ * POST /api/ingest/gate/reset
+ * Resets the given gate to zero on batch completion (called by live_worker_v2.py)
+ * Headers: x-plc-secret: <secret>
+ * Body: { gate: number (1-8), timestamp?: ISO/string/number }
+ */
+router.post("/gate/reset", verifyPlcSecret, async (req, res) => {
+  try {
+    const { gate, timestamp } = req.body || {};
+    const g = Number(gate);
+    if (!Number.isFinite(g) || g < gates.GATE_MIN || g > gates.GATE_MAX) {
+      return res.status(400).json({ message: "gate must be 1-8" });
+    }
+    const tsIso = normalizeTs(timestamp);
+
+    console.log(`🔄 [RESET REQUEST] Gate ${g} at ${tsIso}`);
+    
+    // Reset authoritative state
+    const after = gates.resetGate(g);
+    console.log(`✅ [RESET DONE] Gate ${g} → pieces: ${after.pieces}, grams: ${after.grams}`);
+
+    // Broadcast reset so UI shows the drop to 0 exactly once
+    broadcast("gate", { gate: g, pieces: after.pieces, grams: after.grams, ts: tsIso });
+    console.log(`📡 [BROADCAST] gate event for Gate ${g} reset`);
+
+    // Persist reset in M2 as well
+    influx.writeGateState({
+      gate: g,
+      pieces_in_gate: 0,
+      weight_sum_g: 0,
+      ts: tsIso,
+    }).catch(err => console.error("M2 reset write failed:", err.message));
+    
+    // Also broadcast full snapshot to ensure UI consistency
+    const snapshot = gates.getSnapshot();
+    broadcast("overlay", { ts: tsIso, overlay: snapshot });
+    console.log(`📡 [BROADCAST] overlay snapshot after Gate ${g} reset`);
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("ingest/gate/reset error:", e);
+    res.status(500).json({ message: "Reset failed", error: e.message });
+  }
+});
+
+/**
+ * POST /api/ingest/reload-assignments
+ * Reload recipe assignments (called by live_worker after program change)
+ */
+router.post("/reload-assignments", verifyPlcSecret, (req, res) => {
+  try {
+    console.log('🔄 Reloading recipe assignments via API call...');
+    
+    // Emit event to trigger auto-reload in recipeManager
+    broadcast('program:changed');
+    
+    // Also broadcast to SSE clients so dashboard refreshes
+    broadcast('assignmentsReloaded', { timestamp: new Date().toISOString() });
+    
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("ingest/reload-assignments error:", e);
+    res.status(500).json({ message: "Reload failed", error: e.message });
   }
 });
 

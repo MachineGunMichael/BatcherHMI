@@ -1,0 +1,3 @@
+# Simulator dependencies (using built-in libraries for CSV parsing)
+requests>=2.31.0
+

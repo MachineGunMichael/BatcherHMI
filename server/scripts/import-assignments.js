@@ -49,23 +49,29 @@ async function importAssignments() {
 
   // Insert programs if they don't exist
   const insertProgram = db.prepare(`
-    INSERT OR IGNORE INTO programs (id, name, description)
-    VALUES (?, ?, ?)
+    INSERT OR IGNORE INTO programs (id, name, gates)
+    VALUES (?, ?, 8)
   `);
   
   for (const [id, name] of programs) {
-    insertProgram.run(id, name, `Auto-imported program ${id}`);
+    insertProgram.run(id, name);
   }
   console.log(`✓ Inserted/updated ${programs.size} programs`);
 
-  // Insert recipes if they don't exist
+  // Insert recipes if they don't exist (with default weight ranges)
   const insertRecipe = db.prepare(`
-    INSERT OR IGNORE INTO recipes (name, target_weight_g, tolerance_g, description)
-    VALUES (?, NULL, NULL, ?)
+    INSERT OR IGNORE INTO recipes (
+      name, 
+      piece_min_weight_g, 
+      piece_max_weight_g, 
+      batch_min_weight_g, 
+      batch_max_weight_g
+    )
+    VALUES (?, 0, 1000, NULL, NULL)
   `);
   
   for (const [name] of recipes) {
-    insertRecipe.run(name, `Auto-imported recipe ${name}`);
+    insertRecipe.run(name);
   }
   console.log(`✓ Inserted/updated ${recipes.size} recipes`);
 
@@ -75,22 +81,30 @@ async function importAssignments() {
   allRecipes.forEach(r => recipeMap.set(r.name, r.id));
 
   // Group assignments by timestamp and program to create configs
+  // Handle duplicate gate assignments (keep only the last one per gate)
   const configsByTimestamp = new Map();
   
   assignments.forEach(({ ts, program, gate, recipe }) => {
     const key = `${ts}_${program}`;
     if (!configsByTimestamp.has(key)) {
-      configsByTimestamp.set(key, { ts, program, gates: [] });
+      configsByTimestamp.set(key, { ts, program, gateMap: new Map() });
     }
-    configsByTimestamp.get(key).gates.push({ gate, recipe });
+    // Overwrite if duplicate gate (keeps last assignment)
+    configsByTimestamp.get(key).gateMap.set(gate, recipe);
+  });
+  
+  // Convert gate maps to arrays
+  configsByTimestamp.forEach((config) => {
+    config.gates = Array.from(config.gateMap.entries()).map(([gate, recipe]) => ({ gate, recipe }));
+    delete config.gateMap;
   });
 
   console.log(`\nCreating ${configsByTimestamp.size} configuration snapshots...`);
 
   // Insert configs and their assignments
   const insertConfig = db.prepare(`
-    INSERT INTO run_configs (name, program_id, description)
-    VALUES (?, ?, ?)
+    INSERT INTO run_configs (name, source, program_id)
+    VALUES (?, 'program', ?)
   `);
   
   const insertConfigAssignment = db.prepare(`
@@ -99,8 +113,8 @@ async function importAssignments() {
   `);
   
   const insertSettingsHistory = db.prepare(`
-    INSERT INTO settings_history (changed_at, active_config_id, note, user_id)
-    VALUES (?, ?, ?, NULL)
+    INSERT INTO settings_history (changed_at, mode, active_config_id, note, user_id)
+    VALUES (?, 'preset', ?, ?, NULL)
   `);
 
   let configCount = 0;
@@ -111,8 +125,7 @@ async function importAssignments() {
     const configName = `Config_${ts.replace(/[:\s]/g, '_')}_P${program}`;
     const result = insertConfig.run(
       configName,
-      program,
-      `Auto-imported config from ${ts}`
+      program
     );
     
     const configId = result.lastInsertRowid;

@@ -7,6 +7,7 @@ import SettingsIcon from "@mui/icons-material/TuneOutlined";
 import SimulationIcon from '@mui/icons-material/ShapeLineOutlined';
 import DashboardIcon from '@mui/icons-material/DashboardOutlined';
 import PlanAssistIcon from '@mui/icons-material/MoreTimeOutlined';
+import StatsIcon from '@mui/icons-material/BarChartOutlined';
 // import MenuOutlinedIcon from "@mui/icons-material/MenuOutlined";
 import HomeOutlinedIcon from '@mui/icons-material/HomeOutlined';
 // import PeopleOutlinedIcon from '@mui/icons-material/PeopleOutlined';
@@ -42,6 +43,8 @@ const Sidebar = () => {
     switch (iconName) {
       case 'dashboard':
         return <DashboardIcon />;
+      case 'stats':
+        return <StatsIcon />;
       case 'planAssist':
         return <PlanAssistIcon />;
       case 'settings':

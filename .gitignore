@@ -41,4 +41,4 @@ python-worker/coverage.xml
 
 # ---- Editor/OS
 .vscode/
-*.swp
+*.swp.runtime-config*.json

@@ -2,6 +2,7 @@ import Dashboard from "../scenes/dashboard";
 import Settings from "../scenes/settings";
 import Simulation from "../scenes/simulation";
 import PlanAssist from "../scenes/planAssist";
+import Stats from "../scenes/stats";
 
 // Define all available routes with their metadata
 export const ROUTES = {
@@ -28,6 +29,12 @@ export const ROUTES = {
     name: "PlanAssist",
     component: PlanAssist,
     icon: "planAssist"
+  },
+  STATS: {
+    path: "/stats",
+    name: "Stats",
+    component: Stats,
+    icon: "stats"
   }
 };
 
@@ -35,12 +42,14 @@ export const ROUTES = {
 export const ROLE_ROUTES = {
   admin: [
     ROUTES.DASHBOARD,
+    ROUTES.STATS,
     ROUTES.PLAN_ASSIST,
     ROUTES.SETTINGS,
     ROUTES.SIMULATION
   ],
   manager: [
     ROUTES.DASHBOARD,
+    ROUTES.STATS,
     ROUTES.SIMULATION
   ],
   operator: [

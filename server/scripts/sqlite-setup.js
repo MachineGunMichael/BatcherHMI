@@ -95,7 +95,7 @@ function seedIfEmpty() {
     return;
   }
 
-  console.log('Seeding users, recipes, program, settings...');
+  console.log('Seeding users only...');
 
   const insertUser = db.prepare(`
     INSERT INTO users (username, password_hash, role, name, permissions)
@@ -125,7 +125,7 @@ function seedIfEmpty() {
     permissions: JSON.stringify(['read','execute']),
   });
 
-  console.log('Seed complete.');
+  console.log('✅ Users seeded. Recipes and programs will be loaded by Python worker.');
 }
 
 /* -------------- active setup + history -------------- */
@@ -275,6 +275,65 @@ function createStatisticsSchema() {
       PRIMARY KEY (program_id, gate_number),
       FOREIGN KEY (program_id) REFERENCES programs(id) ON DELETE CASCADE
     );
+
+    -- Batch completions (single source of truth for batch events)
+    CREATE TABLE IF NOT EXISTS batch_completions (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      gate         INTEGER NOT NULL,
+      completed_at TEXT NOT NULL,              -- ISO timestamp
+      pieces       INTEGER NOT NULL,
+      weight_g     REAL NOT NULL,
+      recipe_id    INTEGER NOT NULL,
+      program_id   INTEGER,
+      created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (recipe_id) REFERENCES recipes(id) ON DELETE CASCADE,
+      FOREIGN KEY (program_id) REFERENCES programs(id) ON DELETE SET NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_batch_completions_time ON batch_completions(completed_at);
+    CREATE INDEX IF NOT EXISTS idx_batch_completions_gate ON batch_completions(gate);
+    
+    -- M3 KPI tables (per-minute data, migrated from InfluxDB to SQLite)
+    CREATE TABLE IF NOT EXISTS kpi_minute_recipes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp TEXT NOT NULL,
+      recipe_name TEXT NOT NULL,
+      program_id INTEGER,
+      batches_min REAL DEFAULT 0,
+      giveaway_pct REAL DEFAULT 0,
+      pieces_processed INTEGER DEFAULT 0,
+      weight_processed_g REAL DEFAULT 0,
+      rejects_per_min REAL DEFAULT 0,
+      total_rejects_count INTEGER DEFAULT 0,
+      total_rejects_weight_g REAL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_kpi_min_recipes_time ON kpi_minute_recipes(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_kpi_min_recipes_recipe ON kpi_minute_recipes(recipe_name, timestamp);
+    
+    CREATE TABLE IF NOT EXISTS kpi_minute_combined (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp TEXT NOT NULL,
+      batches_min REAL DEFAULT 0,
+      giveaway_pct REAL DEFAULT 0,
+      pieces_processed INTEGER DEFAULT 0,
+      weight_processed_g REAL DEFAULT 0,
+      rejects_per_min REAL DEFAULT 0,
+      total_rejects_count INTEGER DEFAULT 0,
+      total_rejects_weight_g REAL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_kpi_min_combined_time ON kpi_minute_combined(timestamp);
+    
+    -- M4 KPI table (cumulative totals per recipe)
+    CREATE TABLE IF NOT EXISTS kpi_totals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp TEXT NOT NULL,
+      recipe_name TEXT NOT NULL,
+      program_id INTEGER,
+      total_batches INTEGER DEFAULT 0,
+      giveaway_g_per_batch REAL DEFAULT 0,
+      giveaway_pct_avg REAL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_kpi_totals_time ON kpi_totals(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_kpi_totals_recipe ON kpi_totals(recipe_name, timestamp);
   `);
 
   // ---------- Views ----------
@@ -394,6 +453,13 @@ function createStatisticsSchema() {
   // is intentionally removed because those minute tables no longer exist.
 }
 
+/* -------------------- seed default program -------------------- */
+function seedDefaultProgramIfEmpty() {
+  // ⚠️ REMOVED: No longer seed recipes or programs at startup
+  // The Python worker will be the single source of truth for recipes and programs
+  console.log('⏩ Skipping recipe/program seed. Python worker will load them.');
+}
+
 /* ---------------------- main ---------------------- */
 function main() {
   createBaseSchema();
@@ -401,6 +467,7 @@ function main() {
   createActiveConfigSchema();
   seedInitialActiveConfigIfMissing();
   createStatisticsSchema();
+  seedDefaultProgramIfEmpty();
   console.log('✅ SQLite setup complete.');
 }
 main();

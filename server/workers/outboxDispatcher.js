@@ -1,5 +1,5 @@
 const settingsRepo = require('../repositories/settingsRepo');
-const stream = require('../routes/stream'); // use its broadcast helper
+const { broadcast } = require('../lib/eventBus'); // use eventBus broadcast helper
 
 // placeholder for posting to external C# service, etc.
 async function forwardToExternal(event) {
@@ -19,7 +19,7 @@ function start(intervalMs = 2000) {
       for (const row of rows) {
         const payload = JSON.parse(row.payload);
         // notify SSE clients as well
-        stream.broadcast(row.event_type, payload);
+        broadcast(row.event_type, payload);
         await forwardToExternal({ type: row.event_type, payload });
         doneIds.push(row.id);
       }

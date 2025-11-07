@@ -17,6 +17,7 @@ const statsRoutes = require('./routes/stats');
 const assignmentsRoutes = require('./routes/assignments');
 const historyRoutes = require('./routes/history');
 const importRoutes = require('./routes/import');
+const configRoutes = require('./routes/config');
 
 const outbox = require('./workers/outboxDispatcher');
 
@@ -50,6 +51,7 @@ app.use('/api/stats', statsRoutes);
 app.use('/api/assignments', assignmentsRoutes); // M5 moved from InfluxDB to SQLite
 app.use('/api/history', historyRoutes);
 app.use('/api/import', importRoutes); // One-time data imports
+app.use('/api/config', configRoutes); // Runtime configuration
 
 // (optional) keep your earlier debug TS endpoints for convenience:
 app.get('/api/ts/health', async (_req, res) => {

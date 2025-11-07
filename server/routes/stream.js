@@ -2,14 +2,14 @@
 const express = require("express");
 const router = express.Router();
 
-let verifyToken = (_req, _res, next) => next(); // fallback if auth not present
+let verifyToken = (_req, _res, next) => next();
 try {
   ({ verifyToken } = require("../utils/authMiddleware"));
-} catch { /* auth is optional here */ }
+} catch {}
 
 const { bus } = require("../lib/eventBus");
 const assignmentsRepo = require("../repositories/assignmentsRepo");
-const influx = require("../services/influx");
+const gates = require("../state/gates");
 
 // --- SSE helpers ---
 function openSSE(res) {
@@ -27,35 +27,39 @@ function send(res, event, payload) {
 }
 
 // GET /api/stream/dashboard?mode=live
-router.get("/dashboard", verifyToken, async (req, res) => {
+router.get("/dashboard", async (req, res) => {
   openSSE(res);
 
-  // forward real-time piece events (for the scatter plot)
-  const onPiece = (payload) => send(res, "piece", payload);
-  bus.on("piece", onPiece);
+  // Initial snapshot immediately (no 1s delay)
+  try {
+    const tsISO = new Date().toISOString();
+    const legend = assignmentsRepo.getAssignmentsSnapshotAt(tsISO);
+    const overlay = gates.getSnapshot(); // authoritative in-memory
+    send(res, "tick", { ts: tsISO, legend, overlay });
+  } catch (e) {
+    console.error("initial tick failed:", e);
+  }
 
-  // keepalive so proxies don’t kill the connection
+  // forward real-time events
+  const onPiece = (payload) => send(res, "piece", payload); // for scatter
+  const onGate  = (payload) => send(res, "gate", payload);  // per-gate increments + resets
+  const onOverlay = (payload) => send(res, "overlay", payload); // full overlay snapshot (for resets)
+  bus.on("piece", onPiece);
+  bus.on("gate", onGate);
+  bus.on("overlay", onOverlay);
+
+  // keepalive
   const keepAlive = setInterval(() => res.write(": ping\n\n"), 30_000);
 
-  // once per second, push legend + overlay snapshot
-  const poll = setInterval(async () => {
+  // once per second: legend + overlay snapshot from in-memory (no Influx here)
+  const poll = setInterval(() => {
     try {
-      const now = new Date();
-      const tsISO = now.toISOString();
-
-      // from SQLite: which recipe is active per gate at this moment
+      const tsISO = new Date().toISOString();
       const legend = assignmentsRepo.getAssignmentsSnapshotAt(tsISO);
-
-      // from Influx (M2): pieces and grams per gate over a small window
-      const overlay = await influx.queryM2GateOverlay({
-        ts: tsISO,
-        windowSec: 10,
-      });
-
+      const overlay = gates.getSnapshot();
       send(res, "tick", { ts: tsISO, legend, overlay });
     } catch (e) {
       console.error("SSE tick error:", e);
-      // don’t crash the stream; next tick will try again
     }
   }, 1000);
 
@@ -63,6 +67,8 @@ router.get("/dashboard", verifyToken, async (req, res) => {
     clearInterval(keepAlive);
     clearInterval(poll);
     bus.off("piece", onPiece);
+    bus.off("gate", onGate);
+    bus.off("overlay", onOverlay);
   });
 });
 

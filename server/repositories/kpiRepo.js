@@ -1,109 +1,253 @@
 // server/repositories/kpiRepo.js
+// Query M3 (KPI minute) and M4 (KPI totals) data from SQLite
+// These were moved from InfluxDB to SQLite for better performance
+
 const db = require('../db/sqlite');
 
-/** normalize ts => minute start (Date | ms | ISO) */
-function toMinuteStart(ts) {
-  const d = typeof ts === 'number' ? new Date(ts) : new Date(ts);
-  if (Number.isNaN(d.getTime())) return new Date(); // fallback now
-  return new Date(Math.floor(d.getTime() / 60000) * 60000);
+/**
+ * Convert SQLite timestamp to milliseconds since epoch
+ * @param {string} ts - ISO 8601 timestamp
+ * @returns {number} Milliseconds since epoch
+ */
+function toEpochMs(ts) {
+  return new Date(ts).getTime();
 }
 
-// Ensure tables exist (idempotent)
-db.exec(`
-  CREATE TABLE IF NOT EXISTS kpi_minute_snapshots (
-    ts_minute        DATETIME NOT NULL,
-    recipe           TEXT NOT NULL,                 -- recipe name or "__combined"
-    batches_min      REAL NOT NULL,
-    giveaway_pct     REAL NOT NULL,
-    rejects_per_min  REAL,
-    PRIMARY KEY (ts_minute, recipe)
-  );
-
-  CREATE TABLE IF NOT EXISTS kpi_total_snapshots (
-    ts                     DATETIME NOT NULL,
-    recipe                 TEXT NOT NULL,
-    total_batches          REAL NOT NULL,
-    giveaway_g_per_batch   REAL NOT NULL,
-    giveaway_pct_avg       REAL NOT NULL,
-    PRIMARY KEY (ts, recipe)
-  );
-`);
-
-const upsertMinuteStmt = db.prepare(`
-  INSERT INTO kpi_minute_snapshots
-    (ts_minute, recipe, batches_min, giveaway_pct, rejects_per_min)
-  VALUES
-    (@ts_minute, @recipe, @batches_min, @giveaway_pct, @rejects_per_min)
-  ON CONFLICT(ts_minute, recipe) DO UPDATE SET
-    batches_min = excluded.batches_min,
-    giveaway_pct = excluded.giveaway_pct,
-    rejects_per_min = excluded.rejects_per_min
-`);
-
-const upsertTotalsStmt = db.prepare(`
-  INSERT INTO kpi_total_snapshots
-    (ts, recipe, total_batches, giveaway_g_per_batch, giveaway_pct_avg)
-  VALUES
-    (@ts, @recipe, @total_batches, @giveaway_g_per_batch, @giveaway_pct_avg)
-  ON CONFLICT(ts, recipe) DO UPDATE SET
-    total_batches = excluded.total_batches,
-    giveaway_g_per_batch = excluded.giveaway_g_per_batch,
-    giveaway_pct_avg = excluded.giveaway_pct_avg
-`);
-
-function upsertMinute({ ts, recipe, batches_min, giveaway_pct, rejects_per_min }) {
-  const ts_minute = toMinuteStart(ts).toISOString();
-  upsertMinuteStmt.run({
-    ts_minute,
-    recipe: String(recipe),
-    batches_min: Number(batches_min),
-    giveaway_pct: Number(giveaway_pct),
-    rejects_per_min: rejects_per_min == null ? null : Number(rejects_per_min),
+/**
+ * Get M3 throughput (batches/min) per recipe
+ * Returns: { perRecipe: { recipe: [{t, v}] }, total: [{t, v}] }
+ */
+function getM3ThroughputPerRecipe({ from, to }) {
+  const fromMs = toEpochMs(from);
+  const toMs = toEpochMs(to);
+  
+  // Per-recipe data
+  const perRecipeRows = db.prepare(`
+    SELECT recipe_name, timestamp, batches_min
+    FROM kpi_minute_recipes
+    WHERE timestamp >= ? AND timestamp <= ?
+    ORDER BY timestamp ASC
+  `).all(from, to);
+  
+  const perRecipe = {};
+  perRecipeRows.forEach(row => {
+    if (!perRecipe[row.recipe_name]) {
+      perRecipe[row.recipe_name] = [];
+    }
+    perRecipe[row.recipe_name].push({
+      t: row.timestamp,
+      v: Number(row.batches_min)
+    });
   });
-  return { ok: true, ts_minute };
+  
+  // Total (combined) data
+  const totalRows = db.prepare(`
+    SELECT timestamp, batches_min
+    FROM kpi_minute_combined
+    WHERE timestamp >= ? AND timestamp <= ?
+    ORDER BY timestamp ASC
+  `).all(from, to);
+  
+  const total = totalRows.map(row => ({
+    t: row.timestamp,
+    v: Number(row.batches_min)
+  }));
+  
+  return { perRecipe, total };
 }
 
-function upsertTotals({ ts, recipe, total_batches, giveaway_g_per_batch, giveaway_pct_avg }) {
-  const when = new Date(ts).toISOString();
-  upsertTotalsStmt.run({
-    ts: when,
-    recipe: String(recipe),
-    total_batches: Number(total_batches),
-    giveaway_g_per_batch: Number(giveaway_g_per_batch),
-    giveaway_pct_avg: Number(giveaway_pct_avg),
+/**
+ * Get M3 giveaway (%) per recipe
+ * Returns: { perRecipe: { recipe: [{t, v}] }, total: [{t, v}] }
+ */
+function getM3GiveawayPerRecipe({ from, to }) {
+  // Per-recipe data
+  const perRecipeRows = db.prepare(`
+    SELECT recipe_name, timestamp, giveaway_pct
+    FROM kpi_minute_recipes
+    WHERE timestamp >= ? AND timestamp <= ?
+    ORDER BY timestamp ASC
+  `).all(from, to);
+  
+  const perRecipe = {};
+  perRecipeRows.forEach(row => {
+    if (!perRecipe[row.recipe_name]) {
+      perRecipe[row.recipe_name] = [];
+    }
+    perRecipe[row.recipe_name].push({
+      t: row.timestamp,
+      v: Number(row.giveaway_pct)
+    });
   });
-  return { ok: true, ts: when };
+  
+  // Total (combined) data
+  const totalRows = db.prepare(`
+    SELECT timestamp, giveaway_pct
+    FROM kpi_minute_combined
+    WHERE timestamp >= ? AND timestamp <= ?
+    ORDER BY timestamp ASC
+  `).all(from, to);
+  
+  const total = totalRows.map(row => ({
+    t: row.timestamp,
+    v: Number(row.giveaway_pct)
+  }));
+  
+  return { perRecipe, total };
 }
 
-function historyMinute({ from, to, include = 'all' }) {
-  // defaults: last 60 minutes
-  let fromD = from ? new Date(from) : new Date(Date.now() - 60 * 60 * 1000);
-  let toD = to ? new Date(to) : new Date();
+/**
+ * Get M3 pieces processed per recipe
+ * Returns: { perRecipe: { recipe: [{t, v}] }, total: [{t, v}] }
+ */
+function getM3PiecesProcessedPerRecipe({ from, to }) {
+  // Per-recipe data
+  const perRecipeRows = db.prepare(`
+    SELECT recipe_name, timestamp, pieces_processed
+    FROM kpi_minute_recipes
+    WHERE timestamp >= ? AND timestamp <= ?
+    ORDER BY timestamp ASC
+  `).all(from, to);
+  
+  const perRecipe = {};
+  perRecipeRows.forEach(row => {
+    if (!perRecipe[row.recipe_name]) {
+      perRecipe[row.recipe_name] = [];
+    }
+    perRecipe[row.recipe_name].push({
+      t: row.timestamp,
+      v: Number(row.pieces_processed)
+    });
+  });
+  
+  // Total (combined) data
+  const totalRows = db.prepare(`
+    SELECT timestamp, pieces_processed
+    FROM kpi_minute_combined
+    WHERE timestamp >= ? AND timestamp <= ?
+    ORDER BY timestamp ASC
+  `).all(from, to);
+  
+  const total = totalRows.map(row => ({
+    t: row.timestamp,
+    v: Number(row.pieces_processed)
+  }));
+  
+  return { perRecipe, total };
+}
 
-  const params = {
-    from: fromD.toISOString(),
-    to: toD.toISOString(),
+/**
+ * Get M3 weight processed (g) per recipe
+ * Returns: { perRecipe: { recipe: [{t, v}] }, total: [{t, v}] }
+ */
+function getM3WeightProcessedPerRecipe({ from, to }) {
+  // Per-recipe data
+  const perRecipeRows = db.prepare(`
+    SELECT recipe_name, timestamp, weight_processed_g
+    FROM kpi_minute_recipes
+    WHERE timestamp >= ? AND timestamp <= ?
+    ORDER BY timestamp ASC
+  `).all(from, to);
+  
+  const perRecipe = {};
+  perRecipeRows.forEach(row => {
+    if (!perRecipe[row.recipe_name]) {
+      perRecipe[row.recipe_name] = [];
+    }
+    perRecipe[row.recipe_name].push({
+      t: row.timestamp,
+      v: Number(row.weight_processed_g)
+    });
+  });
+  
+  // Total (combined) data
+  const totalRows = db.prepare(`
+    SELECT timestamp, weight_processed_g
+    FROM kpi_minute_combined
+    WHERE timestamp >= ? AND timestamp <= ?
+    ORDER BY timestamp ASC
+  `).all(from, to);
+  
+  const total = totalRows.map(row => ({
+    t: row.timestamp,
+    v: Number(row.weight_processed_g)
+  }));
+  
+  return { perRecipe, total };
+}
+
+/**
+ * Get M3 rejects (combined total only)
+ * Returns: [{ t, v, total_rejects_count, total_rejects_weight_g }]
+ */
+function getM3CombinedRejects({ from, to }) {
+  const rows = db.prepare(`
+    SELECT timestamp, rejects_per_min, total_rejects_count, total_rejects_weight_g
+    FROM kpi_minute_combined
+    WHERE timestamp >= ? AND timestamp <= ?
+    ORDER BY timestamp ASC
+  `).all(from, to);
+  
+  return rows.map(row => ({
+    t: row.timestamp,
+    v: Number(row.rejects_per_min),
+    total_rejects_count: Number(row.total_rejects_count),
+    total_rejects_weight_g: Number(row.total_rejects_weight_g)
+  }));
+}
+
+/**
+ * Get M3 combined data (for all KPIs at once)
+ * Returns: { throughput, giveaway, piecesProcessed, weightProcessed }
+ */
+function getM3AllCombined({ from, to }) {
+  return {
+    throughput: getM3ThroughputPerRecipe({ from, to }),
+    giveaway: getM3GiveawayPerRecipe({ from, to }),
+    piecesProcessed: getM3PiecesProcessedPerRecipe({ from, to }),
+    weightProcessed: getM3WeightProcessedPerRecipe({ from, to })
   };
+}
 
-  let sql = `
-    SELECT ts_minute, recipe, batches_min, giveaway_pct, rejects_per_min
-    FROM kpi_minute_snapshots
-    WHERE ts_minute >= @from AND ts_minute <= @to
-  `;
-
-  if (include === 'combined') {
-    sql += ` AND recipe = "__combined" `;
-  } else if (include === 'recipes') {
-    sql += ` AND recipe <> "__combined" `;
-  }
-
-  sql += ` ORDER BY ts_minute ASC, recipe ASC `;
-
-  return db.prepare(sql).all(params);
+/**
+ * Get M4 pie chart data (totals per recipe)
+ * Returns: [{ recipe, total_batches, giveaway_g_per_batch, giveaway_pct_avg }]
+ */
+function getM4Pies({ from, to }) {
+  // Get the LATEST value for each recipe within the time range
+  // This gives us the cumulative totals as of the 'to' timestamp
+  const rows = db.prepare(`
+    SELECT DISTINCT
+      recipe_name,
+      total_batches,
+      giveaway_g_per_batch,
+      giveaway_pct_avg
+    FROM kpi_totals
+    WHERE timestamp >= ? AND timestamp <= ?
+      AND timestamp = (
+        SELECT MAX(timestamp)
+        FROM kpi_totals kt2
+        WHERE kt2.recipe_name = kpi_totals.recipe_name
+          AND kt2.timestamp >= ?
+          AND kt2.timestamp <= ?
+      )
+    ORDER BY recipe_name ASC
+  `).all(from, to, from, to);
+  
+  return rows.map(row => ({
+    recipe: row.recipe_name,
+    total_batches: Number(row.total_batches),
+    giveaway_g_per_batch: Number(row.giveaway_g_per_batch),
+    giveaway_pct_avg: Number(row.giveaway_pct_avg)
+  }));
 }
 
 module.exports = {
-  upsertMinute,
-  upsertTotals,
-  historyMinute,
+  getM3ThroughputPerRecipe,
+  getM3GiveawayPerRecipe,
+  getM3PiecesProcessedPerRecipe,
+  getM3WeightProcessedPerRecipe,
+  getM3CombinedRejects,
+  getM3AllCombined,
+  getM4Pies
 };
