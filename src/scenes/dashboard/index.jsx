@@ -343,7 +343,7 @@ const Dashboard = () => {
   }, [colorMap]);
 
   const formatTimeLabel = (ts) =>
-    new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: 'UTC' });
+    new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
 
   const chartTheme = {
     axis: {
@@ -611,8 +611,7 @@ const Dashboard = () => {
             <Box flex="0 0 300px" display="flex" flexDirection="column" gap="2px">
               <Typography variant="body2" color={colors.primary[700]} fontSize="10px">
                 {new Date(currentTime).toLocaleString('en-US', { 
-                  month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
-                  timeZone: 'UTC'
+                  month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
                 })}
               </Typography>
               <Slider

@@ -1,6 +1,5 @@
 import Dashboard from "../scenes/dashboard";
-import Settings from "../scenes/settings";
-import Simulation from "../scenes/simulation";
+import Setup from "../scenes/setup";
 import PlanAssist from "../scenes/planAssist";
 import Stats from "../scenes/stats";
 
@@ -12,17 +11,11 @@ export const ROUTES = {
     component: Dashboard,
     icon: "dashboard"
   },
-  SIMULATION: {
-    path: "/simulation", 
-    name: "Simulation",
-    component: Simulation,
-    icon: "simulation"
-  },
-  SETTINGS: {
-    path: "/settings",
-    name: "Settings", 
-    component: Settings,
-    icon: "settings"
+  SETUP: {
+    path: "/setup",
+    name: "Setup", 
+    component: Setup,
+    icon: "setup"
   },
   PLAN_ASSIST: {
     path: "/planAssist",
@@ -42,19 +35,17 @@ export const ROUTES = {
 export const ROLE_ROUTES = {
   admin: [
     ROUTES.DASHBOARD,
+    ROUTES.SETUP,
     ROUTES.STATS,
     ROUTES.PLAN_ASSIST,
-    ROUTES.SETTINGS,
-    ROUTES.SIMULATION
   ],
   manager: [
     ROUTES.DASHBOARD,
     ROUTES.STATS,
-    ROUTES.SIMULATION
   ],
   operator: [
     ROUTES.DASHBOARD,
-    ROUTES.SETTINGS
+    ROUTES.SETUP
   ]
 };
 

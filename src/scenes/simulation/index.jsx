@@ -22,7 +22,7 @@ import { ResponsiveLine } from "@nivo/line";
 import { ResponsiveBar } from "@nivo/bar";
 import { tokens } from "../../theme";
 import Header from "../../components/Header";
-import mockData from "../../data/mockData_json7.json";
+// import mockData from "../../data/mockData_json7.json"; // TEMPORARILY DISABLED
 import { useAppContext } from "../../context/AppContext";
 
 const Simulation = () => {
@@ -96,14 +96,18 @@ const Simulation = () => {
   });
 
   // Find the selected simulation object
-  const simulation = selectedSimulation 
-    ? mockData.pareto_simulations.find((sim) => sim.id === selectedSimulation)
-    : null;
+  // TEMPORARILY DISABLED - mockData
+  const simulation = null;
+  // const simulation = selectedSimulation 
+  //   ? mockData.pareto_simulations.find((sim) => sim.id === selectedSimulation)
+  //   : null;
     
   // Get batch details if a simulation is selected
-  const batchDetails = selectedSimulation && mockData.batch_details
-    ? mockData.batch_details.find((batch) => batch.id === (batchMapping[selectedSimulation] || selectedSimulation))
-    : null;
+  // TEMPORARILY DISABLED - mockData
+  const batchDetails = null;
+  // const batchDetails = selectedSimulation && mockData.batch_details
+  //   ? mockData.batch_details.find((batch) => batch.id === (batchMapping[selectedSimulation] || selectedSimulation))
+  //   : null;
 
   // Extract x-values for slider if a simulation is selected
   const xValues = simulation?.data.map((pt) => pt.x) || [];
@@ -406,11 +410,13 @@ const Simulation = () => {
                   onChange={handleSimulationChange}
                   color="secondary"
                 >
-                  {mockData.pareto_simulations.map((sim) => (
+                  {/* TEMPORARILY DISABLED - mockData */}
+                  {/* {mockData.pareto_simulations.map((sim) => (
                     <MenuItem key={sim.id} value={sim.id}>
                       {sim.id}
                     </MenuItem>
-                  ))}
+                  ))} */}
+                  <MenuItem value="">No simulations available</MenuItem>
                 </Select>
               </FormControl>
             </Box>

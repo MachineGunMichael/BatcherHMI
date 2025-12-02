@@ -49,7 +49,8 @@ SQLITE_DB   = os.getenv("SQLITE_DB", DEFAULT_SQLITE)
 INFLUX_HOST = os.getenv("INFLUXDB3_HOST_URL", "http://127.0.0.1:8181")
 INFLUX_TOKEN= os.getenv("INFLUXDB3_AUTH_TOKEN")
 INFLUX_DB   = os.getenv("INFLUXDB3_DATABASE", "batching")
-PLANT_TZ    = os.getenv("TZ_EUROPE", "Europe/Amsterdam")
+# Auto-detect system timezone (or use LOCAL_TIMEZONE env var if set)
+PLANT_TZ    = os.getenv("LOCAL_TIMEZONE") or datetime.now().astimezone().tzinfo.tzname(None)
 
 HAS_INFLUX = bool(INFLUX_TOKEN and INFLUX_HOST and INFLUX_DB)
 
@@ -63,12 +64,8 @@ if HAS_INFLUX:
 warnings.simplefilter("ignore", category=FutureWarning)
 
 # CSV collectors (append rows as dicts while you process)
-CSV_ROWS_INFLUX_M3_RECIPE: List[dict]   = []   # per-minute per-recipe KPI (batches_min, giveaway_pct, rejects_per_min)
-CSV_ROWS_INFLUX_M3_COMBINED: List[dict] = []   # per-minute combined KPI
-CSV_ROWS_INFLUX_M4_TOTALS: List[dict]   = []   # per-recipe totals (end of window)
 CSV_ROWS_INFLUX_M2_GATE: List[dict]     = []   # per-minute gate_state
 CSV_ROWS_INFLUX_M1_PIECES: List[dict]   = []   # raw pieces stream (optional; handy for sanity)
-# M5 (assignments) removed - now stored in SQLite only (run_config_assignments + settings_history tables)
 
 # --------------------- TZ HELPERS ---------------------
 UTC = tz.UTC
@@ -371,9 +368,20 @@ class SqliteWriter:
             end_utc.strftime("%Y-%m-%dT%H:%M:00Z"),
         ))
 
-    def update_gate_dwell(self, program_id: int, gate_number: int, durations_sec: List[float]):
+    def update_gate_dwell(self, program_id: int, gate_number: int, durations_sec: List[float], batch_timestamps: List[pd.Timestamp] = None):
         # Welford online accumulation; but we can accumulate batch-wise for simplicity
         if not durations_sec: return
+        
+        # Write individual dwell times for boxplot visualization
+        if durations_sec:
+            for i, duration in enumerate(durations_sec):
+                timestamp = batch_timestamps[i].isoformat() if batch_timestamps and i < len(batch_timestamps) else None
+                self.conn.execute("""
+                    INSERT INTO gate_dwell_times (program_id, gate_number, dwell_time_sec, batch_timestamp)
+                    VALUES (?, ?, ?, ?)
+                """, (program_id, gate_number, duration, timestamp))
+        
+        # Also maintain summary statistics in gate_dwell_accumulators for backward compatibility
         # fetch current
         row = self.conn.execute("""
             SELECT sample_count, mean_sec, m2_sec, min_sec, max_sec
@@ -402,6 +410,120 @@ class SqliteWriter:
               updated_at   = CURRENT_TIMESTAMP
         """, (program_id, gate_number, n, mean, m2, mn, mx))
 
+    def write_kpi_minute_recipes(self, program_id: int, recipe_minute: Dict[Tuple[int, str], Dict[str, float]], 
+                                  recipe_kpi_minute: Dict[Tuple[int, str], Dict[str, float]], 
+                                  assignments: 'WindowAssignments'):
+        """
+        Write per-recipe per-minute KPIs to SQLite kpi_minute_recipes table.
+        This mirrors what goes to InfluxDB but stores in SQLite for Stats page graphs.
+        """
+        for (rid, ts_z), kpi in recipe_kpi_minute.items():
+            # Get recipe name from assignments
+            gates = [g for g, rr in assignments.gate_to_recipe_id.items() if rr == rid]
+            if not gates:
+                continue
+            recipe_name = assignments.gate_to_recipe_name[gates[0]] or f"recipe_{rid}"
+            
+            # Get throughput data from recipe_minute
+            throughput = recipe_minute.get((rid, ts_z), {})
+            
+            # Insert into SQLite
+            self.conn.execute("""
+                INSERT INTO kpi_minute_recipes 
+                  (timestamp, recipe_name, program_id, batches_min, giveaway_pct, 
+                   pieces_processed, weight_processed_g, rejects_per_min, 
+                   total_rejects_count, total_rejects_weight_g)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0)
+            """, (
+                ts_z,
+                recipe_name,
+                program_id,
+                float(kpi.get('batches_min', 0.0)),
+                float(kpi.get('giveaway_pct', 0.0)),
+                int(throughput.get('pieces_processed', 0)),
+                int(throughput.get('weight_processed_g', 0))
+            ))
+    
+    def write_kpi_minute_combined(self, program_id: int, combined_kpi_minute: Dict[str, Dict[str, float]],
+                                    prog_minute: Dict[str, Dict[str, float]], 
+                                    gate0_counts_per_min: Dict[str, int], 
+                                    gate0_weights_per_min: Dict[str, float]):
+        """
+        Write combined (all recipes) per-minute KPIs to SQLite kpi_minute_combined table.
+        """
+        # Sort timestamps chronologically for cumulative reject calculation
+        all_timestamps = sorted(combined_kpi_minute.keys())
+        
+        cumulative_reject_count = 0
+        cumulative_reject_weight = 0.0
+        
+        for ts_z in all_timestamps:
+            kpi = combined_kpi_minute[ts_z]
+            throughput = prog_minute.get(ts_z, {})
+            
+            # Add this minute's rejects to cumulative totals
+            minute_reject_count = int(gate0_counts_per_min.get(ts_z, 0))
+            minute_reject_weight = float(gate0_weights_per_min.get(ts_z, 0.0))
+            
+            cumulative_reject_count += minute_reject_count
+            cumulative_reject_weight += minute_reject_weight
+            
+            self.conn.execute("""
+                INSERT INTO kpi_minute_combined
+                  (timestamp, batches_min, giveaway_pct, pieces_processed, weight_processed_g,
+                   rejects_per_min, total_rejects_count, total_rejects_weight_g)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                ts_z,
+                float(kpi.get('batches_min', 0.0)),
+                float(kpi.get('giveaway_pct', 0.0)),
+                int(throughput.get('pieces_processed', 0)),
+                int(throughput.get('weight_processed_g', 0)),
+                float(minute_reject_count),
+                int(cumulative_reject_count),
+                float(cumulative_reject_weight)
+            ))
+    
+    def write_kpi_totals(self, program_id: int, per_recipe_totals: Dict[int, Dict[str, float]], 
+                          assignments: 'WindowAssignments', window_end_ts: pd.Timestamp):
+        """
+        Write per-recipe cumulative totals to SQLite kpi_totals table.
+        This is a snapshot at the end of the window showing final cumulative values.
+        """
+        ts_z = window_end_ts.strftime("%Y-%m-%dT%H:%M:00Z")
+        
+        for rid, totals in per_recipe_totals.items():
+            if rid is None:
+                continue
+                
+            # Get recipe name from assignments
+            gates = [g for g, rr in assignments.gate_to_recipe_id.items() if rr == rid]
+            if not gates:
+                continue
+            recipe_name = assignments.gate_to_recipe_name[gates[0]] or f"recipe_{rid}"
+            
+            total_batches = float(totals.get("total_batches", 0))
+            total_give_g = float(totals.get("total_giveaway_weight_g", 0))
+            total_batched_g = float(totals.get("total_batched_weight_g", 0))
+            
+            # Calculate giveaway per batch and giveaway percentage avg
+            giveaway_g_per_batch = (total_give_g / max(1.0, total_batches))
+            total_actual_g = total_batched_g + total_give_g
+            giveaway_pct_avg = (total_give_g / total_actual_g * 100.0) if total_actual_g > 0 else 0.0
+            
+            self.conn.execute("""
+                INSERT INTO kpi_totals
+                  (timestamp, recipe_name, program_id, total_batches, giveaway_g_per_batch, giveaway_pct_avg)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                ts_z,
+                recipe_name,
+                program_id,
+                int(total_batches),
+                float(giveaway_g_per_batch),
+                float(giveaway_pct_avg)
+            ))
+
 
 @dataclass
 class WindowAssignments:
@@ -413,13 +535,17 @@ class WindowAssignments:
 # --------------------- INFLUX WRITER ---------------------
 class InfluxWriter:
     """
-    Shapes aligned with server/services/influx.js:
-      M1  writePiece          -> measurement 'pieces',   tags: {piece_id?}, fields: {weight_g}
-      M2  writeGateState      -> measurement 'gate_state', tags: {gate},   fields: {pieces_in_gate, weight_sum_g}
-      M3  writeKpiMinute      -> measurement 'kpi_minute', tags: {recipe}, fields: {batches_min, giveaway_pct, rejects_per_min?}
-          writeKpiMinuteCombined -> same as M3 with recipe="__combined"
-      M4  writeKpiTotals      -> measurement 'kpi_totals', tags: {recipe}, fields: {total_batches, giveaway_g_per_batch, giveaway_pct_avg}
-      M5  REMOVED - assignments now in SQLite (run_config_assignments + settings_history tables)
+    InfluxDB writer for replay data import.
+    
+    CURRENT ARCHITECTURE (as of Nov 2025):
+    - InfluxDB: Stores M1 (pieces) and M2 (gate_state) for real-time visualization
+    - SQLite: Stores ALL KPIs, stats, and aggregated data (M3/M4 equivalent)
+    
+    This writer handles:
+      M1  writePieces     -> measurement 'pieces', tags: {piece_id, gate}, fields: {weight_g}
+      M2  writeGateState  -> measurement 'gate_state', tags: {gate}, fields: {pieces_in_gate, weight_sum_g}
+    
+    M3 (kpi_minute) and M4 (kpi_totals) are now stored ONLY in SQLite.
     """
     def __init__(self):
         if not HAS_INFLUX:
@@ -646,168 +772,6 @@ class InfluxWriter:
             data_frame_tag_columns=['gate'],
         )
         return out
-
-    # --------- M3
-    def writeKpiMinute(self, t_minute_utc: pd.Timestamp, recipe_name: str,
-                       batches_min: float, giveaway_pct: float, rejects_per_min: Optional[float] = None):
-        if not self.client: return
-        p = Point("kpi_minute").time(self._to_dt(t_minute_utc)) \
-                               .tag("recipe", str(recipe_name)) \
-                               .field("batches_min", float(batches_min)) \
-                               .field("giveaway_pct", float(giveaway_pct))
-        if rejects_per_min is not None:
-            p = p.field("rejects_per_min", float(rejects_per_min))
-        self.client.write(p)
-
-    def writeKpiMinuteCombined(self, t_minute_utc: pd.Timestamp, batches_min: float,
-                               giveaway_pct: float, rejects_per_min: Optional[float] = None):
-        self.writeKpiMinute(t_minute_utc, "__combined", batches_min, giveaway_pct, rejects_per_min)
-
-    def writeKpiMinuteDF(self, recipe_kpi_minute, recipe_minute, assignments: WindowAssignments, program_id: int):
-        """
-        Write per-recipe per-minute KPI rows with:
-        - batches_min
-        - giveaway_pct
-        - pieces_processed           <-- NEW
-        - weight_processed_g         <-- NEW
-        """
-        import pandas as pd
-        if not self.client or not recipe_kpi_minute:
-            return pd.DataFrame(columns=['_time','program','recipe','batches_min','giveaway_pct','pieces_processed','weight_processed_g'])
-
-        rows = []
-        for (rid, ts_z), v in recipe_kpi_minute.items():
-            gates = [g for g, rr in assignments.gate_to_recipe_id.items() if rr == rid]
-            if not gates:
-                continue
-            rname = assignments.gate_to_recipe_name[gates[0]] or f"recipe_{rid}"
-
-            # new fields from recipe_minute (same key)
-            rm = recipe_minute.get((rid, ts_z), {})
-            rows.append({
-                '_time': pd.Timestamp(ts_z).tz_localize('UTC') if pd.Timestamp(ts_z).tzinfo is None else pd.Timestamp(ts_z).tz_convert('UTC'),
-                'program': str(program_id),
-                'recipe': str(rname),
-                'batches_min': float(v.get('batches_min', 0.0)),
-                'giveaway_pct': float(v.get('giveaway_pct', 0.0)),
-                'pieces_processed': float(rm.get('pieces_processed', 0.0)),
-                'weight_processed_g': float(rm.get('weight_processed_g', 0.0)),
-            })
-
-        # Optional dense fill for every recipe and every minute in the window
-        full_minutes = None
-        if DENSE_INFLUX_MINUTES and '__full_minutes__' in assignments.gate_to_recipe_name:
-            full_minutes = assignments.gate_to_recipe_name['__full_minutes__']  # list[str iso Z]
-            all_recipes = [assignments.gate_to_recipe_name[g] for g in assignments.gate_to_recipe_name if isinstance(g, int) and assignments.gate_to_recipe_name[g]]
-            existing = {(r['recipe'], r['_time'].strftime("%Y-%m-%dT%H:%M:00Z")) for r in rows}
-            for rname in set(all_recipes):
-                for tsz in full_minutes:
-                    key = (rname, tsz)
-                    if key not in existing:
-                        rows.append({
-                            '_time': pd.Timestamp(tsz).tz_localize('UTC') if pd.Timestamp(tsz).tzinfo is None else pd.Timestamp(tsz).tz_convert('UTC'),
-                            'program': str(program_id),
-                            'recipe': str(rname),
-                            'batches_min': 0.0,
-                            'giveaway_pct': 0.0,
-                            'pieces_processed': 0.0,
-                            'weight_processed_g': 0.0,
-                        })
-
-        df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=['_time','program','recipe','batches_min','giveaway_pct','pieces_processed','weight_processed_g'])
-        if not df.empty:
-            self.client.write(
-                df,
-                data_frame_measurement_name='kpi_minute',
-                data_frame_timestamp_column='_time',
-                data_frame_tag_columns=['program','recipe'],
-            )
-        return df
-
-
-    def writeKpiMinuteCombinedDF(self, combined_kpi_minute, prog_minute, program_id: int, gate0_counts_per_min: Dict[str, int], gate0_weights_per_min: Dict[str, float]):
-        """
-        combined: roll-up across recipes, tagged with program.
-        Adds:
-        - pieces_processed      (from prog_minute; counts ALL pieces incl rejects, same as old SQLite)
-        - weight_processed_g    (from prog_minute; non-reject weight per minute)
-        - total_rejects_count   (cumulative reject count for this program)
-        - total_rejects_weight_g (cumulative reject weight for this program)
-        """
-        import pandas as pd
-        if not self.client or not combined_kpi_minute:
-            return pd.DataFrame(columns=['_time','program','recipe','batches_min','giveaway_pct','rejects_per_min','pieces_processed','weight_processed_g','total_rejects_count','total_rejects_weight_g'])
-
-        # Calculate cumulative rejects (reset to 0 at start of each program)
-        # First, collect all timestamps and sort them chronologically
-        all_timestamps = sorted(combined_kpi_minute.keys())
-        
-        cumulative_reject_count = 0
-        cumulative_reject_weight = 0.0
-        
-        rows = []
-        for ts_z in all_timestamps:
-            v = combined_kpi_minute[ts_z]
-            pm = prog_minute.get(ts_z, {})
-            
-            # Add this minute's rejects to cumulative totals
-            minute_reject_count = int(gate0_counts_per_min.get(ts_z, 0))
-            minute_reject_weight = float(gate0_weights_per_min.get(ts_z, 0.0))
-            
-            cumulative_reject_count += minute_reject_count
-            cumulative_reject_weight += minute_reject_weight
-            
-            rows.append({
-                '_time': pd.Timestamp(ts_z).tz_localize('UTC') if pd.Timestamp(ts_z).tzinfo is None else pd.Timestamp(ts_z).tz_convert('UTC'),
-                'program': str(program_id),
-                'recipe': '__combined',
-                'batches_min': float(v.get('batches_min', 0.0)),
-                'giveaway_pct': float(v.get('giveaway_pct', 0.0)),
-                'rejects_per_min': float(minute_reject_count),
-                'pieces_processed': float(pm.get('pieces_processed', 0.0)),
-                'weight_processed_g': float(pm.get('weight_processed_g', 0.0)),
-                'total_rejects_count': int(cumulative_reject_count),
-                'total_rejects_weight_g': float(cumulative_reject_weight),
-            })
-
-        df = pd.DataFrame(rows)
-        self.client.write(
-            df,
-            data_frame_measurement_name='kpi_minute',
-            data_frame_timestamp_column='_time',
-            data_frame_tag_columns=['program','recipe'],
-        )
-        return df
-    
-    # --------- M4
-    def writeKpiTotals(self, t_utc: pd.Timestamp, recipe_name: str,
-                       total_batches: float, giveaway_g_per_batch: float, giveaway_pct_avg: float):
-        if not self.client: return
-        p = Point("kpi_totals").time(self._to_dt(t_utc)) \
-                               .tag("recipe", str(recipe_name)) \
-                               .field("total_batches", float(total_batches)) \
-                               .field("giveaway_g_per_batch", float(giveaway_g_per_batch)) \
-                               .field("giveaway_pct_avg", float(giveaway_pct_avg))
-        self.client.write(p)
-
-    def writeKpiTotalsDF(self, m4_df: pd.DataFrame, program_id: int):
-        if m4_df.empty:
-            return m4_df
-
-        df = m4_df.copy()
-        df['program'] = str(program_id)          # <-- always attach program
-
-        if self.client:                          # <-- only guard the write
-            self.client.write(
-                df,
-                data_frame_measurement_name='kpi_totals',
-                data_frame_timestamp_column='_time',
-                data_frame_tag_columns=['program','recipe'],
-            )
-        return df
-
-    # --------- M5: REMOVED - assignments now stored in SQLite only
-    # (see run_config_assignments and settings_history tables)
 
 # --------------------- PARSERS FOR WINDOWS / RECIPE MAP ---------------------
 def _parse_pair_generic(s: Any) -> Tuple[int, int]:
@@ -1161,13 +1125,16 @@ def compute_window_kpis(df_slice: pd.DataFrame, assignments: WindowAssignments):
 
     # -------- dwell --------
     dwell: Dict[int, List[float]] = {}
+    dwell_timestamps: Dict[int, List[pd.Timestamp]] = {}
     for gate, grp in batches.groupby('Gate'):
         if gate == 0: continue
         ts_sorted = grp['Timestamp'].sort_values()
-        diffs = ts_sorted.diff().dropna().dt.total_seconds().tolist()
-        dwell[int(gate)] = diffs
+        diffs = ts_sorted.diff().dropna()
+        dwell[int(gate)] = diffs.dt.total_seconds().tolist()
+        # Store the timestamps of batches (excluding the first one since diff starts from second)
+        dwell_timestamps[int(gate)] = ts_sorted.iloc[1:].tolist()
 
-    return program_totals, per_recipe_totals, prog_minute, recipe_minute, dwell, recipe_kpi_minute, combined_kpi_minute
+    return program_totals, per_recipe_totals, prog_minute, recipe_minute, dwell, dwell_timestamps, recipe_kpi_minute, combined_kpi_minute
 
 # --------------------- MAIN PIPELINE ---------------------
 def build_window_assignments(win_row: pd.Series, recipe_map: Dict[str, RecipeSpec], sw: SqliteWriter) -> Tuple[int, int, WindowAssignments, str]:
@@ -1243,100 +1210,6 @@ def build_window_assignments(win_row: pd.Series, recipe_map: Dict[str, RecipeSpe
     print(f"[assign] gates with recipes: {have} -> {names}")
 
     return program_id, config_id, WindowAssignments(gate_to_recipe_id, gate_to_recipe_name, recipe_id_to_gates), base_name
-
-def build_m4_cumulative_per_minute(df_slice: pd.DataFrame, assignments: WindowAssignments) -> pd.DataFrame:
-    """
-    For each recipe:
-      - compute for each minute: filled_batches_equiv (sum of "fill"),
-        batched_actual_w, target_w, giveaway_w
-      - then build cumulative totals over time within the window
-      - emit per-minute rows with:
-          total_batches (cum filled), giveaway_g_per_batch (cum_give / max(cum_filled,1)),
-          giveaway_pct_avg (cum_give / (cum_actual + cum_give) * 100)
-    """
-    pieces = df_slice[df_slice['Type']=='Piece'].copy()
-    batches = df_slice[df_slice['Type']=='Batch'].copy()
-
-    rows = []
-
-    for rid, gates in assignments.recipe_id_to_gates.items():
-        if rid is None or not gates: 
-            continue
-
-        rname = assignments.gate_to_recipe_name[gates[0]]
-
-        # decode recipe spec from name
-        try:
-            _, x, y, xx, yy, xxx, yyy = rname.split('_', 6)
-            lo_p, hi_p = int(x), int(y)
-            lo_b, hi_b = int(xx), int(yy)
-            bc_type = None if xxx == 'NA' else xxx
-            bc_val  = None if yyy in ('NA','',None) else int(float(yyy))
-        except Exception:
-            lo_p=hi_p=lo_b=hi_b=0; bc_type=None; bc_val=None
-
-        b = batches[batches['Gate'].isin(gates)].copy()  
-        if b.empty:
-            continue                               
-        b.loc[:, '__m'] = b['Timestamp'].dt.floor('T')    # <— safer assign
-
-        # per-minute aggregates: actual weight and "filled equivalents"
-        per_min = []
-        for ts_min, bb in b.groupby('__m'):
-            w_actual = float(bb['Weight'].sum())
-            filled = 0.0
-            w_target = 0.0
-
-            for _, one in bb.iterrows():
-                weight = float(one['Weight'])
-                if bc_type in ('exact','min') and bc_val:
-                    try:
-                        actual_count = int(float(one.get('BatchCount', np.nan)))
-                    except:
-                        actual_count = 0
-                    this_fill = 1.0 if (bc_type=='exact' and actual_count==bc_val) or (bc_type=='min' and actual_count>=bc_val) \
-                               else (actual_count/float(bc_val)) if bc_val else 0.0
-                    this_tgt = this_fill * (bc_val * lo_p if bc_val else 0.0)
-                else:
-                    if lo_b <= 0:
-                        this_fill = 1.0
-                        this_tgt  = weight
-                    else:
-                        this_fill = 1.0 if weight >= lo_b else weight/float(lo_b)
-                        this_tgt  = this_fill * lo_b
-
-                filled   += this_fill
-                w_target += this_tgt
-
-            w_give = max(0.0, w_actual - w_target)
-            per_min.append((ts_min, filled, w_actual, w_give))
-
-        if not per_min:
-            continue
-
-        # sort by minute and do cumulative
-        per_min = sorted(per_min, key=lambda t: t[0])
-        cum_filled = 0.0
-        cum_actual = 0.0
-        cum_give   = 0.0
-
-        for ts_min, filled, w_actual, w_give in per_min:
-            cum_filled += filled
-            cum_actual += w_actual
-            cum_give   += w_give
-
-            gpb = (cum_give / max(1.0, cum_filled))
-            gpct_avg = (cum_give / (cum_actual + cum_give) * 100.0) if (cum_actual + cum_give) > 0 else 0.0
-
-            rows.append({
-                '_time': ts_min.tz_localize('UTC') if ts_min.tzinfo is None else ts_min.tz_convert('UTC'),
-                'recipe': rname,
-                'total_batches': float(cum_filled),
-                'giveaway_g_per_batch': float(gpb),
-                'giveaway_pct_avg': float(gpct_avg),
-            })
-
-    return pd.DataFrame(rows, columns=['_time','recipe','total_batches','giveaway_g_per_batch','giveaway_pct_avg'])
 
 def main():
     ap = argparse.ArgumentParser(description="One-time import of Excel data into SQLite and Influx")
@@ -1433,26 +1306,19 @@ def main():
             # Compute KPIs (#1..#13 + dwell)
             (prog_totals,
              recipe_totals,
-             prog_minute,
-             recipe_minute,
-             dwell,
-             recipe_kpi_minute,
-             combined_kpi_minute) = compute_window_kpis(df_slice, assignments)
+            prog_minute,
+            recipe_minute,
+            dwell,
+            dwell_timestamps,
+            recipe_kpi_minute,
+            combined_kpi_minute) = compute_window_kpis(df_slice, assignments)
 
             # Build dense minute list for SQLite always
             t0 = df_slice['Timestamp'].min().floor('T')
             t1 = df_slice['Timestamp'].max().floor('T')
             full_minutes_z_sql = [m.strftime("%Y-%m-%dT%H:%M:00Z") for m in pd.date_range(t0, t1, freq='T')]
 
-            # --- WRITE SQLITE ---
-            sw.write_program_totals(program_id, prog_totals, start_utc, end_utc)
-            for rid, totals in recipe_totals.items():
-                sw.bump_recipe_totals(program_id, rid, totals)
-            for gate, durations in dwell.items():
-                sw.update_gate_dwell(program_id, gate, durations)
-
-
-            # build Gate-0 (reject) piece-counts and weights per minute for M3 combined
+            # build Gate-0 (reject) piece-counts and weights per minute (needed for combined KPIs)
             g0 = df_slice[(df_slice['Type'] == 'Piece') & (df_slice['Gate'] == 0)].copy()
             if not g0.empty:
                 g0_with_min = g0.assign(_min=g0['Timestamp'].dt.floor('T'))
@@ -1465,6 +1331,20 @@ def main():
             else:
                 gate0_counts_per_min = {}
                 gate0_weights_per_min = {}
+
+            # --- WRITE SQLITE ---
+            sw.write_program_totals(program_id, prog_totals, start_utc, end_utc)
+            for rid, totals in recipe_totals.items():
+                sw.bump_recipe_totals(program_id, rid, totals)
+            for gate, durations in dwell.items():
+                timestamps = dwell_timestamps.get(gate, [])
+                sw.update_gate_dwell(program_id, gate, durations, timestamps)
+            
+            # Write per-minute KPIs to SQLite (for Stats page graphs and Dashboard)
+            sw.write_kpi_minute_recipes(program_id, recipe_minute, recipe_kpi_minute, assignments)
+            sw.write_kpi_minute_combined(program_id, combined_kpi_minute, prog_minute, gate0_counts_per_min, gate0_weights_per_min)
+            sw.write_kpi_totals(program_id, recipe_totals, assignments, end_utc)
+            print(f"[SQLite] Wrote {len(recipe_kpi_minute)} recipe + {len(combined_kpi_minute)} combined + {len(recipe_totals)} totals rows")
 
             # --- WRITE INFLUX (optional, v3 / M1–M4) ---
             if HAS_INFLUX and iw.client:
@@ -1519,73 +1399,8 @@ def main():
                         .to_dict('records')
                     )
 
-                # ---------- M3: recipe kpis per minute (fast DF) ----------
-                m3_recipe_df = iw.writeKpiMinuteDF(recipe_kpi_minute, recipe_minute, assignments, program_id)
-                if not m3_recipe_df.empty:
-                    CSV_ROWS_INFLUX_M3_RECIPE.extend(
-                        m3_recipe_df.assign(
-                            ts_minute=lambda d: d['_time'].map(utc_iso)
-                        )[[
-                            'ts_minute', 'program', 'recipe',
-                            'batches_min', 'giveaway_pct',
-                            'pieces_processed', 'weight_processed_g'
-                        ]].to_dict('records')
-                    )
-
-                m3_combined_df = iw.writeKpiMinuteCombinedDF(combined_kpi_minute, prog_minute, program_id, gate0_counts_per_min, gate0_weights_per_min)
-                if not m3_combined_df.empty:
-                    CSV_ROWS_INFLUX_M3_COMBINED.extend(
-                        m3_combined_df.assign(
-                            ts_minute=lambda d: d['_time'].map(utc_iso)
-                        )[[
-                            'ts_minute', 'program', 'recipe',
-                            'batches_min', 'giveaway_pct', 'rejects_per_min',
-                            'pieces_processed', 'weight_processed_g',
-                            'total_rejects_count', 'total_rejects_weight_g'
-                        ]].to_dict('records')
-                    )
-
                 print("[debug] M2 rows (gate_state):", 0 if m2_df is None else len(m2_df))
-                print("[debug] M3 recipe keys:", len(recipe_kpi_minute))
-
-                # M4: rolling per-minute cumulative per recipe within this program
-                m4_raw = build_m4_cumulative_per_minute(df_slice, assignments)
-
-                if DENSE_INFLUX_MINUTES and not m4_raw.empty:
-                    # full minute index for the window (UTC tz-aware)
-                    full_idx = pd.to_datetime(full_minutes_z, utc=True)
-
-                    # build a full recipe × minute grid and forward-fill within each recipe
-                    recipes = m4_raw['recipe'].unique()
-                    mi = pd.MultiIndex.from_product([recipes, full_idx], names=['recipe', '_time'])
-
-                    m4_dense = (
-                        m4_raw
-                        .set_index(['recipe', '_time'])
-                        .reindex(mi)
-                        .groupby(level=0).ffill()
-                        .fillna({
-                            'total_batches': 0.0,
-                            'giveaway_g_per_batch': 0.0,
-                            'giveaway_pct_avg': 0.0
-                        })
-                        .reset_index()
-                    )
-
-                    m4_raw = m4_dense
-
-                try:
-                    m4_df = iw.writeKpiTotalsDF(m4_raw, program_id)
-                except Exception as e:
-                    print(f"[M4] totals DataFrame write failed ({type(e).__name__}): {e}")
-                    m4_df = pd.DataFrame()
-
-                if not m4_df.empty:
-                    CSV_ROWS_INFLUX_M4_TOTALS.extend(
-                        m4_df.assign(
-                            ts=lambda d: d['_time'].map(utc_iso)
-                        )[ ['ts','program','recipe','total_batches','giveaway_g_per_batch','giveaway_pct_avg'] ].to_dict('records')
-                    )
+                print("[debug] M1 pieces:", len(pieces_all), "| M2 gate_state:", len(m2_df) if m2_df is not None else 0)
 
             else:
                 print("[Influx] writes skipped (no client)")
@@ -1609,13 +1424,6 @@ def main():
             pd.DataFrame(CSV_ROWS_INFLUX_M1_PIECES).sort_values("ts").to_csv(os.path.join(out_dir, "influx_m1_pieces.csv"), index=False)
         if CSV_ROWS_INFLUX_M2_GATE:
             pd.DataFrame(CSV_ROWS_INFLUX_M2_GATE).sort_values(["ts_minute","gate"]).to_csv(os.path.join(out_dir, "influx_m2_gate_state.csv"), index=False)
-        if CSV_ROWS_INFLUX_M3_RECIPE:
-            pd.DataFrame(CSV_ROWS_INFLUX_M3_RECIPE).sort_values(["ts_minute","recipe"]).to_csv(os.path.join(out_dir, "influx_m3_kpi_minute_recipes.csv"), index=False)
-        if CSV_ROWS_INFLUX_M3_COMBINED:
-            pd.DataFrame(CSV_ROWS_INFLUX_M3_COMBINED).sort_values(["ts_minute"]).to_csv(os.path.join(out_dir, "influx_m3_kpi_minute_combined.csv"), index=False)
-        if CSV_ROWS_INFLUX_M4_TOTALS:
-            pd.DataFrame(CSV_ROWS_INFLUX_M4_TOTALS).sort_values(["ts","recipe"]).to_csv(os.path.join(out_dir, "influx_m4_kpi_totals.csv"), index=False)
-        # M5 (assignments) CSV export removed - query from SQLite instead
         print(f"[CSV] Influx exports written to ./{out_dir}/")
 
     def export_sqlite_csv(sqlite_path: str, out_dir: str = OUT_DIR):

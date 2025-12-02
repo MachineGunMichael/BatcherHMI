@@ -313,6 +313,9 @@ class LiveWorker:
         # M4 data tracking (cumulative totals per recipe)
         self.m4_cumulative: Dict[int, Dict[str, float]] = {}  # recipe_id -> {total_batches, cum_actual, cum_give}
         
+        # Gate dwell time tracking (last batch timestamp per gate)
+        self.last_batch_time: Dict[int, datetime] = {}  # gate -> last batch timestamp
+        
         # No time shifting needed - timestamps are already current time from simulator/C# app
         
         # Statistics
@@ -566,9 +569,19 @@ class LiveWorker:
             now = datetime.now(timezone.utc)
             gate_assignments = assignment_config['gate_assignments']
             
-            # Generate unique program name based on timestamp for live mode
-            # Format: program_YYYYMMDD_HHMMSS
-            program_name = f"program_{now.strftime('%Y%m%d_%H%M%S')}"
+            # Generate unique program name based on LOCAL timestamp for live mode
+            # Format: program_YYYYMMDD_HHMMSS (in local deployment timezone)
+            # Auto-detects system timezone (or uses LOCAL_TIMEZONE env var if explicitly set)
+            from dateutil import tz
+            local_tz_name = os.getenv("LOCAL_TIMEZONE")
+            if local_tz_name:
+                # Use explicitly configured timezone
+                local_tz = tz.gettz(local_tz_name)
+            else:
+                # Auto-detect system's local timezone
+                local_tz = datetime.now().astimezone().tzinfo
+            local_now = now.astimezone(local_tz)
+            program_name = f"program_{local_now.strftime('%Y%m%d_%H%M%S')}"
             
             # Check if program exists by name (should be unique due to timestamp)
             existing_program = self.sqlite_conn.execute("""
@@ -659,6 +672,10 @@ class LiveWorker:
             self.total_rejects_count = 0
             self.total_rejects_weight = 0.0
             print(f"   🔄 Reset reject counters for new program")
+            
+            # Reset gate dwell time tracking for new program
+            self.last_batch_time = {}
+            print(f"   🔄 Reset gate dwell time tracking for new program")
             
             print(f"   ✅ Applied program {program_id} with {len(gate_assignments)} gate assignments")
             
@@ -1271,17 +1288,85 @@ class LiveWorker:
         self.accumulate_for_minute(piece, None)
         self.pieces_processed += 1
     
+    def update_gate_dwell_accumulator(self, gate: int, dwell_time_sec: float):
+        """Update Welford accumulator for gate dwell statistics"""
+        try:
+            # Fetch current accumulator state
+            row = self.sqlite_conn.execute("""
+                SELECT sample_count, mean_sec, m2_sec, min_sec, max_sec
+                FROM gate_dwell_accumulators 
+                WHERE program_id = ? AND gate_number = ?
+            """, (self.program_id, gate)).fetchone()
+            
+            if row:
+                n, mean, m2, min_sec, max_sec = row
+                n = int(n)
+                mean = float(mean)
+                m2 = float(m2)
+            else:
+                n, mean, m2, min_sec, max_sec = 0, 0.0, 0.0, None, None
+            
+            # Welford's online algorithm
+            n += 1
+            delta = dwell_time_sec - mean
+            mean += delta / n
+            delta2 = dwell_time_sec - mean
+            m2 += delta * delta2
+            
+            min_sec = dwell_time_sec if min_sec is None else min(min_sec, dwell_time_sec)
+            max_sec = dwell_time_sec if max_sec is None else max(max_sec, dwell_time_sec)
+            
+            # Update accumulator
+            self.sqlite_conn.execute("""
+                INSERT INTO gate_dwell_accumulators 
+                (program_id, gate_number, sample_count, mean_sec, m2_sec, min_sec, max_sec, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(program_id, gate_number) DO UPDATE SET
+                    sample_count = excluded.sample_count,
+                    mean_sec = excluded.mean_sec,
+                    m2_sec = excluded.m2_sec,
+                    min_sec = excluded.min_sec,
+                    max_sec = excluded.max_sec,
+                    updated_at = CURRENT_TIMESTAMP
+            """, (self.program_id, gate, n, mean, m2, min_sec, max_sec))
+        except Exception as e:
+            print(f"   ⚠️  Error updating gate dwell accumulator: {e}")
+    
     def process_completed_batch(self, batch: Dict):
         """Process a completed batch from backend for M3/M4 calculations"""
         try:
             # Parse timestamp
             batch_time = datetime.fromisoformat(batch['completed_at'].replace('Z', '+00:00'))
             minute_bucket = batch_time.replace(second=0, microsecond=0)
+            gate = batch['gate']
+            
+            # Track gate dwell time
+            if gate != 0:  # Don't track reject gate
+                if gate in self.last_batch_time:
+                    # Calculate dwell time (time since last batch on this gate)
+                    dwell_time_sec = (batch_time - self.last_batch_time[gate]).total_seconds()
+                    
+                    # Write to database
+                    try:
+                        self.sqlite_conn.execute("""
+                            INSERT INTO gate_dwell_times (program_id, gate_number, dwell_time_sec, batch_timestamp)
+                            VALUES (?, ?, ?, ?)
+                        """, (self.program_id, gate, dwell_time_sec, batch_time.isoformat()))
+                        
+                        # Also update accumulator for summary stats
+                        self.update_gate_dwell_accumulator(gate, dwell_time_sec)
+                        
+                        self.sqlite_conn.commit()
+                    except Exception as e:
+                        print(f"   ⚠️  Error writing gate dwell time: {e}")
+                
+                # Update last batch time for this gate
+                self.last_batch_time[gate] = batch_time
             
             # Create BatchEvent for M4 tracking
             batch_event = BatchEvent(
                 timestamp=batch_time,
-                gate=batch['gate'],
+                gate=gate,
                 weight_g=batch['weight_g'],
                 piece_count=batch['pieces']
             )

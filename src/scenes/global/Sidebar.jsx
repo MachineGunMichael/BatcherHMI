@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Sidebar as ProSidebar, Menu, MenuItem } from "react-pro-sidebar";
 import { Box, Typography, useTheme } from "@mui/material";
-import { Link } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 import { tokens } from "../../theme";
 import SettingsIcon from "@mui/icons-material/TuneOutlined";
 import SimulationIcon from '@mui/icons-material/ShapeLineOutlined';
@@ -34,9 +34,18 @@ const Sidebar = () => {
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [selected, setSelected] = useState("Dashboard");
   const { currentRole } = useAppContext();
+  const location = useLocation();
 
   // Get routes available for current role
   const availableRoutes = getRoutesForRole(currentRole);
+
+  // Sync selected state with current route on mount and route change
+  useEffect(() => {
+    const currentRoute = availableRoutes.find(route => route.path === location.pathname);
+    if (currentRoute) {
+      setSelected(currentRoute.name);
+    }
+  }, [location.pathname, availableRoutes]);
 
   // Map route icons to MUI icons
   const getIcon = (iconName) => {
@@ -47,10 +56,8 @@ const Sidebar = () => {
         return <StatsIcon />;
       case 'planAssist':
         return <PlanAssistIcon />;
-      case 'settings':
+      case 'setup':
         return <SettingsIcon />;
-      case 'simulation':
-        return <SimulationIcon />;
       default:
         return <HomeOutlinedIcon />;
     }
