@@ -18,6 +18,7 @@ const assignmentsRoutes = require('./routes/assignments');
 const historyRoutes = require('./routes/history');
 const importRoutes = require('./routes/import');
 const configRoutes = require('./routes/config');
+const machineRoutes = require('./routes/machine');
 
 const outbox = require('./workers/outboxDispatcher');
 
@@ -52,6 +53,7 @@ app.use('/api/assignments', assignmentsRoutes); // M5 moved from InfluxDB to SQL
 app.use('/api/history', historyRoutes);
 app.use('/api/import', importRoutes); // One-time data imports
 app.use('/api/config', configRoutes); // Runtime configuration
+app.use('/api/machine', machineRoutes); // Machine control and state management
 
 // (optional) keep your earlier debug TS endpoints for convenience:
 app.get('/api/ts/health', async (_req, res) => {
@@ -88,9 +90,42 @@ app.get('/api/ts/query', verifyToken, async (req, res) => {
   }
 });
 
+// ---------- startup initialization ----------
+const gates = require('./state/gates');
+const machineState = require('./services/machineState');
+
+// Reset all gates and machine state on server startup
+// This ensures a clean slate when the server restarts
+function initializeOnStartup() {
+  try {
+    // Reset all gate states to 0
+    gates.resetAll();
+    console.log('🔄 Reset all gates to 0 on startup');
+    
+    // Reset machine state to idle (clears active recipes)
+    machineState.reset();
+    console.log('🔄 Reset machine state to idle on startup');
+  } catch (e) {
+    console.error('⚠️  Failed to initialize on startup:', e);
+  }
+}
+
+// ---------- memory monitoring ----------
+// Only log warnings when memory gets high (passive monitoring)
+setInterval(() => {
+  const heapMB = process.memoryUsage().heapUsed / 1024 / 1024;
+  if (heapMB > 1500) {
+    console.warn(`⚠️  Memory: ${heapMB.toFixed(0)} MB heap used`);
+  }
+}, 60 * 1000); // Check every minute
+
 // ---------- start server ----------
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT} (SQLite + InfluxDB3)`);
+  
+  // Initialize clean state on startup
+  initializeOnStartup();
+  
   if (outbox && typeof outbox.start === 'function') {
     outbox.start();     // begin polling outbox & broadcasting
   }

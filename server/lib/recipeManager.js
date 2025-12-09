@@ -14,12 +14,68 @@ class RecipeManager {
 
   /**
    * Load all recipes from SQLite
+   * Uses database columns as the source of truth, with name parsing as fallback
    */
   loadRecipes() {
-    const rows = db.prepare(`SELECT id, name FROM recipes`).all();
+    const rows = db.prepare(`
+      SELECT id, name, 
+             piece_min_weight_g, piece_max_weight_g,
+             batch_min_weight_g, batch_max_weight_g,
+             min_pieces_per_batch, max_pieces_per_batch
+      FROM recipes
+    `).all();
     
     for (const row of rows) {
-      const spec = this.parseRecipeName(row.id, row.name);
+      // Try to parse from name first (for backwards compatibility)
+      let spec = this.parseRecipeName(row.id, row.name);
+      
+      // Use database columns as source of truth (override parsed values)
+      if (spec) {
+        // Override with actual database values if they exist
+        spec.pieceMin = row.piece_min_weight_g ?? spec.pieceMin;
+        spec.pieceMax = row.piece_max_weight_g ?? spec.pieceMax;
+        spec.batchMin = row.batch_min_weight_g ?? spec.batchMin;
+        spec.batchMax = row.batch_max_weight_g ?? spec.batchMax;
+        
+        // Determine count type and value from database
+        if (row.min_pieces_per_batch && row.max_pieces_per_batch && 
+            row.min_pieces_per_batch === row.max_pieces_per_batch) {
+          spec.countType = 'exact';
+          spec.countVal = row.min_pieces_per_batch;
+        } else if (row.min_pieces_per_batch) {
+          spec.countType = 'min';
+          spec.countVal = row.min_pieces_per_batch;
+        } else if (row.max_pieces_per_batch) {
+          spec.countType = 'max';
+          spec.countVal = row.max_pieces_per_batch;
+        }
+      } else {
+        // Fallback: create spec entirely from database columns
+        spec = {
+          id: row.id,
+          name: row.name,
+          pieceMin: row.piece_min_weight_g || 0,
+          pieceMax: row.piece_max_weight_g || 0,
+          batchMin: row.batch_min_weight_g || 0,
+          batchMax: row.batch_max_weight_g || 0,
+          countType: null,
+          countVal: null,
+        };
+        
+        // Determine count type from database
+        if (row.min_pieces_per_batch && row.max_pieces_per_batch && 
+            row.min_pieces_per_batch === row.max_pieces_per_batch) {
+          spec.countType = 'exact';
+          spec.countVal = row.min_pieces_per_batch;
+        } else if (row.min_pieces_per_batch) {
+          spec.countType = 'min';
+          spec.countVal = row.min_pieces_per_batch;
+        } else if (row.max_pieces_per_batch) {
+          spec.countType = 'max';
+          spec.countVal = row.max_pieces_per_batch;
+        }
+      }
+      
       if (spec) {
         this.recipes.set(row.id, spec);
       }
@@ -58,35 +114,105 @@ class RecipeManager {
   }
 
   /**
-   * Load current gate assignments from SQLite
+   * Load current gate assignments from machine state (NEW - machine state integration)
    */
   loadGateAssignments() {
-    const rows = db.prepare(`
-      SELECT rca.gate_number, rca.recipe_id
-      FROM run_config_assignments rca
-      WHERE rca.config_id = (
-        SELECT active_config_id 
-        FROM settings_history 
-        WHERE active_config_id IS NOT NULL 
-        ORDER BY changed_at DESC 
-        LIMIT 1
-      )
-    `).all();
+    // Get active recipes from machine state
+    const machineStateRow = db.prepare(`
+      SELECT active_recipes 
+      FROM machine_state 
+      WHERE id = 1
+    `).get();
     
     this.gateAssignments.clear();
     
-    if (rows.length === 0) {
-      console.log('⏳ No gate assignments loaded yet. Waiting for Python worker...');
+    if (!machineStateRow || !machineStateRow.active_recipes) {
+      console.log('⏳ No active recipes in machine state yet');
       return;
     }
     
-    for (const row of rows) {
-      this.gateAssignments.set(row.gate_number, row.recipe_id);
-      const recipe = this.recipes.get(row.recipe_id);
-      console.log(`   Gate ${row.gate_number} → ${recipe ? recipe.name : row.recipe_id}`);
+    try {
+      const activeRecipes = JSON.parse(machineStateRow.active_recipes);
+      
+      if (!Array.isArray(activeRecipes) || activeRecipes.length === 0) {
+        console.log('⏳ No active recipes configured');
+        return;
+      }
+      
+      // Convert active recipes to gate assignments
+      for (const recipe of activeRecipes) {
+        const recipeName = recipe.recipeName;
+        const gates = recipe.gates || [];
+        const params = recipe.params || {};
+        
+        // Find recipe ID by name
+        let recipeRow = db.prepare(`SELECT id FROM recipes WHERE name = ?`).get(recipeName);
+        
+        if (!recipeRow) {
+          // Auto-create recipe (fallback if /api/machine/recipes wasn't called)
+          console.warn(`⚠️  Recipe not found in database: ${recipeName}, auto-creating...`);
+          
+          try {
+            // Handle count type properly: exact means both min and max are the same
+            let minPieces = null;
+            let maxPieces = null;
+            if (params.countType === 'min') {
+              minPieces = params.countValue;
+            } else if (params.countType === 'max') {
+              maxPieces = params.countValue;
+            } else if (params.countType === 'exact') {
+              minPieces = params.countValue;
+              maxPieces = params.countValue;
+            }
+            
+            db.prepare(`
+              INSERT INTO recipes (
+                name, 
+                piece_min_weight_g, 
+                piece_max_weight_g, 
+                batch_min_weight_g, 
+                batch_max_weight_g, 
+                min_pieces_per_batch, 
+                max_pieces_per_batch
+              ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            `).run(
+              recipeName,
+              params.pieceMinWeight || 0,
+              params.pieceMaxWeight || 0,
+              params.batchMinWeight || null,
+              params.batchMaxWeight || null,
+              minPieces,
+              maxPieces
+            );
+            
+            // Fetch the newly created recipe
+            recipeRow = db.prepare(`SELECT id FROM recipes WHERE name = ?`).get(recipeName);
+            console.log(`   ✅ Auto-created recipe: ${recipeName} (ID: ${recipeRow.id})`);
+          } catch (e) {
+            console.error(`   ❌ Failed to auto-create recipe ${recipeName}:`, e);
+            continue;
+          }
+        }
+        
+        if (!recipeRow) {
+          console.error(`   ❌ Could not get recipe ID for ${recipeName}`);
+          continue;
+        }
+        
+        const recipeId = recipeRow.id;
+        
+        // Assign this recipe to all its gates
+        for (const gate of gates) {
+          this.gateAssignments.set(gate, recipeId);
+          const recipeSpec = this.recipes.get(recipeId);
+          console.log(`   Gate ${gate} → ${recipeSpec ? recipeSpec.name : recipeName}`);
+        }
+      }
+      
+      console.log(`🔧 Loaded assignments for ${this.gateAssignments.size} gates`);
+    } catch (e) {
+      console.error('❌ Failed to parse active recipes from machine state:', e);
     }
-    
-    console.log(`🔧 Loaded assignments for ${this.gateAssignments.size} gates`);
   }
 
   /**
@@ -178,6 +304,8 @@ class RecipeManager {
    * Reload recipes and assignments (call when program changes)
    */
   reload() {
+    console.log('[RecipeManager] Reloading recipes and gate assignments...');
+    
     // Store old assignments before reloading
     const oldAssignments = new Map(this.gateAssignments);
     
@@ -224,6 +352,16 @@ bus.on('program:changed', () => {
     recipeManager.reload();
   } catch (e) {
     console.error('❌ Failed to reload assignments on program change:', e);
+  }
+});
+
+// Auto-reload assignments when machine state changes (NEW - machine state integration)
+bus.on('machine:state-changed', (state) => {
+  console.log(`📢 Machine state changed to: ${state.state}, ${state.activeRecipes?.length || 0} active recipes, reloading assignments...`);
+  try {
+    recipeManager.reload();  // Use reload() instead of just loadGateAssignments() to reset gates
+  } catch (e) {
+    console.error('❌ Failed to reload assignments on machine state change:', e);
   }
 });
 

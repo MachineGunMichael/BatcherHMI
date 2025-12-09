@@ -460,6 +460,28 @@ function seedDefaultProgramIfEmpty() {
   console.log('⏩ Skipping recipe/program seed. Python worker will load them.');
 }
 
+/* -------------- machine state schema -------------- */
+function createMachineStateSchema() {
+  run(`
+    -- Machine state table (singleton)
+    CREATE TABLE IF NOT EXISTS machine_state (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      state TEXT NOT NULL DEFAULT 'idle' CHECK (state IN ('idle', 'running', 'paused', 'transitioning')),
+      current_program_id INTEGER,
+      active_recipes TEXT, -- JSON array of recipe objects
+      program_start_recipes TEXT, -- JSON snapshot for comparison
+      last_updated TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (current_program_id) REFERENCES programs(id) ON DELETE SET NULL
+    );
+    
+    -- Ensure singleton row exists
+    INSERT OR IGNORE INTO machine_state (id, state, active_recipes, program_start_recipes)
+    VALUES (1, 'idle', '[]', '[]');
+  `);
+  
+  console.log('✅ Machine state schema created.');
+}
+
 /* ---------------------- main ---------------------- */
 function main() {
   createBaseSchema();
@@ -467,6 +489,7 @@ function main() {
   createActiveConfigSchema();
   seedInitialActiveConfigIfMissing();
   createStatisticsSchema();
+  createMachineStateSchema();
   seedDefaultProgramIfEmpty();
   console.log('✅ SQLite setup complete.');
 }

@@ -313,6 +313,20 @@ router.get('/programs/:id/gate-dwell', verifyToken, (req, res) => {
       });
     }
     
+    // Get actual batch counts per gate from batch_completions
+    const batchCounts = db.prepare(`
+      SELECT gate, COUNT(*) as batch_count
+      FROM batch_completions
+      WHERE program_id = ? AND gate != 0
+      GROUP BY gate
+    `).all(programId);
+    
+    // Create batch count map
+    const gateBatchCount = {};
+    batchCounts.forEach(row => {
+      gateBatchCount[row.gate] = row.batch_count;
+    });
+    
     // Get all dwell times for this program
     const dwellTimes = db.prepare(`
       SELECT 
@@ -326,13 +340,27 @@ router.get('/programs/:id/gate-dwell', verifyToken, (req, res) => {
     
     // Group by gate and add recipe information
     const dwellByGate = {};
+    
+    // First, initialize all gates that have batches (even if no dwell times)
+    Object.keys(gateBatchCount).forEach(gate => {
+      const gateNum = parseInt(gate);
+      dwellByGate[gateNum] = {
+        gate: gateNum,
+        recipe_name: gateToRecipe[gateNum] || 'Unknown',
+        dwell_times: [],
+        batch_count: gateBatchCount[gateNum] || 0
+      };
+    });
+    
+    // Then add dwell times
     dwellTimes.forEach(row => {
       const gate = row.gate_number;
       if (!dwellByGate[gate]) {
         dwellByGate[gate] = {
           gate: gate,
           recipe_name: gateToRecipe[gate] || 'Unknown',
-          dwell_times: []
+          dwell_times: [],
+          batch_count: gateBatchCount[gate] || 0
         };
       }
       dwellByGate[gate].dwell_times.push(row.dwell_time_sec);
@@ -370,6 +398,16 @@ router.get('/programs/:id/history', verifyToken, async (req, res) => {
     `).all(programId);
     
     console.log(`[History] Found ${kpiData.length} per-minute records for program ${programId}`);
+    
+    // Debug: Log first few rows to see actual values
+    if (kpiData.length > 0) {
+      console.log(`[History] Sample data:`, kpiData.slice(0, 3).map(r => ({
+        recipe: r.recipe_name,
+        batches: r.batches_min,
+        pieces: r.pieces_processed,
+        weight: r.weight_processed_g
+      })));
+    }
     
     // Transform SQLite data to match the format expected by frontend
     // Group by recipe and convert timestamps to milliseconds
@@ -451,99 +489,115 @@ router.get('/programs/:id/pieces', verifyToken, async (req, res) => {
     
     const iterator = await influx.query(query);
     
-    // Convert result to JavaScript array
-    const allPieces = [];
+    // MEMORY OPTIMIZATION: Stream process data in a single pass
+    // Instead of loading all pieces into an array, we:
+    // 1. First pass: find min/max times and count pieces
+    // 2. Second pass: accumulate into pre-allocated buckets
+    
+    const TREND_BUCKETS = 100;
+    let pieceCount = 0;
+    let minTime = Infinity;
+    let maxTime = -Infinity;
+    
+    // Pre-allocate bucket accumulators (minimal memory)
+    const buckets = new Array(TREND_BUCKETS);
+    for (let i = 0; i < TREND_BUCKETS; i++) {
+      buckets[i] = { count: 0, sum: 0, min: Infinity, max: -Infinity };
+    }
+    
+    // Single pass: stream directly into buckets
+    // We need to buffer pieces temporarily to get time range first
+    const pieceBuffer = [];
+    const MAX_BUFFER_SIZE = 5000; // Process in chunks to limit memory
+    
     for await (const row of iterator) {
-      if (row.gate && row.gate !== 0) { // Exclude rejects (gate 0)
-        allPieces.push({
-          t: new Date(row.time).getTime(),
-          w: Number(row.weight_g),
-          g: Number(row.gate)
-        });
+      if (row.gate && row.gate !== 0) {
+        const t = new Date(row.time).getTime();
+        const w = Number(row.weight_g);
+        
+        pieceBuffer.push({ t, w });
+        pieceCount++;
+        
+        if (t < minTime) minTime = t;
+        if (t > maxTime) maxTime = t;
+        
+        // Process buffer when it gets large
+        if (pieceBuffer.length >= MAX_BUFFER_SIZE && minTime !== Infinity && maxTime !== -Infinity) {
+          const timeRange = maxTime - minTime || 1;
+          const bucketSize = timeRange / TREND_BUCKETS;
+          
+          for (const p of pieceBuffer) {
+            const bucketIdx = Math.min(
+              Math.floor((p.t - minTime) / bucketSize),
+              TREND_BUCKETS - 1
+            );
+            const bucket = buckets[bucketIdx];
+            bucket.count++;
+            bucket.sum += p.w;
+            if (p.w < bucket.min) bucket.min = p.w;
+            if (p.w > bucket.max) bucket.max = p.w;
+          }
+          pieceBuffer.length = 0; // Clear buffer
+        }
       }
     }
     
-    console.log(`[Pieces] Found ${allPieces.length} pieces for program ${programId}`);
+    console.log(`[Pieces] Found ${pieceCount} pieces for program ${programId}`);
     
-    // Calculate trend line and scatter points showing min/mean/max per time bucket
-    const TREND_BUCKETS = 100;  // Number of time buckets for both trend and scatter
-    
-    if (allPieces.length === 0) {
+    if (pieceCount === 0 || minTime === Infinity) {
       return res.json({ scatterPoints: [], trendLine: [] });
     }
     
-    // Sort by time
-    allPieces.sort((a, b) => a.t - b.t);
-    
-    const minTime = allPieces[0].t;
-    const maxTime = allPieces[allPieces.length - 1].t;
-    const timeRange = maxTime - minTime;
+    // Process remaining pieces in buffer
+    const timeRange = maxTime - minTime || 1;
     const bucketSize = timeRange / TREND_BUCKETS;
     
-    // Calculate both trend line and scatter points (min/mean/max per bucket)
+    for (const p of pieceBuffer) {
+      const bucketIdx = Math.min(
+        Math.floor((p.t - minTime) / bucketSize),
+        TREND_BUCKETS - 1
+      );
+      const bucket = buckets[bucketIdx];
+      bucket.count++;
+      bucket.sum += p.w;
+      if (p.w < bucket.min) bucket.min = p.w;
+      if (p.w > bucket.max) bucket.max = p.w;
+    }
+    pieceBuffer.length = 0; // Clear buffer
+    
+    // Build final results from bucket statistics
     const trendLine = [];
     const scatterPoints = [];
     
     for (let i = 0; i < TREND_BUCKETS; i++) {
-      const bucketStart = minTime + (i * bucketSize);
-      const bucketEnd = bucketStart + bucketSize;
-      
-      // Get all pieces in this time bucket
-      const bucketPieces = allPieces.filter(p => p.t >= bucketStart && p.t < bucketEnd);
-      
-      if (bucketPieces.length > 0) {
-        const avgTime = (bucketStart + bucketEnd) / 2;
-        
-        // Calculate statistics
-        const weights = bucketPieces.map(p => p.w);
-        const minWeight = Math.min(...weights);
-        const maxWeight = Math.max(...weights);
-        const avgWeight = weights.reduce((sum, w) => sum + w, 0) / weights.length;
+      const bucket = buckets[i];
+      if (bucket.count > 0) {
+        const avgTime = minTime + (i + 0.5) * bucketSize;
+        const avgWeight = bucket.sum / bucket.count;
         
         // Add trend line point (mean)
-        trendLine.push({
-          t: avgTime,
-          w: avgWeight
-        });
+        trendLine.push({ t: avgTime, w: avgWeight });
         
-        // Add scatter points: always add min and max, add mean only if it's distinct
-        scatterPoints.push({
-          t: avgTime,
-          w: minWeight,
-          g: 0
-        });
+        // Add scatter points: min
+        scatterPoints.push({ t: avgTime, w: bucket.min, g: 0 });
         
-        // Add mean point only if it's visibly different from min and max (more than 5g difference)
-        if (Math.abs(avgWeight - minWeight) > 5 && Math.abs(avgWeight - maxWeight) > 5) {
-          scatterPoints.push({
-            t: avgTime,
-            w: avgWeight,
-            g: 0
-          });
+        // Add mean only if visibly different from min and max (> 5g)
+        if (Math.abs(avgWeight - bucket.min) > 5 && Math.abs(avgWeight - bucket.max) > 5) {
+          scatterPoints.push({ t: avgTime, w: avgWeight, g: 0 });
         }
         
-        if (Math.abs(maxWeight - minWeight) > 5) {
-          scatterPoints.push({
-            t: avgTime,
-            w: maxWeight,
-            g: 0
-          });
+        // Add max only if different from min
+        if (Math.abs(bucket.max - bucket.min) > 5) {
+          scatterPoints.push({ t: avgTime, w: bucket.max, g: 0 });
         }
       }
-    }
-    
-    console.log(`[Pieces] Debug first few buckets:`);
-    for (let i = 0; i < Math.min(3, trendLine.length); i++) {
-      console.log(`  Bucket ${i}: trend=${trendLine[i].w.toFixed(1)}g at ${new Date(trendLine[i].t).toLocaleTimeString()}`);
-      const bucketScatter = scatterPoints.filter(p => Math.abs(p.t - trendLine[i].t) < 1);
-      console.log(`    Scatter points: ${bucketScatter.map(p => p.w.toFixed(1)).join(', ')}g`);
     }
     
     console.log(`[Pieces] Calculated trend line with ${trendLine.length} points`);
     console.log(`[Pieces] Scatter points: ${scatterPoints.length} points (min/mean/max per time bucket)`);
     
     res.json({ 
-      scatterPoints: scatterPoints.sort((a, b) => a.t - b.t),
+      scatterPoints: scatterPoints,
       trendLine: trendLine
     });
     

@@ -6,6 +6,7 @@ const { broadcast } = require("../lib/eventBus");
 const influx = require("../services/influx");
 const gates = require("../state/gates");
 const recipeManager = require("../lib/recipeManager");
+const machineState = require("../services/machineState");
 const db = require("../db/sqlite");
 
 // Simple shared-secret for PLCs (machines don't send JWTs)
@@ -22,18 +23,11 @@ function verifyPlcSecret(req, res, next) {
   next();
 }
 
-// Get current program ID from settings_history
+// Get current program ID from machine state
 function getCurrentProgramId() {
   try {
-    const row = db.prepare(`
-      SELECT rc.program_id
-      FROM settings_history sh
-      JOIN run_configs rc ON rc.id = sh.active_config_id
-      WHERE sh.active_config_id IS NOT NULL
-      ORDER BY sh.changed_at DESC
-      LIMIT 1
-    `).get();
-    return row?.program_id || null;
+    const state = machineState.getState();
+    return state.currentProgramId || null;
   } catch (err) {
     console.error('Failed to get current program ID:', err);
     return null;
@@ -122,17 +116,41 @@ let nextPieceId = 1;
  * For simulator/C# algorithm - receives pieces with gate assignment from simulator
  * Headers: x-plc-secret: <secret>
  * Body: { timestamp?: ISO/string/number, weight_g: number, gate: number (0-8) }
+ * 
+ * ✨ IMPORTANT: The backend RE-ASSIGNS pieces based on active recipes in machine_state.
+ * This ensures pieces only go to gates with active recipes, regardless of what
+ * the simulator sends.
  */
 router.post("/piece", verifyPlcSecret, async (req, res) => {
   try {
-    const { weight_g, gate, timestamp } = req.body || {};
+    // ✨ CHECK MACHINE STATE - reject pieces if not running
+    const state = machineState.getState();
+    if (state.state !== 'running') {
+      // Silently drop pieces when machine is not running (don't spam logs)
+      return res.json({ ok: true, dropped: true, reason: `machine is ${state.state}` });
+    }
+    
+    const { weight_g, timestamp } = req.body || {};
     const w = Number(weight_g);
     if (!Number.isFinite(w)) return res.status(400).json({ message: "weight_g must be a number" });
-    const g = Number(gate);
-    if (!Number.isFinite(g) || g < 0 || g > 8) return res.status(400).json({ message: "gate must be 0-8" });
 
     const tsIso = normalizeTs(timestamp);
     const piece_id = String(nextPieceId++);
+
+    // ✨ RE-ASSIGN PIECE based on active recipes (ignore simulator's gate)
+    // Find all eligible gates where piece weight falls within recipe bounds
+    const eligibleGates = [];
+    for (let gate = gates.GATE_MIN; gate <= gates.GATE_MAX; gate++) {
+      const recipe = recipeManager.getRecipeForGate(gate);
+      if (recipe && w >= recipe.pieceMin && w <= recipe.pieceMax) {
+        eligibleGates.push(gate);
+      }
+    }
+    
+    // Assign to random eligible gate, or gate 0 (reject) if none
+    const g = eligibleGates.length > 0 
+      ? eligibleGates[Math.floor(Math.random() * eligibleGates.length)]
+      : 0;
 
     // Per-piece scatter update
     broadcast("piece", { piece_id, gate: g, weight_g: w, ts: tsIso });

@@ -8,7 +8,7 @@ try {
 } catch {}
 
 const { bus } = require("../lib/eventBus");
-const assignmentsRepo = require("../repositories/assignmentsRepo");
+const recipeManager = require("../lib/recipeManager");
 const gates = require("../state/gates");
 
 // --- SSE helpers ---
@@ -26,6 +26,24 @@ function send(res, event, payload) {
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
+/**
+ * Get active gate assignments from recipeManager (machine state)
+ * Returns [{ gate, recipe_name }] for Dashboard legend
+ */
+function getActiveLegend() {
+  const legend = [];
+  
+  // Get gate assignments from recipeManager (which reads from machine_state)
+  for (let gate = 1; gate <= 8; gate++) {
+    const recipe = recipeManager.getRecipeForGate(gate);
+    if (recipe) {
+      legend.push({ gate, recipe_name: recipe.name });
+    }
+  }
+  
+  return legend;
+}
+
 // GET /api/stream/dashboard?mode=live
 router.get("/dashboard", async (req, res) => {
   openSSE(res);
@@ -33,7 +51,7 @@ router.get("/dashboard", async (req, res) => {
   // Initial snapshot immediately (no 1s delay)
   try {
     const tsISO = new Date().toISOString();
-    const legend = assignmentsRepo.getAssignmentsSnapshotAt(tsISO);
+    const legend = getActiveLegend(); // from machine state (NEW)
     const overlay = gates.getSnapshot(); // authoritative in-memory
     send(res, "tick", { ts: tsISO, legend, overlay });
   } catch (e) {
@@ -55,7 +73,7 @@ router.get("/dashboard", async (req, res) => {
   const poll = setInterval(() => {
     try {
       const tsISO = new Date().toISOString();
-      const legend = assignmentsRepo.getAssignmentsSnapshotAt(tsISO);
+      const legend = getActiveLegend(); // from machine state (NEW)
       const overlay = gates.getSnapshot();
       send(res, "tick", { ts: tsISO, legend, overlay });
     } catch (e) {

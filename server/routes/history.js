@@ -46,10 +46,10 @@ router.get('/m3-all', async (req, res) => {
  */
 router.get('/throughput', async (req, res) => {
   try {
-    const { from, to, bucket = '60s' } = req.query;
-    const perRecipe = await influx.queryM3ThroughputPerRecipe({ from, to, bucket });
-    const total = await influx.queryM3CombinedTotal({ from, to, bucket, field: 'batches_min' });
-    res.json({ perRecipe, total });
+    const { from, to } = req.query;
+    // NOW USES SQLITE instead of InfluxDB
+    const result = kpiRepo.getM3ThroughputPerRecipe({ from, to });
+    res.json(result);
   } catch (e) {
     console.error('throughput history error', e);
     res.status(500).json({ error: 'Failed to fetch throughput history' });
@@ -66,10 +66,10 @@ router.get('/throughput', async (req, res) => {
  */
 router.get('/giveaway', async (req, res) => {
   try {
-    const { from, to, bucket = '60s' } = req.query;
-    const perRecipe = await influx.queryM3GiveawayPerRecipe({ from, to, bucket });
-    const total = await influx.queryM3CombinedTotal({ from, to, bucket, field: 'giveaway_pct' });
-    res.json({ perRecipe, total });
+    const { from, to } = req.query;
+    // NOW USES SQLITE instead of InfluxDB
+    const result = kpiRepo.getM3GiveawayPerRecipe({ from, to });
+    res.json(result);
   } catch (e) {
     console.error('giveaway history error', e);
     res.status(500).json({ error: 'Failed to fetch giveaway history' });
@@ -86,10 +86,10 @@ router.get('/giveaway', async (req, res) => {
  */
 router.get('/pieces-processed', async (req, res) => {
   try {
-    const { from, to, bucket = '60s' } = req.query;
-    const perRecipe = await influx.queryM3PiecesProcessedPerRecipe({ from, to, bucket });
-    const total = await influx.queryM3CombinedTotal({ from, to, bucket, field: 'pieces_processed' });
-    res.json({ perRecipe, total });
+    const { from, to } = req.query;
+    // NOW USES SQLITE instead of InfluxDB
+    const result = kpiRepo.getM3PiecesProcessedPerRecipe({ from, to });
+    res.json(result);
   } catch (e) {
     console.error('pieces-processed history error', e);
     res.status(500).json({ error: 'Failed to fetch pieces-processed history' });
@@ -106,10 +106,10 @@ router.get('/pieces-processed', async (req, res) => {
  */
 router.get('/weight-processed', async (req, res) => {
   try {
-    const { from, to, bucket = '60s' } = req.query;
-    const perRecipe = await influx.queryM3WeightProcessedPerRecipe({ from, to, bucket });
-    const total = await influx.queryM3CombinedTotal({ from, to, bucket, field: 'weight_processed_g' });
-    res.json({ perRecipe, total });
+    const { from, to } = req.query;
+    // NOW USES SQLITE instead of InfluxDB
+    const result = kpiRepo.getM3WeightProcessedPerRecipe({ from, to });
+    res.json(result);
   } catch (e) {
     console.error('weight-processed history error', e);
     res.status(500).json({ error: 'Failed to fetch weight-processed history' });

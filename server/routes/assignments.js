@@ -54,9 +54,17 @@ router.get('/at-time', verifyToken, (req, res) => {
       return res.status(400).json({ message: 'timestamp query parameter is required' });
     }
     
-    // Use snapshot function which reads from assignment_history_view
-    // This view should contain the per-gate snapshots over time
-    const assignments = assignmentsRepo.getAssignmentsSnapshotAt(timestamp);
+    // ✨ NEW: Read from machine_state.active_recipes instead of legacy tables
+    const recipeManager = require('../lib/recipeManager');
+    const assignments = [];
+    
+    for (let gate = 1; gate <= 8; gate++) {
+      const recipe = recipeManager.getRecipeForGate(gate);
+      if (recipe) {
+        assignments.push({ gate, recipe_name: recipe.name });
+      }
+    }
+    
     return res.json({ ok: true, timestamp, assignments });
   } catch (e) {
     console.error('Get assignments at time error:', e);

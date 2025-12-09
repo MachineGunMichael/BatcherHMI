@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dotenv import load_dotenv
 import requests
+from machine_client import MachineStateClient
 
 # Load environment
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -189,6 +190,31 @@ class RecipeSpec:
             bc_val=bc_val
         )
 
+def generate_recipe_name(piece_min, piece_max, batch_min, batch_max, bc_min, bc_max):
+    """
+    Generate recipe name in format: R_x_y_xx_yy_xxx_yyy
+    Matches frontend logic in setup/index.jsx
+    """
+    # Determine piece count type and value
+    if bc_min is None and bc_max is None:
+        bc_type = 'NA'
+        bc_val = 0
+    elif bc_min == bc_max:
+        bc_type = 'exact'
+        bc_val = bc_min
+    elif bc_max is None or bc_max == 0:
+        bc_type = 'min'
+        bc_val = bc_min or 0
+    elif bc_min is None or bc_min == 0:
+        bc_type = 'max'
+        bc_val = bc_max or 0
+    else:
+        # Both exist but different - shouldn't happen, default to min
+        bc_type = 'min'
+        bc_val = bc_min or 0
+    
+    return f"R_{piece_min}_{piece_max}_{batch_min or 0}_{batch_max or 0}_{bc_type}_{bc_val}"
+
 @dataclass
 class PieceData:
     """Single piece"""
@@ -230,6 +256,10 @@ class MinuteAccumulator:
     
     def add_batch(self, batch: BatchEvent):
         self.batches_by_gate[batch.gate].append(batch)
+    
+    def has_data(self) -> bool:
+        """Check if accumulator has any pieces or batches"""
+        return bool(self.pieces_by_gate) or bool(self.batches_by_gate)
 
 # ========== SQLite Helper Functions for M3/M4 ==========
 
@@ -286,6 +316,14 @@ class LiveWorker:
         self.influx_client = None
         self.sqlite_conn = None
         self.running = False
+        
+        # Machine state client
+        self.machine_client = MachineStateClient(BACKEND_URL)
+        self.machine_state = "idle"  # idle, running, paused, transitioning
+        self.paused = False
+        self.transitioning = False
+        self.was_paused_before_transition = False  # Track if transition started from paused state
+        self.gates_to_finish = set()  # Gates that need to finish current batch during transition
         
         # HTTP headers for backend API calls
         self.headers = {
@@ -454,9 +492,231 @@ class LiveWorker:
         if self.sqlite_conn:
             self.sqlite_conn.close()
     
+    # =====================================================================
+    # MACHINE STATE MANAGEMENT
+    # =====================================================================
+    
+    def poll_machine_state(self):
+        """Poll backend for machine state changes"""
+        state = self.machine_client.get_state()
+        if not state:
+            return
+        
+        new_state = state['state']
+        
+        # Detect state changes
+        if new_state != self.machine_state:
+            print(f"\n🔄 [MachineState] {self.machine_state} → {new_state}")
+            self.handle_state_change(self.machine_state, new_state, state)
+            self.machine_state = new_state
+    
+    def handle_state_change(self, old_state, new_state, state_data):
+        """Handle machine state transitions"""
+        if new_state == 'running':
+            if old_state == 'idle':
+                # Starting new program
+                program_id = state_data.get('currentProgramId')
+                active_recipes = state_data.get('activeRecipes', [])
+                print(f"   ▶️  Starting new program {program_id} with {len(active_recipes)} recipes")
+                self.start_program(program_id, active_recipes)
+                self.paused = False
+                
+            elif old_state == 'paused':
+                # Resuming from pause
+                print(f"   ▶️  Resuming program {self.program_id}")
+                self.paused = False
+        
+        elif new_state == 'paused':
+            # Pausing simulation
+            print(f"   ⏸️  Pausing program {self.program_id}")
+            self.paused = True
+        
+        elif new_state == 'transitioning':
+            # Transition to stop or recipe change
+            print(f"   🔄 Transitioning program {self.program_id}")
+            self.was_paused_before_transition = self.paused  # Track if we were paused
+            self.transitioning = True
+            self.paused = False  # Clear paused flag so we can process transition
+            self.identify_gates_to_finish(state_data)
+        
+        elif new_state == 'idle':
+            # Stopped/reset - clear all gate assignments
+            print(f"   ⏹️  Machine stopped - clearing gate assignments")
+            self.gate_to_recipe.clear()
+            self.program_id = None
+            self.paused = False
+            self.transitioning = False
+            self.was_paused_before_transition = False
+    
+    def start_program(self, program_id, active_recipes):
+        """Start a new program with given recipes"""
+        self.program_id = program_id
+        
+        # Reload recipes from database to pick up any newly created ones
+        self.load_recipes()
+        
+        # Convert active_recipes to gate assignments
+        gate_map = self.machine_client.recipes_to_gate_map(active_recipes)
+        
+        # Update gate_to_recipe mapping
+        self.gate_to_recipe.clear()
+        for gate, recipe_data in gate_map.items():
+            recipe_name = recipe_data['recipeName']
+            # Find recipe_id from name
+            recipe_id = self.get_recipe_id_by_name(recipe_name)
+            if recipe_id:
+                self.gate_to_recipe[gate] = recipe_id
+            else:
+                print(f"   ⚠️  Recipe not found in database: {recipe_name}")
+        
+        print(f"   📋 Gate assignments: {self.gate_to_recipe}")
+        
+        # Reset gate states
+        for gate in self.gate_to_recipe.keys():
+            self.gate_states[gate] = GateState(gate, self.gate_to_recipe[gate])
+        
+        # Reset minute accumulator
+        self.current_minute = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        self.minute_accumulator = MinuteAccumulator(self.current_minute)
+        
+        # Reset M4 cumulative
+        self.m4_cumulative.clear()
+        
+        # Reset batch polling cursor for new program
+        self.last_batch_id_processed = 0
+        
+        # Reset gate dwell time tracking
+        self.last_batch_time = {}
+    
+    def identify_gates_to_finish(self, state_data):
+        """Identify which gates have in-progress batches during transition"""
+        # Compare current recipes with program start recipes
+        current_recipes = state_data.get('activeRecipes', [])
+        program_start_recipes = state_data.get('programStartRecipes', [])
+        
+        comparison = self.machine_client.compare_recipes(program_start_recipes, current_recipes)
+        
+        # Gates that changed or were removed need to finish their batches
+        self.gates_to_finish = set(comparison['gates_changed'] + comparison['gates_removed'])
+        
+        print(f"   🎯 Gates to finish batches: {self.gates_to_finish}")
+        print(f"   🆕 Gates to add: {comparison['gates_added']}")
+    
+    def check_transition_complete(self):
+        """Check if all gates have finished their batches during transition"""
+        if not self.transitioning:
+            return False
+        
+        # If we were previously paused, partial batches won't complete (no new pieces)
+        # In this case, we discard partial batches and proceed immediately
+        if self.was_paused_before_transition:
+            print(f"\n✅ [Transition] Transition from paused - discarding any partial batches")
+            # Clear partial batches from affected gates
+            for gate in self.gates_to_finish:
+                if gate in self.gate_states:
+                    self.gate_states[gate].pieces.clear()
+                    self.gate_states[gate].total_weight = 0
+            return True
+        
+        # Check if all gates_to_finish have no pending pieces
+        for gate in self.gates_to_finish:
+            if gate in self.gate_states:
+                gate_state = self.gate_states[gate]
+                if len(gate_state.pieces) > 0 or gate_state.total_weight > 0:
+                    # Still has pending batch
+                    return False
+        
+        # All gates finished - transition complete
+        print(f"\n✅ [Transition] All batches completed on gates {self.gates_to_finish}")
+        return True
+    
+    def finalize_transition(self):
+        """Finalize program and notify backend"""
+        import time as _time
+        transition_start = _time.time()
+        print(f"\n🏁 [Transition] Finalizing program {self.program_id}")
+        
+        # Write final KPIs
+        kpi_start = _time.time()
+        if self.minute_accumulator and self.minute_accumulator.has_data():
+            self.process_minute_kpis()
+        print(f"   ⏱️ KPI write took {(_time.time() - kpi_start) * 1000:.0f}ms")
+        
+        # Get backend state to determine action
+        state = self.machine_client.get_state()
+        current_recipes = state.get('activeRecipes', [])
+        program_start_recipes = state.get('programStartRecipes', [])
+        
+        # Determine if this is a stop or recipe change
+        recipes_changed = json.dumps(current_recipes) != json.dumps(program_start_recipes)
+        action = 'recipe_change' if recipes_changed else 'stop'
+        
+        # Notify backend (this is where stats calculation happens)
+        backend_start = _time.time()
+        result = self.machine_client.notify_transition_complete(self.program_id, action)
+        print(f"   ⏱️ Backend notify took {(_time.time() - backend_start) * 1000:.0f}ms")
+        
+        if result:
+            print(f"   ✅ Backend notified, action: {action}")
+            
+            if action == 'recipe_change':
+                # Backend created new program - get the new program ID and restart
+                new_program_id = result.get('programId')
+                if new_program_id:
+                    print(f"   🆕 Starting new program {new_program_id} with updated recipes")
+                    
+                    # Get current active recipes from backend state
+                    new_state = self.machine_client.get_state()
+                    new_recipes = new_state.get('activeRecipes', [])
+                    
+                    # Clear old state and start fresh
+                    self.gate_states.clear()
+                    self.gate_to_recipe.clear()
+                    self.last_batch_time.clear()
+                    self.m4_cumulative.clear()
+                    self.last_batch_id_processed = 0
+                    
+                    # Reset minute accumulator for new program
+                    self.current_minute = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+                    self.minute_accumulator = MinuteAccumulator(self.current_minute)
+                    
+                    # Start the new program
+                    self.start_program(new_program_id, new_recipes)
+                    self.machine_state = 'running'
+                    print(f"   ✅ New program {new_program_id} started successfully")
+                    print(f"   ⏱️ Total transition took {(_time.time() - transition_start) * 1000:.0f}ms")
+                else:
+                    print(f"   ⚠️ No new program ID in response")
+                    
+            elif action == 'stop':
+                # Reset to idle
+                self.machine_state = 'idle'
+                self.gate_to_recipe.clear()
+                self.gate_states.clear()
+                print(f"   ⏱️ Total stop transition took {(_time.time() - transition_start) * 1000:.0f}ms")
+        
+        # Reset transition state
+        self.transitioning = False
+        self.was_paused_before_transition = False
+        self.gates_to_finish.clear()
+    
+    def get_recipe_id_by_name(self, recipe_name):
+        """Find recipe_id from recipe name"""
+        for recipe_id, spec in self.recipes.items():
+            if spec.recipe_name == recipe_name:
+                return recipe_id
+        return None
+    
+    # =====================================================================
+    # END MACHINE STATE MANAGEMENT
+    # =====================================================================
+    
     def load_recipes(self):
-        """Load recipe specs from SQLite"""
+        """Load recipe specs from SQLite (clears and reloads all recipes)"""
         print("📋 Loading recipe specifications...")
+        
+        # Clear existing recipes to pick up newly created ones
+        self.recipes.clear()
         
         cur = self.sqlite_conn.execute("""
             SELECT id, name FROM recipes
@@ -675,6 +935,7 @@ class LiveWorker:
             
             # Reset gate dwell time tracking for new program
             self.last_batch_time = {}
+            self.last_batch_id_processed = 0  # Reset batch polling cursor
             print(f"   🔄 Reset gate dwell time tracking for new program")
             
             print(f"   ✅ Applied program {program_id} with {len(gate_assignments)} gate assignments")
@@ -1158,17 +1419,21 @@ class LiveWorker:
     
     
     def poll_completed_batches(self) -> List[Dict]:
-        """Poll SQLite for completed batches since last check"""
+        """Poll SQLite for completed batches since last check for CURRENT program only"""
         try:
             if not hasattr(self, 'last_batch_id_processed'):
                 self.last_batch_id_processed = 0
             
+            # Only process batches for the current program!
+            if not self.program_id:
+                return []
+            
             cur = self.sqlite_conn.execute("""
                 SELECT id, gate, completed_at, pieces, weight_g, recipe_id
                 FROM batch_completions
-                WHERE id > ?
+                WHERE id > ? AND program_id = ?
                 ORDER BY id ASC
-            """, (self.last_batch_id_processed,))
+            """, (self.last_batch_id_processed, self.program_id))
             
             batches = []
             for row in cur.fetchall():
@@ -1196,7 +1461,7 @@ class LiveWorker:
         """Poll InfluxDB for new pieces"""
         try:
             if self.last_processed_time is None:
-                from_time = datetime.now(timezone.utc) - timedelta(seconds=1)
+                from_time = datetime.now(timezone.utc) - timedelta(seconds=5)
             else:
                 from_time = self.last_processed_time
             
@@ -1391,8 +1656,16 @@ class LiveWorker:
         """Add to minute accumulator"""
         minute_bucket = piece.timestamp.replace(second=0, microsecond=0)
         
-        # Initialize new minute (or re-initialize if None after processing)
-        if self.minute_accumulator is None or minute_bucket > self.current_minute:
+        # Check if we need to roll over to a new minute
+        if self.minute_accumulator is None:
+            # First piece - initialize accumulator
+            self.current_minute = minute_bucket
+            self.minute_accumulator = MinuteAccumulator(minute_start=minute_bucket)
+        elif minute_bucket > self.current_minute:
+            # Minute rolled over - PROCESS the old accumulator BEFORE creating new one
+            # This prevents data loss when pieces arrive with timestamps in the next minute
+            if self.minute_accumulator.has_data():
+                self.process_minute_kpis()
             self.current_minute = minute_bucket
             self.minute_accumulator = MinuteAccumulator(minute_start=minute_bucket)
         
@@ -1789,35 +2062,75 @@ class LiveWorker:
     def run(self):
         """Main loop - polls for new pieces and processes KPIs every minute"""
         print("\n" + "=" * 70)
-        print("🚀 Live Mode Worker v3 (M3/M4 KPIs only)")
+        print("🚀 Live Mode Worker v4 (Machine State Integration)")
         print("=" * 70 + "\n")
         
         self.connect()
         self.load_recipes()
         
-        # ✨ NEW: Recover any incomplete programs from previous crashes
+        # ✨ Recover any incomplete programs from previous crashes
         self.recover_incomplete_programs()
         
-        # Load and apply program assignments
-        print("🔧 Loading program assignments...")
-        if self.load_program_assignments_from_json():
-            first_assignment = self.program_assignments[0]
-            print(f"   Applying initial program {first_assignment['program_id']}...")
-            self.apply_program_assignment(first_assignment)
+        # Poll initial machine state from backend
+        print("🔧 Polling machine state from backend...")
+        initial_state = self.machine_client.get_state()
+        if initial_state:
+            self.machine_state = initial_state['state']
+            print(f"   Initial state: {self.machine_state}")
+            
+            # If machine is already running, sync with it
+            if self.machine_state == 'running':
+                program_id = initial_state.get('currentProgramId')
+                active_recipes = initial_state.get('activeRecipes', [])
+                print(f"   Syncing with running program {program_id}")
+                self.start_program(program_id, active_recipes)
         else:
-            self.load_current_assignments()
+            print("   ⚠️  Could not connect to backend, using legacy mode")
+            # Fallback to legacy program loading
+            if self.load_program_assignments_from_json():
+                first_assignment = self.program_assignments[0]
+                print(f"   Applying initial program {first_assignment['program_id']}...")
+                self.apply_program_assignment(first_assignment)
+            else:
+                self.load_current_assignments()
         
         self.running = True
         self.start_time = time.time()
         last_stats = time.time()
         last_minute_check = None
+        last_state_poll = time.time()
         
-        print("\n⏳ Polling for M3/M4 KPI calculations every 60 seconds...")
+        print("\n⏳ Polling machine state and processing KPIs...")
         print("   (M1/M2 and batch detection handled by backend JavaScript)")
         print("=" * 70 + "\n")
         
         try:
             while self.running:
+                # ===== MACHINE STATE POLLING =====
+                # Poll machine state frequently (every 200ms) for responsive state changes
+                if time.time() - last_state_poll >= 0.2:
+                    self.poll_machine_state()
+                    last_state_poll = time.time()
+                
+                # Skip processing if paused (but still poll state above)
+                if self.paused:
+                    time.sleep(0.05)  # Short sleep, state polling happens above
+                    continue
+                
+                # Check if transition is complete
+                if self.transitioning:
+                    if self.check_transition_complete():
+                        self.finalize_transition()
+                    # Don't process new pieces during transition
+                    time.sleep(0.05)  # Short sleep, state polling happens above
+                    continue
+                
+                # ===== NORMAL PROCESSING (when running) =====
+                # Only process if machine is running
+                if self.machine_state != 'running':
+                    time.sleep(0.05)  # Short sleep, state polling happens above
+                    continue
+                
                 # Poll for new pieces for M3/M4 calculations only
                 # Batch detection now happens in real-time in the backend!
                 pieces = self.poll_new_pieces()
@@ -1833,6 +2146,9 @@ class LiveWorker:
                     self.process_completed_batch(batch)
                 
                 # Check if minute rolled over - process KPIs if so
+                # Note: accumulate_for_minute may also trigger KPI processing when piece timestamps
+                # cross minute boundaries. This check handles cases where no pieces arrive but
+                # time still passes.
                 now = datetime.now(timezone.utc)
                 current_minute_bucket = now.replace(second=0, microsecond=0)
                 
@@ -1840,31 +2156,34 @@ class LiveWorker:
                     last_minute_check = current_minute_bucket
                 elif current_minute_bucket > last_minute_check:
                     # Minute rolled over - process KPIs for completed minute
-                    if self.minute_accumulator:
-                        self.process_minute_kpis()
+                    # Only process if accumulator exists AND is for a previous minute
+                    # (accumulate_for_minute may have already processed and created new accumulator)
+                    if self.minute_accumulator and self.minute_accumulator.minute_start < current_minute_bucket:
+                        if self.minute_accumulator.has_data():
+                            print(f"   🔄 Minute rollover detected in main loop ({self.minute_accumulator.minute_start.strftime('%H:%M')} < {current_minute_bucket.strftime('%H:%M')})")
+                            self.process_minute_kpis()
                     last_minute_check = current_minute_bucket
                 
-                # Check if it's time to switch to next program
-                try:
-                    self.check_and_switch_program()
-                except Exception as e:
-                    print(f"\n{'='*70}")
-                    print(f"❌ ERROR in check_and_switch_program")
-                    print(f"   Error: {e}")
-                    print(f"{'='*70}")
-                    import traceback
-                    traceback.print_exc()
-                    print(f"{'='*70}\n")
-                    # Don't crash, just continue
+                # Legacy program switching disabled - now controlled by backend machine state
+                # try:
+                #     self.check_and_switch_program()
+                # except Exception as e:
+                #     print(f"\n{'='*70}")
+                #     print(f"❌ ERROR in check_and_switch_program")
+                #     print(f"   Error: {e}")
+                #     print(f"{'='*70}")
+                #     import traceback
+                #     traceback.print_exc()
+                #     print(f"{'='*70}\n")
                 
-                # Print stats every 2 seconds
-                if time.time() - last_stats > 2.0:
+                # Print stats every 60 seconds
+                if time.time() - last_stats > 60.0:
                     self.print_stats()
                     self.log_performance()
                     last_stats = time.time()
                 
-                # M3/M4 calculations happen per-minute, so 60-second polling is fine
-                time.sleep(60.0)  # Backend handles real-time batch detection now!
+                # Short sleep to allow frequent state polling (state check is at top of loop)
+                time.sleep(0.2)  # 200ms - allows state changes to be detected quickly
                 
         except KeyboardInterrupt:
             print("\n\n⚠️  Interrupted by user")

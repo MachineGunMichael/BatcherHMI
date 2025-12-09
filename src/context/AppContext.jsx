@@ -24,6 +24,9 @@ export function AppContextProvider({ children }) {
   const [settingsMode, setSettingsModeState] = useState("preset");
   const [assignedPrograms, setAssignedProgramsState] = useState([]);
   
+  // Assigned Recipes (shared between Setup and MachineControls)
+  const [assignedRecipes, setAssignedRecipesState] = useState([]);
+  
   // DEBUG - Log state changes
   useEffect(() => {
     console.log("Context state changed:", {
@@ -32,9 +35,10 @@ export function AppContextProvider({ children }) {
       selectedSimulation,
       sliderValue,
       settingsMode,
-      assignedPrograms
+      assignedPrograms,
+      assignedRecipes
     });
-  }, [currentRole, dashboardVisibleSeries, selectedSimulation, sliderValue, settingsMode, assignedPrograms]);
+  }, [currentRole, dashboardVisibleSeries, selectedSimulation, sliderValue, settingsMode, assignedPrograms, assignedRecipes]);
 
   // Load persisted data on mount
   useEffect(() => {
@@ -90,6 +94,17 @@ export function AppContextProvider({ children }) {
       }
     } catch (error) {
       console.error("Error loading assigned programs:", error);
+    }
+    
+    try {
+      const assignedRecipesData = localStorage.getItem('assignedRecipes');
+      if (assignedRecipesData) {
+        const parsed = JSON.parse(assignedRecipesData);
+        console.log("Loaded assigned recipes:", parsed);
+        setAssignedRecipesState(parsed);
+      }
+    } catch (error) {
+      console.error("Error loading assigned recipes:", error);
     }
   }, []);
 
@@ -167,6 +182,28 @@ export function AppContextProvider({ children }) {
       }
     }
   };
+  
+  const setAssignedRecipes = (value) => {
+    console.log("Setting assigned recipes:", value);
+    if (typeof value === 'function') {
+      setAssignedRecipesState(prev => {
+        const updated = value(prev);
+        try {
+          localStorage.setItem('assignedRecipes', JSON.stringify(updated));
+        } catch (error) {
+          console.error("Error saving assigned recipes:", error);
+        }
+        return updated;
+      });
+    } else {
+      setAssignedRecipesState(value);
+      try {
+        localStorage.setItem('assignedRecipes', JSON.stringify(value));
+      } catch (error) {
+        console.error("Error saving assigned recipes:", error);
+      }
+    }
+  };
 
   const contextValue = {
     // Role
@@ -188,6 +225,10 @@ export function AppContextProvider({ children }) {
     setSettingsMode,
     assignedPrograms,
     setAssignedPrograms,
+    
+    // Assigned Recipes (shared between Setup and MachineControls)
+    assignedRecipes,
+    setAssignedRecipes,
   };
 
   return (
@@ -222,6 +263,8 @@ export function useAppContext() {
       setSettingsMode: () => {},
       assignedPrograms: [],
       setAssignedPrograms: () => {},
+      assignedRecipes: [],
+      setAssignedRecipes: () => {},
     };
   }
   return context;

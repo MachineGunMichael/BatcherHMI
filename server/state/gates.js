@@ -4,9 +4,13 @@ const GATE_MAX = 8;
 
 const state = new Map();
 const processingQueues = new Map(); // Queue of pending operations per gate
+const operationCounts = new Map(); // Track operation counts to periodically reset queues
+const QUEUE_RESET_THRESHOLD = 1000; // Reset promise chain after N operations to prevent memory buildup
+
 for (let g = GATE_MIN; g <= GATE_MAX; g++) {
   state.set(g, { pieces: 0, grams: 0 });
   processingQueues.set(g, Promise.resolve()); // Start with resolved promise
+  operationCounts.set(g, 0);
 }
 
 function getSnapshot() {
@@ -77,6 +81,18 @@ function loadSnapshot(arr) {
  * @returns {Promise<{ pieces: number, grams: number, batchComplete: boolean }>}
  */
 async function processPieceAtomic(gate, weight, checkBatchComplete) {
+  // Increment operation count and reset queue if threshold reached (prevents memory buildup)
+  const count = operationCounts.get(gate) + 1;
+  operationCounts.set(gate, count);
+  
+  // Periodically reset the promise chain to prevent memory accumulation
+  if (count >= QUEUE_RESET_THRESHOLD) {
+    // Wait for current queue to finish, then reset
+    await processingQueues.get(gate);
+    processingQueues.set(gate, Promise.resolve());
+    operationCounts.set(gate, 0);
+  }
+  
   // Chain this operation to the end of the queue for this gate
   const operation = processingQueues.get(gate).then(async () => {
     // Increment

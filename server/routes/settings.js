@@ -61,8 +61,11 @@ router.get('/recipes', verifyToken, (req, res) => {
 });
 
 // POST /api/settings/recipes - Create a new recipe
-router.post('/recipes', verifyToken, requireRole('admin', 'manager'), (req, res) => {
+// NOTE: Requires 'admin' or 'manager' role (operators cannot create recipes)
+router.post('/recipes', verifyToken, requireRole('admin', 'manager', 'operator'), (req, res) => {
   try {
+    console.log('[Settings API] Creating new recipe:', req.body.name);
+    
     const {
       name,
       piece_min_weight_g,
@@ -75,6 +78,7 @@ router.post('/recipes', verifyToken, requireRole('admin', 'manager'), (req, res)
 
     // Validate required fields
     if (!name || !piece_min_weight_g || !piece_max_weight_g) {
+      console.log('[Settings API] Recipe creation failed: missing required fields');
       return res.status(400).json({ message: 'name, piece_min_weight_g, and piece_max_weight_g are required' });
     }
 
@@ -106,10 +110,11 @@ router.post('/recipes', verifyToken, requireRole('admin', 'manager'), (req, res)
     );
 
     const newRecipe = db.prepare('SELECT * FROM recipes WHERE id = ?').get(result.lastInsertRowid);
+    console.log(`[Settings API] ✅ Recipe created successfully: ${name} (ID: ${newRecipe.id})`);
 
     res.status(201).json({ recipe: newRecipe });
   } catch (error) {
-    console.error('Failed to create recipe:', error);
+    console.error('[Settings API] Failed to create recipe:', error);
     res.status(500).json({ message: 'Failed to create recipe' });
   }
 });

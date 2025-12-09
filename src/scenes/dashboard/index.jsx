@@ -5,9 +5,11 @@ import { ResponsiveLine } from "@nivo/line";
 import { ResponsivePie } from "@nivo/pie";
 import { ResponsiveScatterPlot } from "@nivo/scatterplot";
 import Header from "../../components/Header";
+import MachineControls from "../../components/MachineControls";
 import { tokens } from "../../theme";
 import { useAppContext } from "../../context/AppContext";
 import { useDashboardData } from "./dataProvider";
+import useMachineState from "../../hooks/useMachineState";
 
 /* ---------- Recipe name formatter ---------- */
 const formatRecipeName = (name) => {
@@ -73,14 +75,14 @@ const AnnotatedMachineImage = ({ colorMap, assignmentsByGate, overlayByGate }) =
   const colors = tokens(theme.palette.mode);
 
   const annotationPositions = [
-    { gate: 1, x1: '36%', y1: '70%', x2: '50%', y2: '15%' },
-    { gate: 2, x1: '34%', y1: '60%', x2: '60%', y2: '15%' },
-    { gate: 3, x1: '33%', y1: '50%', x2: '70%', y2: '15%' },
-    { gate: 4, x1: '43%', y1: '35%', x2: '80%', y2: '15%' },
-    { gate: 5, x1: '36%', y1: '70%', x2: '50%', y2: '65%' },
-    { gate: 6, x1: '34%', y1: '60%', x2: '60%', y2: '65%' },
-    { gate: 7, x1: '33%', y1: '50%', x2: '70%', y2: '65%' },
-    { gate: 8, x1: '43%', y1: '35%', x2: '80%', y2: '65%' },
+    { gate: 1, x1: '36%', y1: '70%', x2: '53%', y2: '15%' },
+    { gate: 2, x1: '34%', y1: '60%', x2: '68%', y2: '15%' },
+    { gate: 3, x1: '33%', y1: '50%', x2: '83%', y2: '15%' },
+    { gate: 4, x1: '43%', y1: '35%', x2: '98%', y2: '15%' },
+    { gate: 5, x1: '36%', y1: '70%', x2: '53%', y2: '65%' },
+    { gate: 6, x1: '34%', y1: '60%', x2: '68%', y2: '65%' },
+    { gate: 7, x1: '33%', y1: '50%', x2: '83%', y2: '65%' },
+    { gate: 8, x1: '43%', y1: '35%', x2: '98%', y2: '65%' },
   ];
 
   // Line segments with simple x1, y1, x2, y2 coordinates (in percentages)
@@ -88,26 +90,26 @@ const AnnotatedMachineImage = ({ colorMap, assignmentsByGate, overlayByGate }) =
     // Gate 1 line - first segment (horizontal)
     {
       id: 'gate1-horizontal',
-      x1: 37, y1: 5,
-      x2: 41, y2: 5
+      x1: 35, y1: 5,
+      x2: 39, y2: 5
     },
     // Gate 1 line - second segment (angled to machine)
     {
       id: 'gate1-angled',
-      x1: 37, y1: 5,
-      x2: 33, y2: 7
+      x1: 35, y1: 5,
+      x2: 31, y2: 8
     },
     // Gate 5 line - first segment (horizontal)
     {
       id: 'gate5-horizontal',
-      x1: 37, y1: 55,
-      x2: 41, y2: 55
+      x1: 35, y1: 55,
+      x2: 39, y2: 55
     },
     // Gate 5 line - second segment (angled to machine)
     {
       id: 'gate5-angled',
-      x1: 37, y1: 55,
-      x2: 21, y2: 51
+      x1: 35, y1: 55,
+      x2: 27, y2: 50
     }
   ];
 
@@ -118,9 +120,9 @@ const AnnotatedMachineImage = ({ colorMap, assignmentsByGate, overlayByGate }) =
         style={{
           position: 'absolute',
           top: '40%',
-          left: '17%',
+          left: '19%',
           transform: 'translate(-50%, -50%)',
-          maxHeight: '120%'
+          maxHeight: '100%'
         }}
         src="../../assets/BatchMind2.png"
       />
@@ -140,7 +142,7 @@ const AnnotatedMachineImage = ({ colorMap, assignmentsByGate, overlayByGate }) =
               backgroundColor: colors.primary[100],
               borderRadius: 1,
               border: `1px solid ${headColor}`,
-              width: '110px',
+              width: '130px',
               boxShadow: 3,
               overflow: 'hidden',
             }}
@@ -234,6 +236,9 @@ const Dashboard = () => {
   const theme = useTheme();
   const colors = tokens(theme.palette.mode);
   const isDark = theme.palette.mode === "dark";
+
+  // Machine state from backend
+  const { activeRecipes } = useMachineState();
 
   // global toggles from AppContext
   const { dashboardVisibleSeries, setDashboardVisibleSeries } = useAppContext();
@@ -603,7 +608,9 @@ const Dashboard = () => {
     <Box m="20px" height="calc(100vh - 200px)" maxHeight="calc(100vh - 200px)"
       sx={{ overflow: "visible", display: "flex", flexDirection: "column" }}>
       <Box display="flex" justifyContent="space-between" alignItems="center" mb="20px" sx={{ m: "0px 0 0 0" }}>
-        <Header title="Dashboard" subtitle={`Performance Overview (${mode.toUpperCase()} mode)`} />
+        <Box display="flex" justifyContent="space-between" alignItems="center">
+          <Header title="Dashboard" subtitle="Performance Overview" />
+        </Box>
 
         {/* Time Slider (Replay mode only) */}
         {mode === "replay" && datasetStart && datasetEnd && currentTime && (
@@ -647,8 +654,31 @@ const Dashboard = () => {
         gap="20px"
         sx={{ flex: 1, minHeight: 0, overflow: "hidden" }}
       >
+        {/* Machine Controls (Left of machine image) */}
+        <Box gridColumn="1 / span 2" gridRow="1 / span 4"
+          sx={{ backgroundColor: colors.primary[100], borderRadius: 1.5, overflow: "hidden", p: 1.5 }}>
+          <MachineControls 
+            layout="vertical" 
+            activeRecipesCount={activeRecipes?.length || 0}
+            showTitle={false}
+            styles={{
+              titleVariant: 'h5',
+              buttonHeight: '28px',
+              buttonFontSize: '0.80rem',
+              buttonGap: 1,
+              recipesTextVariant: 'caption',
+              stateBadge: {
+                px: 1.5,
+                py: 0.4,
+                borderRadius: 1.5,
+                fontSize: '0.65rem',
+              },
+            }}
+          />
+        </Box>
+
         {/* Machine Image with overlays */}
-        <Box gridColumn="1 / span 10" gridRow="1 / span 4"
+        <Box gridColumn="3 / span 8" gridRow="1 / span 4"
           sx={{ backgroundColor: colors.primary[100], borderRadius: 1.5, overflow: "hidden", position: 'relative' }}>
           <AnnotatedMachineImage
             colorMap={colorMap}

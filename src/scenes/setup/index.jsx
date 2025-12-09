@@ -18,9 +18,11 @@ import {
   Paper,
 } from "@mui/material";
 import Header from "../../components/Header";
+import MachineControls from "../../components/MachineControls";
 import { tokens } from "../../theme";
 import { useAppContext } from "../../context/AppContext";
 import api from "../../services/api";
+import useMachineState from "../../hooks/useMachineState";
 
 const Setup = () => {
   const theme = useTheme();
@@ -62,20 +64,13 @@ const Setup = () => {
   const [manualGates, setManualGates] = useState([]);
 
   // Save recipe state
-  const [showSaveOption, setShowSaveOption] = useState(false);
-  const [currentRecipeName, setCurrentRecipeName] = useState("");
 
-  // Assigned recipes state (persisted in localStorage)
-  const [assignedRecipes, setAssignedRecipes] = useState(() => {
-    const saved = localStorage.getItem('assignedRecipes');
-    return saved ? JSON.parse(saved) : [];
-  });
+  // Assigned recipes from context (persisted and shared across components)
+  const { assignedRecipes, setAssignedRecipes } = context;
   
-  // Active recipes state (persisted in localStorage)
-  const [activeRecipes, setActiveRecipes] = useState(() => {
-    const saved = localStorage.getItem('activeRecipes');
-    return saved ? JSON.parse(saved) : [];
-  });
+  // Active recipes state (synced from backend via SSE, NOT persisted locally)
+  // Backend machine_state is the single source of truth
+  const [activeRecipes, setActiveRecipes] = useState([]);
   
   const [addError, setAddError] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
@@ -93,22 +88,42 @@ const Setup = () => {
   const [editActiveSuccess, setEditActiveSuccess] = useState("");
 
   // Machine control state
-  const [machineState, setMachineState] = useState("idle"); // "idle", "running", "paused"
+  // Machine state from backend via SSE
+  const {
+    state: backendMachineState,
+    activeRecipes: backendActiveRecipes,
+    currentProgramId: backendProgramId,
+    isConnected: machineConnected,
+  } = useMachineState();
+  
+  // Local machine state (synced with backend)
+  const [machineState, setMachineState] = useState("idle");
 
-  // Load recipes from database
+  // Sync backend machine state with local state
   useEffect(() => {
+    if (backendMachineState) {
+      setMachineState(backendMachineState);
+    }
+  }, [backendMachineState]);
+
+  // Sync active recipes from backend (SSE is the single source of truth)
+  useEffect(() => {
+    if (backendActiveRecipes !== undefined) {
+      setActiveRecipes(backendActiveRecipes);
+    }
+  }, [backendActiveRecipes]);
+
+  // Load recipes from database and clean up old localStorage data
+  useEffect(() => {
+    // Remove old activeRecipes from localStorage (backend is now source of truth)
+    localStorage.removeItem('activeRecipes');
     loadRecipes();
   }, []);
 
-  // Persist assigned recipes to localStorage
-  useEffect(() => {
-    localStorage.setItem('assignedRecipes', JSON.stringify(assignedRecipes));
-  }, [assignedRecipes]);
-
-  // Persist active recipes to localStorage
-  useEffect(() => {
-    localStorage.setItem('activeRecipes', JSON.stringify(activeRecipes));
-  }, [activeRecipes]);
+  // NOTE: assignedRecipes persistence is handled by AppContext
+  // NOTE: activeRecipes is NOT persisted to localStorage
+  // Backend machine_state is the single source of truth for active recipes
+  // Only assignedRecipes is persisted locally (user selections before activation)
 
   const loadRecipes = async () => {
     try {
@@ -250,7 +265,7 @@ const Setup = () => {
   };
 
   // Add manual recipe
-  const handleAddManual = () => {
+  const handleAddManual = async () => {
     // Validate required fields
     if (!manualPieceMin || !manualPieceMax) {
       setAddError("Piece weight bounds are required");
@@ -259,6 +274,11 @@ const Setup = () => {
 
     if (manualGates.length === 0) {
       setAddError("Please assign at least one gate");
+      return;
+    }
+
+    if (!manualBatchWeightEnabled && !manualPieceCountEnabled) {
+      setAddError("Please enable at least one constraint (batch weight or piece count)");
       return;
     }
 
@@ -310,68 +330,58 @@ const Setup = () => {
 
     // Check if recipe already exists in database
     const existingRecipe = recipes.find((r) => r.name === recipeName);
+    console.log(`[Setup] Checking recipe "${recipeName}" - exists in DB: ${!!existingRecipe}, recipes loaded: ${recipes.length}`);
+
+    // If recipe doesn't exist, save it to database first
+    let recipeId = existingRecipe?.id || null;
+    if (!existingRecipe) {
+      console.log(`[Setup] Recipe doesn't exist, saving to database...`);
+      try {
+        const response = await api.post("/settings/recipes", {
+          name: recipeName,
+          piece_min_weight_g: params.pieceMinWeight,
+          piece_max_weight_g: params.pieceMaxWeight,
+          batch_min_weight_g: params.batchMinWeight,
+          batch_max_weight_g: params.batchMaxWeight,
+          min_pieces_per_batch:
+            params.countType === "min" || params.countType === "exact"
+              ? params.countValue
+              : null,
+          max_pieces_per_batch:
+            params.countType === "max" || params.countType === "exact"
+              ? params.countValue
+              : null,
+        });
+        
+        // Get the new recipe ID from response (API returns { recipe: {...} })
+        recipeId = response.data?.recipe?.id || null;
+        
+        // Reload recipes to include the new one
+        await loadRecipes();
+        
+        console.log(`[Setup] Auto-saved new recipe: ${recipeName} (ID: ${recipeId})`);
+      } catch (error) {
+        console.error("[Setup] Failed to auto-save recipe:", error);
+        console.error("[Setup] Error details:", error.response?.data || error.message);
+        setAddError(`Failed to save recipe: ${error.response?.data?.message || error.message}`);
+        return;
+      }
+    }
 
     const newAssignment = {
       type: "manual",
-      recipeId: existingRecipe?.id || null,
+      recipeId: recipeId,
       recipeName,
       params,
       gates: manualGates,
     };
 
-    // Always add to assigned recipes
+    // Add to assigned recipes
     setAssignedRecipes([...assignedRecipes, newAssignment]);
-
-    // If recipe doesn't exist, show save option
-    if (!existingRecipe) {
-      setShowSaveOption(true);
-      setCurrentRecipeName(recipeName);
-    } else {
-      // Recipe exists, just add it
-      resetManualForm();
-      setAddError("");
-    }
-  };
-
-  // Save recipe to database
-  const handleSaveRecipeYes = async () => {
-    try {
-      const params = assignedRecipes[assignedRecipes.length - 1].params;
-      
-      await api.post("/settings/recipes", {
-        name: currentRecipeName,
-        piece_min_weight_g: params.pieceMinWeight,
-        piece_max_weight_g: params.pieceMaxWeight,
-        batch_min_weight_g: params.batchMinWeight,
-        batch_max_weight_g: params.batchMaxWeight,
-        min_pieces_per_batch:
-          params.countType === "min" || params.countType === "exact"
-            ? params.countValue
-            : null,
-        max_pieces_per_batch:
-          params.countType === "max" || params.countType === "exact"
-            ? params.countValue
-            : null,
-      });
-
-      // Reload recipes
-      await loadRecipes();
-
-      setSuccessMessage("Recipe saved to database!");
-      setTimeout(() => setSuccessMessage(""), 3000);
-    } catch (error) {
-      console.error("Failed to save recipe:", error);
-      setAddError("Failed to save recipe to database");
-    }
-
-    setShowSaveOption(false);
     resetManualForm();
+    setAddError("");
   };
 
-  const handleSaveRecipeNo = () => {
-    setShowSaveOption(false);
-    resetManualForm();
-  };
 
   // Remove assigned recipe
   const handleRemoveAssignment = (index) => {
@@ -437,13 +447,22 @@ const Setup = () => {
     }
 
     // Update the recipe
+    // Clear recipeId since the recipe name changed - backend will resolve the correct ID
+    const oldRecipe = assignedRecipes[editingAssignedIndex];
+    const recipeNameChanged = oldRecipe.recipeName !== newRecipeName;
+    
     const updatedRecipes = [...assignedRecipes];
     updatedRecipes[editingAssignedIndex] = {
       ...updatedRecipes[editingAssignedIndex],
+      recipeId: recipeNameChanged ? null : oldRecipe.recipeId, // Clear if name changed
       recipeName: newRecipeName,
       params: newParams,
       gates: editAssignedData.gates
     };
+    
+    if (recipeNameChanged) {
+      console.log(`[Setup] Assigned recipe name changed: ${oldRecipe.recipeName} → ${newRecipeName}, clearing recipeId`);
+    }
 
     setAssignedRecipes(updatedRecipes);
     setEditingAssignedIndex(null);
@@ -454,49 +473,49 @@ const Setup = () => {
   // Send programs to machine (move from assigned to active)
   const handleSendPrograms = async () => {
     try {
-      // TODO: Implement API call to send recipes to machine
-      console.log("Sending recipes to machine:", assignedRecipes);
+      console.log("[Setup] Activating recipes:", assignedRecipes);
       
       // Move assigned recipes to active recipes
-      setActiveRecipes([...activeRecipes, ...assignedRecipes]);
+      const newActiveRecipes = [...activeRecipes, ...assignedRecipes];
+      setActiveRecipes(newActiveRecipes);
       setAssignedRecipes([]);
+      
+      // Sync to backend
+      await api.post('/machine/recipes', { recipes: newActiveRecipes });
+      console.log("[Setup] Active recipes synced to backend");
     } catch (error) {
-      console.error("Failed to send recipes:", error);
-      setAddError("Failed to send recipes to machine");
+      console.error("[Setup] Failed to activate recipes:", error);
+      setAddError("Failed to activate recipes");
     }
   };
 
-  // Machine control handlers
-  const handleStartMachine = () => {
-    if (activeRecipes.length > 0 && machineState !== "running") {
-      setMachineState("running");
-      console.log("Machine started");
-      // TODO: Implement API call to start machine
-    }
-  };
-
-  const handlePauseMachine = () => {
-    if (machineState === "running") {
-      setMachineState("paused");
-      console.log("Machine paused");
-      // TODO: Implement API call to pause machine
-    }
-  };
-
-  const handleStopMachine = () => {
-    if (machineState !== "idle") {
-      setMachineState("idle");
-      // Move active recipes back to assigned recipes
-      setAssignedRecipes([...assignedRecipes, ...activeRecipes]);
-      setActiveRecipes([]);
-      console.log("Machine stopped");
-      // TODO: Implement API call to stop machine
+  // Machine control handlers (now in shared MachineControls component)
+  // Sync active recipes to backend
+  const syncActiveRecipesToBackend = async () => {
+    try {
+      await api.post('/machine/recipes', { recipes: activeRecipes });
+      console.log('[Setup] Synced active recipes to backend');
+    } catch (error) {
+      console.error('[Setup] Failed to sync active recipes:', error);
     }
   };
 
   // Remove active recipe
-  const handleRemoveActiveRecipe = (index) => {
-    setActiveRecipes(activeRecipes.filter((_, i) => i !== index));
+  const handleRemoveActiveRecipe = async (index) => {
+    // Get updated recipes without the removed one
+    const updatedRecipes = activeRecipes.filter((_, i) => i !== index);
+    
+    // Push updated recipes to backend (so it knows about the removal)
+    // This will trigger a program change when Start is pressed (like edit does)
+    try {
+      await api.post('/machine/recipes', { recipes: updatedRecipes });
+      console.log('[Setup] Updated active recipes on backend after removal');
+    } catch (error) {
+      console.error('[Setup] Failed to update active recipes on backend:', error);
+      // Still update local state even if backend fails
+    }
+    
+    setActiveRecipes(updatedRecipes);
     setEditingActiveIndex(null);
     setEditActiveData(null);
   };
@@ -524,7 +543,7 @@ const Setup = () => {
   };
 
   // Accept editing active recipe
-  const handleAcceptEditActive = () => {
+  const handleAcceptEditActive = async () => {
     // Validate at least one gate is selected
     if (!editActiveData.gates || editActiveData.gates.length === 0) {
       setEditActiveError("Please select at least one gate.");
@@ -558,13 +577,33 @@ const Setup = () => {
     }
 
     // Update the recipe
+    // Clear recipeId since the recipe name changed - backend will resolve the correct ID
+    const oldRecipe = activeRecipes[editingActiveIndex];
+    const recipeNameChanged = oldRecipe.recipeName !== newRecipeName;
+    
     const updatedRecipes = [...activeRecipes];
     updatedRecipes[editingActiveIndex] = {
       ...updatedRecipes[editingActiveIndex],
+      recipeId: recipeNameChanged ? null : oldRecipe.recipeId, // Clear if name changed
       recipeName: newRecipeName,
       params: newParams,
       gates: editActiveData.gates
     };
+    
+    if (recipeNameChanged) {
+      console.log(`[Setup] Recipe name changed: ${oldRecipe.recipeName} → ${newRecipeName}, clearing recipeId`);
+    }
+
+    // Push updated recipes to backend (so it knows about the edit)
+    try {
+      await api.post('/machine/recipes', { recipes: updatedRecipes });
+      console.log('[Setup] Updated active recipes on backend after edit');
+    } catch (error) {
+      console.error('[Setup] Failed to update active recipes on backend:', error);
+      setEditActiveError("Failed to update recipe on server");
+      setTimeout(() => setEditActiveError(""), 5000);
+      return;
+    }
 
     setActiveRecipes(updatedRecipes);
     setEditingActiveIndex(null);
@@ -578,6 +617,7 @@ const Setup = () => {
     manualPieceMin &&
     manualPieceMax &&
     manualGates.length > 0 &&
+    (manualBatchWeightEnabled || manualPieceCountEnabled) && // At least one constraint required
     (!manualBatchWeightEnabled || (manualBatchMin && manualBatchMax)) &&
     (!manualPieceCountEnabled || manualPieceCount);
 
@@ -589,9 +629,12 @@ const Setup = () => {
         mt="70px"
         sx={{
           overflowY: "auto",
+          overflowX: "visible",
           maxHeight: "calc(100vh - 200px)",
           pr: 2,
-          pb: 4
+          pb: 4,
+          pl: 1.5,
+          ml: -1.5
         }}
       >
         {/* Top Section: Recipe Selection and Machine Controls */}
@@ -811,47 +854,6 @@ const Setup = () => {
                 Add Recipe
               </Button>
 
-              {/* Save recipe option (only if recipe doesn't exist in DB) */}
-              {showSaveOption && (
-                <Box
-                  mt={2}
-                  p={2}
-                  sx={{
-                    backgroundColor: colors.primary[200],
-                    borderRadius: 1,
-                    border: `1px solid ${colors.tealAccent[500]}`,
-                  }}
-                >
-                  <Box display="flex" alignItems="center" gap={2}>
-                    <Typography variant="body1">
-                      Save recipe <strong>{currentRecipeName}</strong> for future use?
-                    </Typography>
-                    <Button
-                      variant="contained"
-                      color="secondary"
-                      size="small"
-                      onClick={handleSaveRecipeYes}
-                    >
-                      Yes
-                    </Button>
-                    <Button
-                      variant="contained"
-                      size="small"
-                      onClick={handleSaveRecipeNo}
-                      sx={{ 
-                        backgroundColor: colors.redAccent[500],
-                        color: '#fff',
-                        '&:hover': {
-                          backgroundColor: colors.redAccent[600]
-                        }
-                      }}
-                    >
-                      No
-                    </Button>
-                  </Box>
-                </Box>
-              )}
-
               {addError && (
                 <Typography variant="body2" sx={{ color: colors.redAccent[500] }}>
                   {addError}
@@ -863,85 +865,24 @@ const Setup = () => {
 
           {/* Machine Controls (Right) */}
           <Box sx={{ width: "50%" }}>
-            <Typography
-              variant="h4"
-              fontWeight="bold"
-              sx={{ mb: 2, color: colors.tealAccent[500] }}
-            >
-              Machine Controls
-            </Typography>
-
-            {/* Machine State Label - aligned with radio buttons */}
-            <Box sx={{ mb: 2 }}>
-              <Typography variant="h6">
-                {machineState === "running" ? "Machine Running" :
-                 machineState === "paused" ? "Machine Halted" :
-                 "Machine Idle"}
-              </Typography>
-            </Box>
-
-            {/* Control Buttons - aligned with Select Recipe dropdown */}
-            <Box display="flex" gap={3}>
-              {/* Start Button */}
-              <Button
-                variant="contained"
-                onClick={handleStartMachine}
-                disabled={activeRecipes.length === 0 || machineState === "running"}
-                sx={{
-                  flex: 1,
-                  backgroundColor: colors.tealAccent[500],
-                  color: '#fff',
-                  height: '40px',
-                  fontSize: '1.0rem',
-                  borderRadius: 1,
-                  '&:hover': {
-                    backgroundColor: colors.tealAccent[600],
-                  },
-                }}
-              >
-                START
-              </Button>
-
-              {/* Pause Button */}
-              <Button
-                variant="contained"
-                onClick={handlePauseMachine}
-                disabled={machineState !== "running"}
-                sx={{
-                  flex: 1,
-                  backgroundColor: colors.orangeAccent[500],
-                  color: '#fff',
-                  height: '40px',
-                  fontSize: '1.0rem',
-                  borderRadius: 1,
-                  '&:hover': {
-                    backgroundColor: colors.orangeAccent[600],
-                  },
-                }}
-              >
-                PAUSE
-              </Button>
-
-              {/* Stop Button */}
-              <Button
-                variant="contained"
-                onClick={handleStopMachine}
-                disabled={machineState === "idle"}
-                sx={{
-                  flex: 1,
-                  backgroundColor: colors.redAccent[500],
-                  color: '#fff',
-                  height: '40px',
-                  fontSize: '1.0rem',
-                  borderRadius: 1,
-                  '&:hover': {
-                    backgroundColor: colors.redAccent[600],
-                  },
-                }}
-              >
-                STOP
-              </Button>
-            </Box>
+            <MachineControls 
+              layout="horizontal" 
+              activeRecipesCount={activeRecipes.length}
+              onStop={(recipesToRestore) => {
+                // Move active recipes back to assigned (avoid duplicates)
+                const existingRecipeNames = new Set(assignedRecipes.map(r => r.recipeName));
+                const uniqueRecipesToRestore = recipesToRestore.filter(r => !existingRecipeNames.has(r.recipeName));
+                setAssignedRecipes(prev => [...prev, ...uniqueRecipesToRestore]);
+              }}
+              styles={{
+                stateBadge: {
+                  px: 1.5,
+                  py: 0.4,
+                  borderRadius: 1.5,
+                  fontSize: '0.75rem',
+                },
+              }}
+            />
           </Box>
         </Box>
 

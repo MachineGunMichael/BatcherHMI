@@ -92,10 +92,18 @@ const Stats = () => {
     legends: { text: { fill: isDarkMode ? colors.primary[800] : colors.primary[800] } },
     tooltip: {
       container: {
-        background: isDarkMode ? colors.primary[400] : colors.primary[100],
+        background: isDarkMode ? colors.primary[600] : colors.primary[200],
         color: isDarkMode ? colors.grey[100] : colors.grey[900],
       },
     },
+  };
+
+  // Shared tooltip style for custom tooltips (avoids duplicating theme colors)
+  const tooltipStyle = {
+    padding: '9px 12px',
+    background: isDarkMode ? colors.primary[600] : colors.primary[200],
+    color: isDarkMode ? colors.grey[100] : colors.grey[900],
+    borderRadius: '4px',
   };
 
   // Load programs on mount
@@ -535,6 +543,7 @@ const Stats = () => {
               sx={{
                 width: "100%",
                 minWidth: 0,
+                overflow: "visible",
               }}
             >
               {/* Total Batches */}
@@ -595,11 +604,11 @@ const Stats = () => {
               </Box>
 
               {/* Weight Distribution Pie Chart */}
-              <Box sx={{ minWidth: 0, gridColumn: "span 1" }}>
+              <Box sx={{ minWidth: 0, gridColumn: "span 1", overflow: "visible" }}>
                 <Typography variant="h5" fontWeight="bold" color={colors.tealAccent[500]} mb={1}>
                   Weight Distribution
                 </Typography>
-                <Box height="210px">
+                <Box height="210px" sx={{ overflow: "visible", "& svg": { overflow: "visible" } }}>
                   <ResponsivePie
                     data={weightDistributionData}
                     theme={chartTheme}
@@ -619,12 +628,7 @@ const Stats = () => {
                     arcLabelsTextColor="#ffffff"
                     valueFormat={value => `${(value / 1000).toFixed(1)}kg`}
                     tooltip={({ datum }) => (
-                      <div style={{
-                        padding: '9px 12px',
-                        background: isDarkMode ? colors.primary[400] : colors.primary[100],
-                        color: isDarkMode ? colors.grey[100] : colors.grey[900],
-                        borderRadius: '4px'
-                      }}>
+                      <div style={tooltipStyle}>
                         <strong>{datum.label}:</strong> {(datum.value / 1000).toFixed(2)} kg
                       </div>
                     )}
@@ -704,12 +708,7 @@ const Stats = () => {
                       enableLabel={false}
                       enableGridY={false}
                       tooltip={({ id, value, data }) => (
-                        <div style={{
-                          padding: '9px 12px',
-                          background: isDarkMode ? colors.primary[400] : colors.primary[100],
-                          color: isDarkMode ? colors.grey[100] : colors.grey[900],
-                          borderRadius: '4px'
-                        }}>
+                        <div style={tooltipStyle}>
                           <strong>{data.rangeStart}g - {data.rangeEnd}g</strong><br />
                           {value.toLocaleString()} pieces
                         </div>
@@ -875,6 +874,7 @@ const Stats = () => {
                     indexBy="recipe"
                     colors={({ data }) => data.recipeColor}
                     theme={chartTheme}
+                    valueFormat={value => value.toFixed(1)}
                     padding={0.3}
                     margin={{ top: 20, right: 20, bottom: 20, left: 60 }}
                     valueScale={{ type: 'linear' }}
@@ -1057,12 +1057,7 @@ const Stats = () => {
                     arcLabelsTextColor="#ffffff"
                     valueFormat={value => `${(value || 0).toFixed(2)}`}
                     tooltip={({ datum }) => (
-                      <div style={{
-                        padding: '9px 12px',
-                        background: isDarkMode ? colors.primary[400] : colors.primary[100],
-                        color: isDarkMode ? colors.grey[100] : colors.grey[900],
-                        borderRadius: '4px'
-                      }}>
+                      <div style={tooltipStyle}>
                         <strong>{datum.label}:</strong> {(datum.value || 0).toFixed(2)}%
                       </div>
                     )}
@@ -1229,14 +1224,7 @@ const Stats = () => {
                     arcLabelsTextColor="#ffffff"
                     theme={chartTheme}
                     tooltip={({ id, value, color }) => (
-                      <div
-                        style={{
-                          padding: '12px',
-                          background: isDarkMode ? colors.primary[400] : '#ffffff',
-                          border: `1px solid ${color}`,
-                          borderRadius: '4px',
-                        }}
-                      >
+                      <div style={{ ...tooltipStyle, border: `1px solid ${color}` }}>
                         <strong style={{ color }}>{id}:</strong> {value.toLocaleString()} pieces
                       </div>
                     )}
@@ -1432,14 +1420,7 @@ const Stats = () => {
                     arcLabelsTextColor="#ffffff"
                     theme={chartTheme}
                     tooltip={({ id, value, color }) => (
-                      <div
-                        style={{
-                          padding: '12px',
-                          background: isDarkMode ? colors.primary[400] : '#ffffff',
-                          border: `1px solid ${color}`,
-                          borderRadius: '4px',
-                        }}
-                      >
+                      <div style={{ ...tooltipStyle, border: `1px solid ${color}` }}>
                         <strong style={{ color }}>{id}:</strong> {(value / 1000).toFixed(2)} kg
                       </div>
                     )}
@@ -1620,21 +1601,14 @@ const Stats = () => {
                       useMesh={true}
                       legends={[]}
                       tooltip={({ point }) => (
-                        <Box
-                          sx={{
-                            background: isDarkMode ? colors.primary[400] : colors.primary[100],
-                            padding: '9px 12px',
-                            border: `1px solid ${colors.grey[700]}`,
-                            borderRadius: '4px'
-                          }}
-                        >
-                          <Typography variant="body2" color={colors.grey[100]}>
+                        <Box sx={{ ...tooltipStyle, border: `1px solid ${colors.grey[700]}` }}>
+                          <Typography variant="body2" color={tooltipStyle.color}>
                             <strong>{point.serieId}</strong>
                           </Typography>
-                          <Typography variant="body2" color={colors.grey[100]}>
+                          <Typography variant="body2" color={tooltipStyle.color}>
                             Time: {new Date(point.data.x).toLocaleTimeString()}
                           </Typography>
-                          <Typography variant="body2" color={colors.grey[100]}>
+                          <Typography variant="body2" color={tooltipStyle.color}>
                             Weight: {(point.data.y / 1000).toFixed(2)} kg
                           </Typography>
                         </Box>
@@ -1752,18 +1726,11 @@ const Stats = () => {
                           tooltip={({ point }) => {
                             if (!point || !point.data || point.data.x === undefined || point.data.y === undefined) return null;
                             return (
-                              <Box
-                                sx={{
-                                  background: isDarkMode ? colors.primary[400] : colors.primary[100],
-                                  padding: '9px 12px',
-                                  border: `1px solid ${colors.grey[700]}`,
-                                  borderRadius: '4px'
-                                }}
-                              >
-                                <Typography variant="body2" color={colors.grey[100]}>
+                              <Box sx={{ ...tooltipStyle, border: `1px solid ${colors.grey[700]}` }}>
+                                <Typography variant="body2" color={tooltipStyle.color}>
                                   Time: {new Date(point.data.x).toLocaleTimeString()}
                                 </Typography>
-                                <Typography variant="body2" color={colors.grey[100]}>
+                                <Typography variant="body2" color={tooltipStyle.color}>
                                   Weight: {point.data.y.toFixed(1)} g
                                 </Typography>
                               </Box>
@@ -1787,10 +1754,12 @@ const Stats = () => {
           );
 
           // Prepare data for both charts
-          const batchesPerGate = filteredGateDwellData.map(({ gate, recipe_name, dwell_times }) => ({
+          // Use batch_count from backend (actual count from batch_completions)
+          // Fallback to dwell_times.length + 1 if batch_count not available
+          const batchesPerGate = filteredGateDwellData.map(({ gate, recipe_name, dwell_times, batch_count }) => ({
             gate: gate.toString(),
             gateNumber: gate,
-            batches: dwell_times.length,
+            batches: batch_count !== undefined ? batch_count : (dwell_times.length > 0 ? dwell_times.length + 1 : 0),
             recipeColor: recipeColorMap[recipe_name] || colors.grey[500]
           }));
 

@@ -16,11 +16,9 @@ function toEpochMs(ts) {
 /**
  * Get M3 throughput (batches/min) per recipe
  * Returns: { perRecipe: { recipe: [{t, v}] }, total: [{t, v}] }
+ * Note: t is returned as milliseconds since epoch to match InfluxDB format
  */
 function getM3ThroughputPerRecipe({ from, to }) {
-  const fromMs = toEpochMs(from);
-  const toMs = toEpochMs(to);
-  
   // Per-recipe data
   const perRecipeRows = db.prepare(`
     SELECT recipe_name, timestamp, batches_min
@@ -35,7 +33,7 @@ function getM3ThroughputPerRecipe({ from, to }) {
       perRecipe[row.recipe_name] = [];
     }
     perRecipe[row.recipe_name].push({
-      t: row.timestamp,
+      t: toEpochMs(row.timestamp),
       v: Number(row.batches_min)
     });
   });
@@ -49,7 +47,7 @@ function getM3ThroughputPerRecipe({ from, to }) {
   `).all(from, to);
   
   const total = totalRows.map(row => ({
-    t: row.timestamp,
+    t: toEpochMs(row.timestamp),
     v: Number(row.batches_min)
   }));
   
@@ -59,6 +57,7 @@ function getM3ThroughputPerRecipe({ from, to }) {
 /**
  * Get M3 giveaway (%) per recipe
  * Returns: { perRecipe: { recipe: [{t, v}] }, total: [{t, v}] }
+ * Note: t is returned as milliseconds since epoch to match InfluxDB format
  */
 function getM3GiveawayPerRecipe({ from, to }) {
   // Per-recipe data
@@ -75,7 +74,7 @@ function getM3GiveawayPerRecipe({ from, to }) {
       perRecipe[row.recipe_name] = [];
     }
     perRecipe[row.recipe_name].push({
-      t: row.timestamp,
+      t: toEpochMs(row.timestamp),
       v: Number(row.giveaway_pct)
     });
   });
@@ -89,7 +88,7 @@ function getM3GiveawayPerRecipe({ from, to }) {
   `).all(from, to);
   
   const total = totalRows.map(row => ({
-    t: row.timestamp,
+    t: toEpochMs(row.timestamp),
     v: Number(row.giveaway_pct)
   }));
   
@@ -99,6 +98,7 @@ function getM3GiveawayPerRecipe({ from, to }) {
 /**
  * Get M3 pieces processed per recipe
  * Returns: { perRecipe: { recipe: [{t, v}] }, total: [{t, v}] }
+ * Note: t is returned as milliseconds since epoch to match InfluxDB format
  */
 function getM3PiecesProcessedPerRecipe({ from, to }) {
   // Per-recipe data
@@ -115,7 +115,7 @@ function getM3PiecesProcessedPerRecipe({ from, to }) {
       perRecipe[row.recipe_name] = [];
     }
     perRecipe[row.recipe_name].push({
-      t: row.timestamp,
+      t: toEpochMs(row.timestamp),
       v: Number(row.pieces_processed)
     });
   });
@@ -129,7 +129,7 @@ function getM3PiecesProcessedPerRecipe({ from, to }) {
   `).all(from, to);
   
   const total = totalRows.map(row => ({
-    t: row.timestamp,
+    t: toEpochMs(row.timestamp),
     v: Number(row.pieces_processed)
   }));
   
@@ -139,6 +139,7 @@ function getM3PiecesProcessedPerRecipe({ from, to }) {
 /**
  * Get M3 weight processed (g) per recipe
  * Returns: { perRecipe: { recipe: [{t, v}] }, total: [{t, v}] }
+ * Note: t is returned as milliseconds since epoch to match InfluxDB format
  */
 function getM3WeightProcessedPerRecipe({ from, to }) {
   // Per-recipe data
@@ -155,7 +156,7 @@ function getM3WeightProcessedPerRecipe({ from, to }) {
       perRecipe[row.recipe_name] = [];
     }
     perRecipe[row.recipe_name].push({
-      t: row.timestamp,
+      t: toEpochMs(row.timestamp),
       v: Number(row.weight_processed_g)
     });
   });
@@ -169,7 +170,7 @@ function getM3WeightProcessedPerRecipe({ from, to }) {
   `).all(from, to);
   
   const total = totalRows.map(row => ({
-    t: row.timestamp,
+    t: toEpochMs(row.timestamp),
     v: Number(row.weight_processed_g)
   }));
   
@@ -179,6 +180,7 @@ function getM3WeightProcessedPerRecipe({ from, to }) {
 /**
  * Get M3 rejects (combined total only)
  * Returns: [{ t, v, total_rejects_count, total_rejects_weight_g }]
+ * Note: t is returned as milliseconds since epoch to match InfluxDB format
  */
 function getM3CombinedRejects({ from, to }) {
   const rows = db.prepare(`
@@ -189,7 +191,7 @@ function getM3CombinedRejects({ from, to }) {
   `).all(from, to);
   
   return rows.map(row => ({
-    t: row.timestamp,
+    t: toEpochMs(row.timestamp),
     v: Number(row.rejects_per_min),
     total_rejects_count: Number(row.total_rejects_count),
     total_rejects_weight_g: Number(row.total_rejects_weight_g)
