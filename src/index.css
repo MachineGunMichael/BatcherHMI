@@ -52,3 +52,10 @@ body,
   scrollbar-width: thin;
   scrollbar-color: rgba(0, 0, 0, 0.2) transparent;
 }
+
+/* Global synchronized pulse animation for transitioning elements */
+@keyframes syncPulse {
+  0% { opacity: 1; }
+  50% { opacity: 0.5; }
+  100% { opacity: 1; }
+}

@@ -10,6 +10,8 @@ try {
 const { bus } = require("../lib/eventBus");
 const recipeManager = require("../lib/recipeManager");
 const gates = require("../state/gates");
+const machineState = require("../services/machineState");
+const db = require("../db/sqlite");
 
 // --- SSE helpers ---
 function openSSE(res) {
@@ -28,20 +30,48 @@ function send(res, event, payload) {
 
 /**
  * Get active gate assignments from recipeManager (machine state)
- * Returns [{ gate, recipe_name }] for Dashboard legend
+ * For transitioning gates, returns the ORIGINAL recipe (what's actually running on that gate)
+ * Returns [{ gate, recipe_name }] for gate annotations
  */
 function getActiveLegend() {
   const legend = [];
+  const state = machineState.getState();
+  const transitioningGates = state.transitioningGates || [];
+  const transitionStartRecipes = state.transitionStartRecipes || {};
   
-  // Get gate assignments from recipeManager (which reads from machine_state)
+  // Get gate assignments
   for (let gate = 1; gate <= 8; gate++) {
-    const recipe = recipeManager.getRecipeForGate(gate);
-    if (recipe) {
-      legend.push({ gate, recipe_name: recipe.name });
+    // For transitioning gates, use the ORIGINAL recipe (what's actually running)
+    if (transitioningGates.includes(gate) && transitionStartRecipes[gate]) {
+      legend.push({ gate, recipe_name: transitionStartRecipes[gate].recipeName });
+    } else {
+      const recipe = recipeManager.getRecipeForGate(gate);
+      if (recipe) {
+        legend.push({ gate, recipe_name: recipe.name });
+      }
     }
   }
   
   return legend;
+}
+
+/**
+ * Get current program start time from program_stats
+ * Returns ISO timestamp or null if no active program
+ */
+function getCurrentProgramStartTime() {
+  try {
+    const state = machineState.getState();
+    if (!state.currentProgramId) return null;
+    
+    const row = db.prepare(`
+      SELECT start_ts FROM program_stats WHERE program_id = ?
+    `).get(state.currentProgramId);
+    
+    return row?.start_ts || null;
+  } catch (e) {
+    return null;
+  }
 }
 
 // GET /api/stream/dashboard?mode=live
@@ -53,7 +83,20 @@ router.get("/dashboard", async (req, res) => {
     const tsISO = new Date().toISOString();
     const legend = getActiveLegend(); // from machine state (NEW)
     const overlay = gates.getSnapshot(); // authoritative in-memory
-    send(res, "tick", { ts: tsISO, legend, overlay });
+    const state = machineState.getState();
+    const programStartTime = getCurrentProgramStartTime();
+    send(res, "tick", { 
+      ts: tsISO, 
+      legend, 
+      overlay,
+      programId: state.currentProgramId,
+      programStartTime,
+      machineState: state.state,
+      transitioningGates: state.transitioningGates || [],
+      activeRecipes: state.activeRecipes || [],
+      transitionStartRecipes: state.transitionStartRecipes || {},
+      programStartRecipes: state.programStartRecipes || [],
+    });
   } catch (e) {
     console.error("initial tick failed:", e);
   }
@@ -62,9 +105,11 @@ router.get("/dashboard", async (req, res) => {
   const onPiece = (payload) => send(res, "piece", payload); // for scatter
   const onGate  = (payload) => send(res, "gate", payload);  // per-gate increments + resets
   const onOverlay = (payload) => send(res, "overlay", payload); // full overlay snapshot (for resets)
+  const onProgramChange = (payload) => send(res, "program_change", payload); // program start/stop/change
   bus.on("piece", onPiece);
   bus.on("gate", onGate);
   bus.on("overlay", onOverlay);
+  bus.on("program_change", onProgramChange);
 
   // keepalive
   const keepAlive = setInterval(() => res.write(": ping\n\n"), 30_000);
@@ -75,7 +120,20 @@ router.get("/dashboard", async (req, res) => {
       const tsISO = new Date().toISOString();
       const legend = getActiveLegend(); // from machine state (NEW)
       const overlay = gates.getSnapshot();
-      send(res, "tick", { ts: tsISO, legend, overlay });
+      const state = machineState.getState();
+      const programStartTime = getCurrentProgramStartTime();
+      send(res, "tick", { 
+        ts: tsISO, 
+        legend, 
+        overlay,
+        programId: state.currentProgramId,
+        programStartTime,
+        machineState: state.state,
+        transitioningGates: state.transitioningGates || [],
+        activeRecipes: state.activeRecipes || [],
+        transitionStartRecipes: state.transitionStartRecipes || {},
+        programStartRecipes: state.programStartRecipes || [],
+      });
     } catch (e) {
       console.error("SSE tick error:", e);
     }
@@ -87,6 +145,7 @@ router.get("/dashboard", async (req, res) => {
     bus.off("piece", onPiece);
     bus.off("gate", onGate);
     bus.off("overlay", onOverlay);
+    bus.off("program_change", onProgramChange);
   });
 });
 

@@ -41,7 +41,7 @@ router.post('/control', async (req, res) => {
         return handlePause(currentState, res);
       
       case 'stop':
-        return handleStop(currentState, res);
+        return await handleStop(currentState, res);
       
       default:
         return res.status(400).json({ error: `Invalid action: ${action}` });
@@ -107,6 +107,15 @@ function handleStart(currentState, res) {
     });
     machineState.snapshotRecipes();
     
+    // Broadcast program change event so dashboard can reset rejects display
+    const programChangeEvent = { 
+      action: 'start', 
+      programId, 
+      ts: new Date().toISOString() 
+    };
+    console.log('[Machine API] Broadcasting program_change event:', programChangeEvent);
+    eventBus.broadcast('program_change', programChangeEvent);
+    
     return res.json({
       success: true,
       action: 'start_new_program',
@@ -119,17 +128,100 @@ function handleStart(currentState, res) {
     // Start from paused: check if recipes changed
     const changed = machineState.recipesChanged();
     
-    if (changed) {
-      // Recipes changed: transition to new program
-      console.log('[Machine API] Recipes changed, initiating program transition');
+    // Check if there are already gates transitioning (user edited while paused)
+    const alreadyTransitioning = machineState.hasTransitioningGates();
+    
+    if (changed || alreadyTransitioning) {
+      // Recipes changed: create NEW program and use per-gate transition
+      console.log('[Machine API] Recipes changed, creating new program with per-gate transition');
       
-      machineState.updateState({ state: 'transitioning' });
+      const oldProgramId = currentState.currentProgramId;
       
-      // Worker will detect this and finish current batches, then call /transition-complete
+      // Store old program ID so we can finalize it when all transitions complete
+      machineState.setTransitionOldProgramId(oldProgramId);
+      
+      // Set end_ts on old program NOW (when transition starts)
+      // This is the official end time - we'll only be collecting finishing batches after this
+      const transitionTime = new Date().toISOString();
+      db.prepare(`
+        UPDATE program_stats 
+        SET end_ts = ? 
+        WHERE program_id = ?
+      `).run(transitionTime, oldProgramId);
+      console.log(`[Machine API] Old program ${oldProgramId} end_ts set to ${transitionTime} (transition start)`);
+      
+      // 1. Create NEW program (starts at the same moment old program ends)
+      const startTime = transitionTime;
+      const programName = `program_${startTime.replace(/[-:]/g, '').replace(/\..+/, '').replace('T', '_')}`;
+      const insertProgram = db.prepare('INSERT INTO programs (name) VALUES (?)');
+      const result = insertProgram.run(programName);
+      const newProgramId = result.lastInsertRowid;
+      
+      console.log(`[Machine API] Created new program: ${programName} (ID: ${newProgramId})`);
+      
+      // 3. Create program_stats row for new program
+      db.prepare(`
+        INSERT INTO program_stats (program_id, start_ts, end_ts)
+        VALUES (?, ?, NULL)
+      `).run(newProgramId, startTime);
+      console.log(`[Machine API] Created program_stats for program ${newProgramId}`);
+      
+      // 4. Create recipe_stats rows for each active recipe in NEW program
+      const activeRecipes = machineState.getActiveRecipes();
+      for (const recipe of activeRecipes) {
+        const gatesAssigned = (recipe.gates || []).join(',');
+        db.prepare(`
+          INSERT INTO recipe_stats (
+            program_id, recipe_id, gates_assigned,
+            total_batches, total_batched_weight_g, total_reject_weight_g, total_giveaway_weight_g,
+            total_items_batched, total_items_rejected
+          ) VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0)
+        `).run(newProgramId, recipe.recipeId, gatesAssigned);
+        console.log(`[Machine API] Created recipe_stats for recipe ${recipe.recipeId} (${recipe.recipeName}) on gates [${gatesAssigned}]`);
+      }
+      
+      // 5. Get gates that are transitioning
+      const transitioningGates = machineState.getTransitioningGates();
+      
+      if (transitioningGates.length > 0) {
+        console.log(`[Machine API] Gates in transition: ${transitioningGates.join(', ')}`);
+      } else {
+        // NO transitioning gates - old program can be finalized immediately
+        // This happens when adding recipes to EMPTY gates (no batch to complete)
+        console.log(`[Machine API] No transitioning gates - finalizing old program ${oldProgramId} immediately`);
+        calculateAndWriteProgramStats(oldProgramId);
+        machineState.clearTransitionOldProgramId();
+        console.log(`[Machine API] ✅ Old program ${oldProgramId} finalized (no pending batches)`);
+      }
+      
+      // 6. Update state to running with new program
+      machineState.updateState({ 
+        state: 'running',
+        currentProgramId: newProgramId,
+      });
+      
+      // 7. Snapshot recipes if no transitions, otherwise keep old programStartRecipes frozen
+      if (transitioningGates.length === 0) {
+        machineState.snapshotRecipes();
+      }
+      
+      // 8. Broadcast program change event
+      const programChangeEvent = { 
+        action: 'recipe_change', 
+        programId: newProgramId, 
+        ts: new Date().toISOString() 
+      };
+      console.log('[Machine API] Broadcasting program_change event:', programChangeEvent);
+      eventBus.broadcast('program_change', programChangeEvent);
+      
       return res.json({
         success: true,
-        action: 'transition_program',
+        action: 'new_program_with_transitions',
         recipesChanged: true,
+        oldProgramId,
+        newProgramId,
+        programName,
+        transitioningGates: transitioningGates,
         state: machineState.getState(),
       });
       
@@ -183,6 +275,11 @@ function calculateAndWriteProgramStats(programId) {
   console.log(`[Machine API] 📊 Calculating stats for program ${programId}...`);
   
   try {
+    // Get program time range for reject query
+    const programInfo = db.prepare(`
+      SELECT start_ts, end_ts FROM program_stats WHERE program_id = ?
+    `).get(programId);
+    
     // Get all batch completions for this program, grouped by recipe
     const batchStats = db.prepare(`
       SELECT 
@@ -233,7 +330,30 @@ function calculateAndWriteProgramStats(programId) {
       console.log(`[Machine API] Updated recipe_stats for recipe ${stats.recipe_id}: ${stats.total_batches} batches, ${stats.total_items_batched} items, ${stats.total_batched_weight_g}g`);
     }
     
-    // Update program_stats totals
+    // Get reject totals from kpi_minute_combined (written by Python worker)
+    // Rejects are cumulative, so we take the MAX values for this program's time range
+    let rejectCount = 0;
+    let rejectWeightG = 0;
+    
+    if (programInfo && programInfo.start_ts) {
+      const endTs = programInfo.end_ts || new Date().toISOString();
+      
+      const rejectData = db.prepare(`
+        SELECT 
+          MAX(total_rejects_count) as reject_count,
+          MAX(total_rejects_weight_g) as reject_weight
+        FROM kpi_minute_combined
+        WHERE timestamp >= ? AND timestamp <= ?
+      `).get(programInfo.start_ts, endTs);
+      
+      if (rejectData) {
+        rejectCount = rejectData.reject_count || 0;
+        rejectWeightG = rejectData.reject_weight || 0;
+        console.log(`[Machine API] Found rejects from kpi_minute_combined: ${rejectCount} pieces, ${rejectWeightG}g`);
+      }
+    }
+    
+    // Update program_stats totals (including rejects)
     const programTotals = db.prepare(`
       SELECT 
         SUM(total_batches) as total_batches,
@@ -251,17 +371,21 @@ function calculateAndWriteProgramStats(programId) {
           total_batches = ?,
           total_items_batched = ?,
           total_batched_weight_g = ?,
-          total_giveaway_weight_g = ?
+          total_giveaway_weight_g = ?,
+          total_items_rejected = ?,
+          total_reject_weight_g = ?
         WHERE program_id = ?
       `).run(
         programTotals.total_batches || 0,
         programTotals.total_items_batched || 0,
         programTotals.total_batched_weight_g || 0,
         programTotals.total_giveaway_weight_g || 0,
+        rejectCount,
+        rejectWeightG,
         programId
       );
       
-      console.log(`[Machine API] Updated program_stats totals: ${programTotals.total_batches || 0} batches, ${programTotals.total_items_batched || 0} items`);
+      console.log(`[Machine API] Updated program_stats totals: ${programTotals.total_batches || 0} batches, ${programTotals.total_items_batched || 0} items, ${rejectCount} rejected`);
     }
     
     console.log(`[Machine API] ⏱️ Stats calculation took ${Date.now() - startTime}ms`);
@@ -273,17 +397,84 @@ function calculateAndWriteProgramStats(programId) {
 }
 
 /**
- * Handle STOP action
- * Immediately stops the machine and resets to idle (no waiting for batches)
+ * Handle completion of all gate transitions
+ * Called from ingest.js when all transitioning gates have completed their batches
+ * Creates a new program for the new recipe configuration
+ * @returns {Object} { success, newProgramId, programName }
  */
-function handleStop(currentState, res) {
+function handleAllTransitionsComplete() {
+  const transitionStart = Date.now();
+  console.log(`[Machine API] 🎯 All gate transitions complete, finalizing old program stats...`);
+  
+  try {
+    // Get the OLD program ID that we stored when transitions started
+    const oldProgramId = machineState.getTransitionOldProgramId();
+    
+    if (!oldProgramId) {
+      console.log('[Machine API] No old program ID stored - transitions may have already completed');
+      return { success: true, message: 'No pending transition' };
+    }
+    
+    // All batches have been captured - calculate and write stats
+    // NOTE: end_ts was already set when transition started (that's the official end time)
+    console.log(`[Machine API] Calculating final stats for old program ${oldProgramId}...`);
+    calculateAndWriteProgramStats(oldProgramId);
+    
+    console.log(`[Machine API] ✅ Old program ${oldProgramId} stats finalized`);
+    
+    // Clear the stored old program ID
+    machineState.clearTransitionOldProgramId();
+    
+    // Clear transition state
+    machineState.clearTransitions();
+    
+    // Snapshot recipes for the new program
+    machineState.snapshotRecipes();
+    
+    // Broadcast program_change so dashboard resets rejects display
+    const currentState = machineState.getState();
+    eventBus.broadcast('program_change', {
+      action: 'recipe_change',
+      programId: currentState.currentProgramId,
+      programStartTime: new Date().toISOString(),
+      ts: new Date().toISOString()
+    });
+    console.log(`[Machine API] Broadcast program_change for new program ${currentState.currentProgramId}`);
+    
+    console.log(`[Machine API] ⏱️ Transition finalization took ${Date.now() - transitionStart}ms`);
+    
+    return { 
+      success: true, 
+      oldProgramId,
+      message: 'Old program stats saved successfully'
+    };
+  } catch (error) {
+    console.error('[Machine API] Error finalizing old program after transitions:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Handle STOP action
+ * Stops the machine, waits briefly for Python worker to flush KPIs, then calculates stats
+ */
+async function handleStop(currentState, res) {
   if (currentState.state === 'idle') {
     return res.status(400).json({ 
       error: 'Machine is already stopped' 
     });
   }
   
-  console.log('[Machine API] Stopping machine immediately');
+  console.log('[Machine API] Stopping machine...');
+  
+  // Set state to idle first so Python worker can detect and flush KPIs
+  const gates = require('../state/gates');
+  gates.resetAll();
+  machineState.reset();
+  console.log('[Machine API] Machine state reset to idle, waiting for KPI flush...');
+  
+  // Give Python worker time to detect state change and flush KPIs (polls every 200ms)
+  await new Promise(resolve => setTimeout(resolve, 500));
   
   // Finalize program if one was running
   if (currentState.currentProgramId) {
@@ -326,14 +517,13 @@ function handleStop(currentState, res) {
     }
   }
   
-  // Reset gates to 0
-  const gates = require('../state/gates');
-  gates.resetAll();
-  console.log('[Machine API] All gates reset to 0');
+  console.log('[Machine API] ✅ Stop complete');
   
-  // Reset to idle (clears active recipes)
-  machineState.reset();
-  console.log('[Machine API] Machine state reset to idle');
+  // Broadcast program change event so dashboard can reset rejects display
+  eventBus.broadcast('program_change', { 
+    action: 'stop', 
+    ts: new Date().toISOString() 
+  });
   
   return res.json({
     success: true,
@@ -356,6 +546,11 @@ router.post('/transition-complete', async (req, res) => {
     console.log(`[Machine API] Transition complete for program ${programId}, action: ${action}`);
     
     if (action === 'stop') {
+      // Calculate and write program stats (including rejects)
+      const statsStart = Date.now();
+      calculateAndWriteProgramStats(programId);
+      console.log(`[Machine API] ⏱️ Stats calculation phase took ${Date.now() - statsStart}ms`);
+      
       // Finalize program stats and set to idle
       const endTime = new Date().toISOString();
       db.prepare(`
@@ -371,6 +566,12 @@ router.post('/transition-complete', async (req, res) => {
       console.log(`[Machine API] Machine state reset to idle, active recipes cleared`);
       console.log(`[Machine API] ⏱️ Stop transition took ${Date.now() - transitionStart}ms total`);
       
+      // Broadcast program change event so dashboard can reset rejects display
+      eventBus.broadcast('program_change', { 
+        action: 'stop', 
+        ts: new Date().toISOString() 
+      });
+      
       return res.json({
         success: true,
         action: 'stopped',
@@ -378,97 +579,23 @@ router.post('/transition-complete', async (req, res) => {
       });
       
     } else if (action === 'recipe_change') {
-      // Finalize old program and create new one
-      const endTime = new Date().toISOString();
+      // NOTE: This endpoint is now mostly a no-op for recipe_change
+      // Stats are saved by handleAllTransitionsComplete() called from ingest.js
+      // New program is already created by handleStart
+      // Gates should NOT be reset - batches continue until complete
       
-      // Calculate and write stats for old program (just like stop does)
-      const statsStart = Date.now();
-      calculateAndWriteProgramStats(programId);
-      console.log(`[Machine API] ⏱️ Stats calculation phase took ${Date.now() - statsStart}ms`);
+      console.log(`[Machine API] recipe_change acknowledged from Python worker`);
+      console.log(`[Machine API] Stats already handled by handleAllTransitionsComplete()`);
       
-      db.prepare(`
-        UPDATE program_stats 
-        SET end_ts = ? 
-        WHERE program_id = ?
-      `).run(endTime, programId);
-      
-      console.log(`[Machine API] Program ${programId} finalized (recipe change)`);
-      
-      // Reset gate states for the new program
-      const gates = require('../state/gates');
-      gates.resetAll();
-      console.log(`[Machine API] Reset all gate states for new program`);
-      
-      // Create new program
-      const programName = `program_${new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '').replace('T', '_')}`;
-      const insertProgram = db.prepare('INSERT INTO programs (name) VALUES (?)');
-      const result = insertProgram.run(programName);
-      const newProgramId = result.lastInsertRowid;
-      
-      console.log(`[Machine API] Created new program: ${programName} (ID: ${newProgramId})`);
-      
-      // Create program_stats row for new program
-      const startTime = new Date().toISOString();
-      db.prepare(`
-        INSERT INTO program_stats (
-          program_id, 
-          start_ts, 
-          total_batches, 
-          total_items_batched, 
-          total_batched_weight_g,
-          total_reject_weight_g,
-          total_giveaway_weight_g
-        ) VALUES (?, ?, 0, 0, 0, 0, 0)
-      `).run(newProgramId, startTime);
-      
-      // Create recipe_stats rows for each active recipe
-      const activeRecipes = machineState.getActiveRecipes();
-      for (const recipe of activeRecipes) {
-        const recipeId = recipe.recipeId;
-        const recipeName = recipe.recipeName;
-        const gatesAssigned = recipe.gates.join(',');
-        
-        // Get or create recipe ID if it doesn't exist
-        let dbRecipeId = recipeId;
-        if (!dbRecipeId) {
-          const existing = db.prepare('SELECT id FROM recipes WHERE name = ?').get(recipeName);
-          dbRecipeId = existing?.id;
-        }
-        
-        if (dbRecipeId) {
-          db.prepare(`
-            INSERT INTO recipe_stats (
-              program_id, 
-              recipe_id, 
-              gates_assigned,
-              total_batches, 
-              total_items_batched, 
-              total_batched_weight_g,
-              total_items_rejected,
-              total_reject_weight_g,
-              total_giveaway_weight_g
-            ) VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0)
-          `).run(newProgramId, dbRecipeId, gatesAssigned);
-          console.log(`[Machine API] Created recipe_stats for recipe ${recipeName} (ID: ${dbRecipeId})`);
-        }
-      }
-      
-      // Update state to running with new program
-      machineState.updateState({
-        state: 'running',
-        currentProgramId: newProgramId,
-      });
-      machineState.snapshotRecipes();
-      
-      console.log(`[Machine API] ⏱️ Recipe change transition took ${Date.now() - transitionStart}ms total`);
-      
+      // Just return success - the real work is done elsewhere
       return res.json({
         success: true,
-        action: 'new_program_started',
-        programId: newProgramId,
-        programName,
+        action: 'recipe_change_acknowledged',
+        message: 'Recipe change handled by ingest.js flow',
+        programId: currentState.currentProgramId,
         state: machineState.getState(),
       });
+      
     } else {
       return res.status(400).json({ error: 'Invalid action' });
     }
@@ -497,16 +624,18 @@ router.get('/recipes', (req, res) => {
  * POST /api/machine/recipes
  * Update active recipes
  * Body: { recipes: [...] }
+ * 
+ * When updated while paused, tracks which gates are affected for per-gate transitions
  */
 router.post('/recipes', (req, res) => {
   try {
     const { recipes } = req.body;
     const currentState = machineState.getState();
     
-    // Validate: can only update recipes when not running
+    // Allow updates when paused or idle, but not when running
     if (currentState.state === 'running') {
       return res.status(400).json({ 
-        error: 'Cannot update recipes while machine is running' 
+        error: 'Cannot update recipes while machine is running. Please pause first.' 
       });
     }
     
@@ -584,12 +713,71 @@ router.post('/recipes', (req, res) => {
     
     console.log(`[Machine API] Updating active recipes (${recipes.length} recipes)`);
     console.log(`[Machine API] Recipe details:`, recipes.map(r => `${r.recipeName} (ID:${r.recipeId}) on gates [${r.gates.join(',')}]`).join(', '));
+    
+    // If paused, detect which gates are affected by this recipe change
+    // These gates will need to complete their current batch before switching
+    if (currentState.state === 'paused' && currentState.currentProgramId) {
+      const affectedGates = [];
+      const originalRecipes = {};
+      
+      // Build map of old gate -> recipe from programStartRecipes
+      const oldGateToRecipe = {};
+      for (const recipe of currentState.programStartRecipes) {
+        for (const gate of recipe.gates || []) {
+          oldGateToRecipe[gate] = {
+            recipeId: recipe.recipeId,
+            recipeName: recipe.recipeName,
+            params: recipe.params,
+          };
+        }
+      }
+      
+      // Build map of new gate -> recipe
+      const newGateToRecipe = {};
+      for (const recipe of recipes) {
+        for (const gate of recipe.gates || []) {
+          newGateToRecipe[gate] = {
+            recipeId: recipe.recipeId,
+            recipeName: recipe.recipeName,
+            params: recipe.params,
+          };
+        }
+      }
+      
+      // Find gates that had a recipe before but have a different one now (or no recipe)
+      for (const gate of Object.keys(oldGateToRecipe)) {
+        const gateNum = Number(gate);
+        const oldRecipe = oldGateToRecipe[gate];
+        const newRecipe = newGateToRecipe[gate];
+        
+        // Only mark as transitioning if:
+        // 1. Gate had a recipe at program start
+        // 2. Recipe has changed (different recipe or no recipe)
+        // 3. Gate is not already transitioning
+        const existingTransitioning = machineState.getTransitioningGates();
+        const recipeChanged = !newRecipe || newRecipe.recipeName !== oldRecipe.recipeName;
+        
+        if (recipeChanged && !existingTransitioning.includes(gateNum)) {
+          affectedGates.push(gateNum);
+          originalRecipes[gateNum] = oldRecipe;
+          console.log(`[Machine API] Gate ${gate}: recipe changed from ${oldRecipe.recipeName} to ${newRecipe?.recipeName || 'none'}`);
+        }
+      }
+      
+      // Mark affected gates as transitioning
+      if (affectedGates.length > 0) {
+        machineState.startGateTransition(affectedGates, originalRecipes);
+        console.log(`[Machine API] Marked gates [${affectedGates.join(', ')}] for transition`);
+      }
+    }
+    
     machineState.setActiveRecipes(recipes);
     console.log('[Machine API] Active recipes updated successfully in DB');
     
     return res.json({
       success: true,
       recipes: machineState.getActiveRecipes(),
+      transitioningGates: machineState.getTransitioningGates(),
     });
     
   } catch (error) {
@@ -628,5 +816,7 @@ router.get('/stream', (req, res) => {
   console.log('[Machine API] SSE client connected');
 });
 
+// Export router and helper functions
 module.exports = router;
+module.exports.handleAllTransitionsComplete = handleAllTransitionsComplete;
 

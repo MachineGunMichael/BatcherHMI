@@ -10,6 +10,7 @@ import { tokens } from "../../theme";
 import { useAppContext } from "../../context/AppContext";
 import { useDashboardData } from "./dataProvider";
 import useMachineState from "../../hooks/useMachineState";
+import { getSyncedAnimationStyle } from "../../utils/animationSync";
 
 /* ---------- Recipe name formatter ---------- */
 const formatRecipeName = (name) => {
@@ -70,7 +71,7 @@ const ScatterNode = ({ node }) => {
 };
 
 /* ---------- Annotated machine image with per-gate overlay ---------- */
-const AnnotatedMachineImage = ({ colorMap, assignmentsByGate, overlayByGate }) => {
+const AnnotatedMachineImage = ({ colorMap, assignmentsByGate, overlayByGate, transitioningGates, gateToNewRecipe }) => {
   const theme = useTheme();
   const colors = tokens(theme.palette.mode);
 
@@ -130,39 +131,44 @@ const AnnotatedMachineImage = ({ colorMap, assignmentsByGate, overlayByGate }) =
         const program = assignmentsByGate[pos.gate] || "—";
         const headColor = colorMap[program] || colors.primary[500];
         const gateInfo = overlayByGate[pos.gate] || { pieces: 0, grams: 0 };
+        const isTransitioning = (transitioningGates || []).includes(pos.gate);
 
         return (
-          <Box
-            key={idx}
-            sx={{
-              position: 'absolute',
-              top: pos.y2,
-              left: pos.x2,
-              transform: 'translate(-90%, -50%)',
-              backgroundColor: colors.primary[100],
-              borderRadius: 1,
-              border: `1px solid ${headColor}`,
-              width: '130px',
-              boxShadow: 3,
-              overflow: 'hidden',
-            }}
-          >
-            <Box sx={{ backgroundColor: headColor, py: 0.1, px: 0.5, textAlign: 'left' }}>
-              <Typography variant="h8" color="#fff">
-                G{pos.gate}: {formatRecipeName(program)}
-              </Typography>
-            </Box>
-            <Box sx={{ p: 0.5 }}>
-              <Box sx={{ display: 'flex', justifyContent: 'space-between', borderBottom: `1px solid ${colors.grey[300]}`, py: 0.1 }}>
-                <Typography variant="body2" color={colors.primary[800]} fontWeight="bold">Pieces:</Typography>
-                <Typography variant="body2" color={colors.primary[800]}>{gateInfo.pieces ?? 0}</Typography>
+          <React.Fragment key={idx}>
+            {/* Main gate annotation card */}
+            <Box
+              sx={{
+                position: 'absolute',
+                top: pos.y2,
+                left: pos.x2,
+                transform: 'translate(-90%, -50%)',
+                backgroundColor: colors.primary[100],
+                borderRadius: 1,
+                border: `1px solid ${headColor}`,
+                width: '130px',
+                boxShadow: 3,
+                overflow: 'hidden',
+                // Pulsing animation for transitioning gates (uses synced timing)
+                ...(isTransitioning && getSyncedAnimationStyle()),
+              }}
+            >
+              <Box sx={{ backgroundColor: headColor, py: 0.1, px: 0.5, textAlign: 'left' }}>
+                <Typography variant="h8" color="#fff">
+                  G{pos.gate}: {formatRecipeName(program)}
+                </Typography>
               </Box>
-              <Box sx={{ display: 'flex', justifyContent: 'space-between', py: 0.1 }}>
-                <Typography variant="body2" color={colors.primary[800]} fontWeight="bold">Gram:</Typography>
-                <Typography variant="body2" color={colors.primary[800]}>{Number(gateInfo.grams ?? 0).toFixed(1)}</Typography>
+              <Box sx={{ p: 0.5 }}>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', borderBottom: `1px solid ${colors.grey[300]}`, py: 0.1 }}>
+                  <Typography variant="body2" color={colors.primary[800]} fontWeight="bold">Pieces:</Typography>
+                  <Typography variant="body2" color={colors.primary[800]}>{gateInfo.pieces ?? 0}</Typography>
+                </Box>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', py: 0.1 }}>
+                  <Typography variant="body2" color={colors.primary[800]} fontWeight="bold">Gram:</Typography>
+                  <Typography variant="body2" color={colors.primary[800]}>{Number(gateInfo.grams ?? 0).toFixed(1)}</Typography>
+                </Box>
               </Box>
             </Box>
-          </Box>
+          </React.Fragment>
         );
       })}
       
@@ -238,7 +244,29 @@ const Dashboard = () => {
   const isDark = theme.palette.mode === "dark";
 
   // Machine state from backend
-  const { activeRecipes } = useMachineState();
+  const { activeRecipes, transitioningGates, transitionStartRecipes } = useMachineState();
+  
+  // Build map of gate -> new recipe name (for transitioning gates display)
+  const gateToNewRecipe = useMemo(() => {
+    const map = {};
+    (activeRecipes || []).forEach(recipe => {
+      (recipe.gates || []).forEach(gate => {
+        map[gate] = recipe.recipeName;
+      });
+    });
+    return map;
+  }, [activeRecipes]);
+  
+  // Get set of recipe names that are currently transitioning (shown in legend with pulsing)
+  const transitioningRecipeNames = useMemo(() => {
+    const names = new Set();
+    Object.values(transitionStartRecipes || {}).forEach(recipe => {
+      if (recipe && recipe.recipeName) {
+        names.add(recipe.recipeName);
+      }
+    });
+    return names;
+  }, [transitionStartRecipes]);
 
   // global toggles from AppContext
   const { dashboardVisibleSeries, setDashboardVisibleSeries } = useAppContext();
@@ -684,6 +712,8 @@ const Dashboard = () => {
             colorMap={colorMap}
             assignmentsByGate={assignmentsByGate}
             overlayByGate={overlayByGate}
+            transitioningGates={transitioningGates}
+            gateToNewRecipe={gateToNewRecipe}
           />
         </Box>
 
@@ -832,25 +862,30 @@ const Dashboard = () => {
         <Box gridColumn="11 / span 2" gridRow="1 / span 12" display="grid" gridTemplateRows="auto 1fr 1fr 1fr" gap="10px">
           {/* Legend row */}
           <Box sx={{ backgroundColor: colors.primary[100], borderRadius: 1.5, overflow: "hidden", display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "flex-start", gap: "8px" }} p="10px">
-            {legendKeys.map((name) => (
-              <Box
-                key={name}
-                display="flex" alignItems="center" gap="6px"
-                onClick={() => toggleSeries(name)}
-                sx={{
-                  cursor: 'pointer',
-                  opacity: (dashboardVisibleSeries?.[name] ?? true) ? 1 : 0.4,
-                  transition: 'all 0.2s',
-                  '&:hover': { transform: 'scale(1.05)' },
-                  border: (dashboardVisibleSeries?.[name] ?? true) ? 'none' : `1px solid ${colors.grey[300]}`,
-                  borderRadius: '4px',
-                  padding: '4px 8px',
-                }}
-              >
-                <Box width="10px" height="10px" borderRadius="50%" sx={{ backgroundColor: colorMap[name] || colors.primary[700] }} />
-                <Typography variant="body2" fontSize="11px" color={colors.primary[800]}>{formatRecipeName(name)}</Typography>
-              </Box>
-            ))}
+            {legendKeys.map((name) => {
+              const isTransitioning = transitioningRecipeNames.has(name);
+              return (
+                <Box
+                  key={name}
+                  display="flex" alignItems="center" gap="6px"
+                  onClick={() => toggleSeries(name)}
+                  sx={{
+                    cursor: 'pointer',
+                    opacity: (dashboardVisibleSeries?.[name] ?? true) ? 1 : 0.4,
+                    transition: 'all 0.2s',
+                    '&:hover': { transform: 'scale(1.05)' },
+                    border: (dashboardVisibleSeries?.[name] ?? true) ? 'none' : `1px solid ${colors.grey[300]}`,
+                    borderRadius: '4px',
+                    padding: '4px 8px',
+                    // Pulsing animation for transitioning recipes (uses synced timing)
+                    ...(isTransitioning && getSyncedAnimationStyle()),
+                  }}
+                >
+                  <Box width="10px" height="10px" borderRadius="50%" sx={{ backgroundColor: colorMap[name] || colors.primary[700] }} />
+                  <Typography variant="body2" fontSize="11px" color={colors.primary[800]}>{formatRecipeName(name)}</Typography>
+                </Box>
+              );
+            })}
           </Box>
 
           {/* Batch total */}

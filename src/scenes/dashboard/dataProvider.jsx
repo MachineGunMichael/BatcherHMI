@@ -119,6 +119,21 @@ class StickyMinuteReservoir {
       localStorage.setItem(SCATTER_LS_KEY, JSON.stringify({ rows }));
     } catch {}
   }
+  clear() {
+    // Clear all data from the reservoir (used when recipe changes)
+    this.buckets.clear();
+    this.seen.clear();
+    this.stats = [];
+    this.q10 = null;
+    this.q90 = null;
+    this.totalCore = 0;
+    this.totalOutliers = 0;
+    // Also clear localStorage
+    try {
+      localStorage.removeItem(SCATTER_LS_KEY);
+    } catch {}
+    console.log('📋 [RESERVOIR] Cleared scatter reservoir');
+  }
   addPoint({ id, t, weight_g, gate }, nowMs) {
     if (!Number.isFinite(t)) return;
     if (nowMs - t > this.horizonMs) return;
@@ -224,49 +239,85 @@ async function getJSON(url) {
   return res.json();
 }
 
-// Persistent color tracking - keeps colors stable and reuses freed colors
-// Maps recipe name to color index in priority order
-let recipeToColorIndex = {}; // { recipeName: colorIndex }
+// Persistent color tracking - keeps colors stable based on slot/position
+// Maps gate to slot index to ensure consistent colors during transitions
+let slotToColor = {}; // { slotIndex: colorIndex }
 
-function buildColorMap(recipeNames, PALETTE, totalColor) {
+/**
+ * Build color map based on Active Recipes positions (slots)
+ * This ensures colors stay consistent even when recipe names change during transitions
+ * 
+ * @param {Array} activeRecipes - Array from backend { recipeName, gates } 
+ * @param {Object} transitionStartRecipes - Map of gate -> { recipeName } for transitioning gates
+ * @param {Array} recipeNames - List of recipe names currently visible (from SSE legend)
+ * @param {Array} PALETTE - Color palette
+ * @param {String} totalColor - Color for Total
+ */
+function buildColorMap(recipeNames, PALETTE, totalColor, activeRecipes = [], transitionStartRecipes = {}, programStartRecipes = []) {
   const map = {};
-  const activeRecipeSet = new Set(recipeNames);
+  const hasTransitioning = Object.keys(transitionStartRecipes).length > 0;
   
-  // Step 1: Clean up - remove inactive recipes and free their color indices
-  Object.keys(recipeToColorIndex).forEach((recipe) => {
-    if (!activeRecipeSet.has(recipe)) {
-      delete recipeToColorIndex[recipe]; // Free up the color
-    }
-  });
-  
-  // Step 2: Assign existing colors to recipes that already have them
-  recipeNames.forEach((recipe) => {
-    if (recipeToColorIndex[recipe] !== undefined) {
-      map[recipe] = PALETTE[recipeToColorIndex[recipe]];
-    }
-  });
-  
-  // Step 3: Find which color indices are currently in use
-  const usedIndices = new Set(Object.values(recipeToColorIndex));
-  
-  // Step 4: Assign colors to new recipes using first available index in priority order
-  recipeNames.forEach((recipe) => {
-    if (map[recipe]) return; // Already has a color
+  // DURING TRANSITIONS: Use programStartRecipes for ALL color assignments
+  // This freezes colors so nothing shifts until transitions complete
+  if (hasTransitioning && programStartRecipes.length > 0) {
+    // Build gate -> slot mapping from programStartRecipes
+    const gateToSlot = {};
+    programStartRecipes.forEach((recipe, slotIndex) => {
+      (recipe.gates || []).forEach(gate => {
+        gateToSlot[gate] = slotIndex;
+      });
+    });
     
-    // Find first available color index
-    for (let i = 0; i < PALETTE.length; i++) {
-      if (!usedIndices.has(i)) {
-        recipeToColorIndex[recipe] = i;
-        map[recipe] = PALETTE[i];
-        usedIndices.add(i); // Mark as used
-        break;
+    // Assign colors based on programStartRecipes positions (frozen)
+    programStartRecipes.forEach((recipe, slotIndex) => {
+      const color = PALETTE[slotIndex % PALETTE.length];
+      map[recipe.recipeName] = color;
+      slotToColor[slotIndex] = color;
+    });
+    
+    // For EDITED recipes (new name, same gates), inherit the slot's color
+    // This ensures 100_300 (replacing 100_175) gets purple, not a new color
+    activeRecipes.forEach((recipe) => {
+      if (!map[recipe.recipeName]) {
+        // Find which slot this recipe belongs to based on its gates
+        const recipeGates = recipe.gates || [];
+        let inheritedSlot = -1;
+        for (const gate of recipeGates) {
+          if (gateToSlot[gate] !== undefined) {
+            inheritedSlot = gateToSlot[gate];
+            break;
+          }
+        }
+        
+        if (inheritedSlot >= 0) {
+          // Inherit the color from the slot it replaced
+          map[recipe.recipeName] = PALETTE[inheritedSlot % PALETTE.length];
+        } else {
+          // Truly new recipe (added to empty gates) - assign next available color
+          const nextSlot = programStartRecipes.length + Object.keys(map).filter(k => k !== "Total").length;
+          map[recipe.recipeName] = PALETTE[nextSlot % PALETTE.length];
+        }
       }
+    });
+  } else {
+    // NO TRANSITIONS: Use activeRecipes positions
+    activeRecipes.forEach((recipe, slotIndex) => {
+      const color = PALETTE[slotIndex % PALETTE.length];
+      map[recipe.recipeName] = color;
+      slotToColor[slotIndex] = color;
+    });
+  }
+  
+  // For any recipe names in recipeNames that don't have a color yet
+  recipeNames.forEach((recipeName, idx) => {
+    if (!map[recipeName]) {
+      map[recipeName] = PALETTE[idx % PALETTE.length];
     }
   });
   
-  // Only add "Total" if there are active recipes
-  if (recipeNames.length > 0) {
-    map["Total"] = totalColor; // Use beige/green for Total
+  // Add "Total" if there are any recipes
+  if (recipeNames.length > 0 || activeRecipes.length > 0 || hasTransitioning) {
+    map["Total"] = totalColor;
   }
   
   return map;
@@ -472,6 +523,11 @@ export function useDashboardData() {
   // LIVE scatter reservoir + persistence
   const reservoirRef = useRef(null);
   const lastPersistRef = useRef(0);
+  
+  // Track current program start time for filtering reject data
+  // Use both state (for useMemo dependency) and ref (for immediate access in callbacks)
+  const [programStartTime, setProgramStartTime] = useState(null);
+  const programStartTimeRef = useRef(null);
 
   // ---------- Fetch runtime configuration ----------
   useEffect(() => {
@@ -632,21 +688,37 @@ export function useDashboardData() {
         });
         setM3ByRecipe(m3ByRecipe);
 
-        // Build combined data
+        // Build combined data, filtering rejects based on program start time
         const combinedData = (throughputData?.total || []).map(r => {
           const giveawayRow = (giveawayData?.total || []).find(g => g.t === r.t);
           const piecesProcessedRow = (piecesProcessedData?.total || []).find(p => p.t === r.t);
           const weightProcessedRow = (weightProcessedData?.total || []).find(w => w.t === r.t);
           const rejectsRow = (rejectsData || []).find(re => re.t === r.t);
+          
+          // Filter rejects: zero out data from before current program start (live mode only)
+          let rejectsPerMin = rejectsRow?.v || 0;
+          let totalRejectsCount = rejectsRow?.total_rejects_count || 0;
+          let totalRejectsWeightG = rejectsRow?.total_rejects_weight_g || 0;
+          
+          if (mode === 'live' && programStartTimeRef.current) {
+            const itemTime = typeof r.t === 'number' ? r.t : new Date(r.t).getTime();
+            if (itemTime < programStartTimeRef.current) {
+              // Data from before current program - zero out rejects
+              rejectsPerMin = 0;
+              totalRejectsCount = 0;
+              totalRejectsWeightG = 0;
+            }
+          }
+          
           return {
             t: r.t,
             batches_min: r.v || 0,
             giveaway_pct: giveawayRow?.v || 0,
             pieces_processed: piecesProcessedRow?.v || 0,
             weight_processed_g: weightProcessedRow?.v || 0,
-            rejects_per_min: rejectsRow?.v || 0,
-            total_rejects_count: rejectsRow?.total_rejects_count || 0,
-            total_rejects_weight_g: rejectsRow?.total_rejects_weight_g || 0
+            rejects_per_min: rejectsPerMin,
+            total_rejects_count: totalRejectsCount,
+            total_rejects_weight_g: totalRejectsWeightG
           };
         });
         setM3Combined(combinedData);
@@ -736,8 +808,14 @@ export function useDashboardData() {
         // Extract unique recipes from SQLite assignments (SOURCE OF TRUTH)
         const activeRecipes = Array.from(new Set(Object.values(assignMap).filter(Boolean)));
         
-        // Build color map ONLY from SQLite assignments
-        setColorMap(buildColorMap(activeRecipes, PALETTE, TOTAL_COLOR));
+        // Build color map - use merge strategy to preserve transitioning recipes
+        const newColorMap = buildColorMap(activeRecipes, PALETTE, TOTAL_COLOR);
+        setColorMap(prev => {
+          // Merge: keep existing colors (including transitioning recipes), add/update new ones
+          const merged = { ...prev, ...newColorMap };
+          console.log('[DATA FETCH] colorMap update - prev keys:', Object.keys(prev), 'new keys:', Object.keys(newColorMap), 'merged keys:', Object.keys(merged));
+          return merged;
+        });
         
         // ========== FILTER M3 DATA ==========
         // Only show recipes that are in SQLite assignments
@@ -842,8 +920,34 @@ export function useDashboardData() {
 
     const onTick = async (ev) => {
       try {
-        const { ts, legend, overlay } = JSON.parse(ev.data);
+        const { 
+          ts, legend, overlay, programId, 
+          programStartTime: tickProgramStartTime, 
+          machineState: tickMachineState,
+          activeRecipes: tickActiveRecipes,
+          transitionStartRecipes: tickTransitionStartRecipes,
+          programStartRecipes: tickProgramStartRecipes,
+        } = JSON.parse(ev.data);
         const to = new Date(ts);
+        
+        // Update program start time from tick (in case we missed program_change event)
+        // Only update if running and we have a valid programStartTime
+        if (tickMachineState === 'running' && tickProgramStartTime) {
+          const newStartTime = new Date(tickProgramStartTime).getTime();
+          // Only update if different from current (to avoid unnecessary re-renders)
+          if (newStartTime !== programStartTimeRef.current) {
+            console.log(`📋 [TICK] Updating programStartTime from tick: ${tickProgramStartTime} (programId: ${programId})`);
+            programStartTimeRef.current = newStartTime;
+            setProgramStartTime(newStartTime);
+          }
+        } else if (tickMachineState === 'idle' || tickMachineState === 'paused') {
+          // Clear program start time if not running
+          if (programStartTimeRef.current !== null) {
+            console.log(`📋 [TICK] Clearing programStartTime (machine state: ${tickMachineState})`);
+            programStartTimeRef.current = null;
+            setProgramStartTime(null);
+          }
+        }
         
         // Update current time every 60 seconds only (for M3/M4 charts)
         const now = Date.now();
@@ -859,10 +963,36 @@ export function useDashboardData() {
         });
         setAssignmentsByGate(assignMap);
         
-        // IMPORTANT: Update colorMap immediately when assignments change (for instant color updates)
-        const activeRecipes = Array.from(new Set(Object.values(assignMap).filter(Boolean)));
-        if (activeRecipes.length > 0) {
-          setColorMap(buildColorMap(activeRecipes, PALETTE, TOTAL_COLOR));
+        // IMPORTANT: Build colorMap from activeRecipes (NEW recipes) for chart legend
+        // This ensures charts show NEW recipe names even during transition
+        // Gate annotations will show OLD recipe (from assignMap/legend)
+        const newRecipeNames = (tickActiveRecipes || []).map(r => r.recipeName).filter(Boolean);
+        const hasTransitioning = Object.keys(tickTransitionStartRecipes || {}).length > 0;
+        
+        // Build colorMap if there are active recipes OR transitioning recipes
+        if (newRecipeNames.length > 0 || hasTransitioning) {
+          // Use activeRecipes for colorMap - these are the NEW recipes
+          // buildColorMap also adds transitioning recipes from transitionStartRecipes
+          const newColorMap = buildColorMap(newRecipeNames, PALETTE, TOTAL_COLOR, tickActiveRecipes || [], tickTransitionStartRecipes || {}, tickProgramStartRecipes || []);
+          console.log('[SSE TICK] colorMap update - newRecipes:', newRecipeNames, 'newColorMap keys:', Object.keys(newColorMap));
+          setColorMap(prev => {
+            // Merge: keep existing colors, add/update new ones
+            const merged = { ...prev };
+            Object.entries(newColorMap).forEach(([key, color]) => {
+              merged[key] = color;
+            });
+            // Only remove old recipes when there are NO transitions
+            // During transitions, keep all colors frozen
+            if (!hasTransitioning) {
+              Object.keys(merged).forEach(key => {
+                if (key !== "Total" && !newColorMap[key]) {
+                  delete merged[key];
+                }
+              });
+            }
+            console.log('[SSE TICK] colorMap merged - transitioning:', hasTransitioning, 'keys:', Object.keys(merged));
+            return merged;
+          });
         }
         
         // Use overlay from SSE (real-time M2 data)
@@ -930,6 +1060,44 @@ export function useDashboardData() {
     };
     es.addEventListener("overlay", onOverlay);
 
+    // Program change event: track program start time
+    const onProgramChange = (ev) => {
+      try {
+        const d = JSON.parse(ev.data); // { action: 'start'|'stop'|'recipe_change', programId?, ts }
+        console.log(`📋 [PROGRAM CHANGE] Received event:`, d);
+        
+        if (d.action === 'start' || d.action === 'recipe_change') {
+          // New program starting - track its start time
+          const startTs = new Date(d.ts).getTime();
+          console.log(`📋 [PROGRAM CHANGE] Setting programStartTime to ${startTs} (${new Date(startTs).toISOString()})`);
+          programStartTimeRef.current = startTs;  // Update ref immediately
+          setProgramStartTime(startTs);  // Update state for re-render
+          
+          // NOTE: Don't clear chart data here!
+          // The colorMap is built from activeRecipes (new recipes), so:
+          // - Old recipe data stays in M3ByRecipe but won't be shown (not in colorMap)
+          // - New recipes will naturally appear as data flows in
+          // This keeps graphs stable and only shows data for currently active recipes
+        } else if (d.action === 'stop') {
+          // Program stopped - clear the start time (no active program)
+          console.log(`📋 [PROGRAM CHANGE] Clearing programStartTime (was: ${programStartTimeRef.current})`);
+          programStartTimeRef.current = null;  // Update ref immediately
+          setProgramStartTime(null);  // Update state for re-render
+        }
+        
+        // Reset rejects to 0 (new program = new reject tracking)
+        setM3Combined(prev => prev.map(item => ({
+          ...item,
+          rejects_per_min: 0,
+          total_rejects_count: 0,
+          total_rejects_weight_g: 0
+        })));
+      } catch (e) {
+        console.error("SSE program_change handling failed:", e);
+      }
+    };
+    es.addEventListener("program_change", onProgramChange);
+
     // Smooth renderer: flush reservoir → React state every 250 ms + persist ~1s
     const flushTimer = setInterval(() => {
       const now = Date.now();
@@ -953,6 +1121,7 @@ export function useDashboardData() {
       es.removeEventListener("piece", onPiece);
       es.removeEventListener("gate", onGate);
       es.removeEventListener("overlay", onOverlay);
+      es.removeEventListener("program_change", onProgramChange);
       es.close();
       clearInterval(flushTimer);
       clearInterval(qTimer);
@@ -976,10 +1145,29 @@ export function useDashboardData() {
     () => toWeightProcessedSeries({ m3ByRecipe, m3Combined, colorMap, xTicks }),
     [m3ByRecipe, m3Combined, colorMap, xTicks]
   );
-  const rejects = useMemo(
-    () => toRejectsSeries({ m3Combined, color: colorMap["Total"] }),
-    [m3Combined, colorMap]
-  );
+  const rejects = useMemo(() => {
+    // Reject data is already filtered at fetch time (when storing in m3Combined)
+    // This useMemo just converts to Nivo format
+    // Additional filtering here as a safety net in case data wasn't filtered at fetch time
+    let filteredM3 = m3Combined;
+    
+    if (mode === 'live' && programStartTime) {
+      filteredM3 = m3Combined.map(item => {
+        const itemTime = typeof item.t === 'number' ? item.t : new Date(item.t).getTime();
+        if (itemTime < programStartTime) {
+          return {
+            ...item,
+            rejects_per_min: 0,
+            total_rejects_count: 0,
+            total_rejects_weight_g: 0
+          };
+        }
+        return item;
+      });
+    }
+    
+    return toRejectsSeries({ m3Combined: filteredM3, color: colorMap["Total"] });
+  }, [m3Combined, colorMap, programStartTime, mode]);
   const scatter = useMemo(() => toScatterSeries(m1Recent), [m1Recent]);
   const pies = useMemo(() => toPieSlices(m4Breakdown, colorMap), [m4Breakdown, colorMap]);
 

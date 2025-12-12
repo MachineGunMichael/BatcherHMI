@@ -5,6 +5,41 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 
 const influx = require('./services/influx');
+const db = require('./db/sqlite');
+
+// --- Database migrations (run at startup) ---
+function runMigrations() {
+  try {
+    // Check which columns exist in machine_state
+    const columns = db.prepare(`PRAGMA table_info(machine_state)`).all();
+    const hasTransitioningGates = columns.some(c => c.name === 'transitioning_gates');
+    const hasTransitionStartRecipes = columns.some(c => c.name === 'transition_start_recipes');
+    const hasTransitionOldProgramId = columns.some(c => c.name === 'transition_old_program_id');
+    
+    if (!hasTransitioningGates) {
+      console.log('[Migration] Adding transitioning_gates column to machine_state...');
+      db.prepare(`ALTER TABLE machine_state ADD COLUMN transitioning_gates TEXT DEFAULT '[]'`).run();
+      console.log('[Migration] ✅ Added transitioning_gates column');
+    }
+    
+    if (!hasTransitionStartRecipes) {
+      console.log('[Migration] Adding transition_start_recipes column to machine_state...');
+      db.prepare(`ALTER TABLE machine_state ADD COLUMN transition_start_recipes TEXT DEFAULT '{}'`).run();
+      console.log('[Migration] ✅ Added transition_start_recipes column');
+    }
+    
+    if (!hasTransitionOldProgramId) {
+      console.log('[Migration] Adding transition_old_program_id column to machine_state...');
+      db.prepare(`ALTER TABLE machine_state ADD COLUMN transition_old_program_id INTEGER DEFAULT NULL`).run();
+      console.log('[Migration] ✅ Added transition_old_program_id column');
+    }
+  } catch (err) {
+    console.error('[Migration] Error running migrations:', err);
+  }
+}
+
+// Run migrations before starting server
+runMigrations();
 
 const authRoutes = require('./routes/auth');
 const programRoutes = require('./routes/programs');

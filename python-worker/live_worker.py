@@ -270,7 +270,7 @@ def write_m3_per_recipe_sqlite(sqlite_conn, timestamp, recipe_name, program_id,
     """Write M3 per-recipe KPI to SQLite"""
     ts_str = timestamp.isoformat()
     sqlite_conn.execute("""
-        INSERT INTO kpi_minute_recipes (
+        INSERT OR REPLACE INTO kpi_minute_recipes (
             timestamp, recipe_name, program_id, batches_min, giveaway_pct,
             pieces_processed, weight_processed_g, rejects_per_min,
             total_rejects_count, total_rejects_weight_g
@@ -286,7 +286,7 @@ def write_m3_combined_sqlite(sqlite_conn, timestamp, batches_min, giveaway_pct,
     """Write M3 combined (total) KPI to SQLite"""
     ts_str = timestamp.isoformat()
     sqlite_conn.execute("""
-        INSERT INTO kpi_minute_combined (
+        INSERT OR REPLACE INTO kpi_minute_combined (
             timestamp, batches_min, giveaway_pct, pieces_processed,
             weight_processed_g, rejects_per_min, total_rejects_count,
             total_rejects_weight_g
@@ -345,6 +345,8 @@ class LiveWorker:
         # Live state
         self.gate_states: Dict[int, GateState] = {}
         self.last_processed_time = None
+        self.processed_piece_ids: set = set()  # Deduplicate pieces across polls
+        self.processed_minutes: set = set()  # Track processed minutes to prevent duplicates
         self.current_minute = None
         self.minute_accumulator = None
         
@@ -522,8 +524,17 @@ class LiveWorker:
                 self.paused = False
                 
             elif old_state == 'paused':
-                # Resuming from pause
-                print(f"   ▶️  Resuming program {self.program_id}")
+                # Resuming from pause - check if program changed (recipes were edited)
+                new_program_id = state_data.get('currentProgramId')
+                active_recipes = state_data.get('activeRecipes', [])
+                
+                if new_program_id and new_program_id != self.program_id:
+                    # Program changed while paused - start fresh with new program
+                    print(f"   ▶️  Recipes changed while paused - starting new program {new_program_id}")
+                    self.start_program(new_program_id, active_recipes)
+                else:
+                    # Same program - just resume
+                    print(f"   ▶️  Resuming program {self.program_id}")
                 self.paused = False
         
         elif new_state == 'paused':
@@ -540,8 +551,20 @@ class LiveWorker:
             self.identify_gates_to_finish(state_data)
         
         elif new_state == 'idle':
-            # Stopped/reset - clear all gate assignments
-            print(f"   ⏹️  Machine stopped - clearing gate assignments")
+            # Stopped/reset - flush any pending KPIs and clear state
+            print(f"   ⏹️  Machine stopped - flushing KPIs and clearing state")
+            
+            # Flush any pending KPIs before clearing state
+            if self.minute_accumulator and self.minute_accumulator.has_data():
+                print(f"   💾 Flushing pending KPIs before stop...")
+                self.process_minute_kpis()
+            
+            # Reset reject counters
+            self.total_rejects_count = 0
+            self.total_rejects_weight = 0.0
+            print(f"   🔄 Reset reject counters")
+            
+            # Clear state
             self.gate_to_recipe.clear()
             self.program_id = None
             self.paused = False
@@ -565,7 +588,8 @@ class LiveWorker:
             # Find recipe_id from name
             recipe_id = self.get_recipe_id_by_name(recipe_name)
             if recipe_id:
-                self.gate_to_recipe[gate] = recipe_id
+                # Ensure gate is integer for consistent lookup
+                self.gate_to_recipe[int(gate)] = recipe_id
             else:
                 print(f"   ⚠️  Recipe not found in database: {recipe_name}")
         
@@ -587,6 +611,17 @@ class LiveWorker:
         
         # Reset gate dwell time tracking
         self.last_batch_time = {}
+        
+        # Reset reject counters for new program
+        self.total_rejects_count = 0
+        self.total_rejects_weight = 0.0
+        print(f"   🔄 Reset reject counters for program {program_id}")
+        
+        # Reset piece deduplication set for new program
+        self.processed_piece_ids.clear()
+        
+        # Reset processed minutes set for new program
+        self.processed_minutes: set = set()
     
     def identify_gates_to_finish(self, state_data):
         """Identify which gates have in-progress batches during transition"""
@@ -675,6 +710,18 @@ class LiveWorker:
                     self.last_batch_time.clear()
                     self.m4_cumulative.clear()
                     self.last_batch_id_processed = 0
+                    self.processed_minutes.clear()
+                    self.processed_piece_ids.clear()
+                    
+                    # FLUSH pending KPIs for the OLD program before resetting
+                    if self.minute_accumulator and self.minute_accumulator.has_data():
+                        print(f"   💾 Flushing pending KPIs for old program before transition...")
+                        self.process_minute_kpis()
+                    
+                    # Reset reject counters for new program
+                    self.total_rejects_count = 0
+                    self.total_rejects_weight = 0.0
+                    print(f"   🔄 Reset reject counters for new program")
                     
                     # Reset minute accumulator for new program
                     self.current_minute = datetime.now(timezone.utc).replace(second=0, microsecond=0)
@@ -693,6 +740,10 @@ class LiveWorker:
                 self.machine_state = 'idle'
                 self.gate_to_recipe.clear()
                 self.gate_states.clear()
+                # Reset reject counters for next program
+                self.total_rejects_count = 0
+                self.total_rejects_weight = 0.0
+                print(f"   🔄 Reset reject counters")
                 print(f"   ⏱️ Total stop transition took {(_time.time() - transition_start) * 1000:.0f}ms")
         
         # Reset transition state
@@ -1458,14 +1509,17 @@ class LiveWorker:
             return []
     
     def poll_new_pieces(self) -> List[PieceData]:
-        """Poll InfluxDB for new pieces"""
+        """Poll InfluxDB for new pieces with lookback to catch delayed writes"""
         try:
-            if self.last_processed_time is None:
-                from_time = datetime.now(timezone.utc) - timedelta(seconds=5)
-            else:
-                from_time = self.last_processed_time
-            
             to_time = datetime.now(timezone.utc)
+            
+            # Use 3-second lookback to catch pieces that were written with latency
+            # We deduplicate using piece_id to avoid processing the same piece twice
+            if self.last_processed_time is None:
+                from_time = to_time - timedelta(seconds=5)
+            else:
+                # Look back 3 seconds from last poll to catch delayed writes
+                from_time = self.last_processed_time - timedelta(seconds=3)
             
             sql = f"""
                 SELECT time, weight_g, gate, piece_id
@@ -1485,6 +1539,13 @@ class LiveWorker:
                 num_rows = len(data_dict['time'])
                 
                 for i in range(num_rows):
+                    piece_id_val = data_dict.get('piece_id', [None] * num_rows)[i]
+                    piece_id_str = str(piece_id_val) if piece_id_val is not None else None
+                    
+                    # Skip if we've already processed this piece (deduplication)
+                    if piece_id_str and piece_id_str in self.processed_piece_ids:
+                        continue
+                    
                     timestamp = data_dict['time'][i]
                     if isinstance(timestamp, str):
                         timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
@@ -1498,16 +1559,24 @@ class LiveWorker:
                         timestamp = timestamp.replace(tzinfo=timezone.utc)
                     
                     gate_val = data_dict.get('gate', [0] * num_rows)[i]
-                    piece_id_val = data_dict.get('piece_id', [None] * num_rows)[i]
                     
                     pieces.append(PieceData(
                         timestamp=timestamp,
                         weight_g=float(data_dict['weight_g'][i]),
                         gate=int(gate_val) if gate_val is not None else 0,
-                        piece_id=str(piece_id_val) if piece_id_val is not None else None
+                        piece_id=piece_id_str
                     ))
+                    
+                    # Mark this piece as processed
+                    if piece_id_str:
+                        self.processed_piece_ids.add(piece_id_str)
             
             self.last_processed_time = to_time
+            
+            # Limit memory by keeping only recent piece IDs (last 5000)
+            if len(self.processed_piece_ids) > 5000:
+                self.processed_piece_ids = set(list(self.processed_piece_ids)[-2500:])
+            
             return pieces
             
         except Exception as e:
@@ -1636,8 +1705,17 @@ class LiveWorker:
                 piece_count=batch['pieces']
             )
             
-            # Initialize new minute if needed (or re-initialize if None after processing)
-            if self.minute_accumulator is None or minute_bucket > self.current_minute:
+            # Check if we need to roll over to a new minute
+            if self.minute_accumulator is None:
+                # First batch - initialize accumulator
+                self.current_minute = minute_bucket
+                self.minute_accumulator = MinuteAccumulator(minute_start=minute_bucket)
+            elif minute_bucket > self.current_minute:
+                # Minute rolled over - PROCESS the old accumulator BEFORE creating new one
+                # This prevents data loss when batches arrive in a new minute
+                if self.minute_accumulator and self.minute_accumulator.has_data():
+                    print(f"   🔄 Minute rollover in batch processing ({self.current_minute.strftime('%H:%M')} → {minute_bucket.strftime('%H:%M')})")
+                    self.process_minute_kpis()
                 self.current_minute = minute_bucket
                 self.minute_accumulator = MinuteAccumulator(minute_start=minute_bucket)
             
@@ -1662,9 +1740,9 @@ class LiveWorker:
             self.current_minute = minute_bucket
             self.minute_accumulator = MinuteAccumulator(minute_start=minute_bucket)
         elif minute_bucket > self.current_minute:
-            # Minute rolled over - PROCESS the old accumulator BEFORE creating new one
-            # This prevents data loss when pieces arrive with timestamps in the next minute
-            if self.minute_accumulator.has_data():
+            # Minute rolled over - process old accumulator BEFORE creating new one
+            # This ensures data is not lost when pieces cross minute boundaries
+            if self.minute_accumulator and self.minute_accumulator.has_data():
                 self.process_minute_kpis()
             self.current_minute = minute_bucket
             self.minute_accumulator = MinuteAccumulator(minute_start=minute_bucket)
@@ -1680,12 +1758,18 @@ class LiveWorker:
         """
         Calculate M3/M4 KPIs for completed minute.
         Delegates to separate M3 and M4 functions.
-        Called ONLY from main loop (once per minute) to prevent duplicates.
         """
         if not self.minute_accumulator:
             return
         
         minute_time = self.minute_accumulator.minute_start
+        
+        # Check if this minute was already processed (prevents duplicate writes)
+        minute_key = minute_time.isoformat()
+        if hasattr(self, 'processed_minutes') and minute_key in self.processed_minutes:
+            print(f"   ⏭️  Minute {minute_time.strftime('%H:%M')} already processed, skipping")
+            return
+        
         print(f"📊 Processing KPIs for {minute_time.strftime('%H:%M')}")
         
         try:
@@ -1699,6 +1783,10 @@ class LiveWorker:
             print(f"⚠️  Error processing KPIs: {e}")
             import traceback
             traceback.print_exc()
+        
+        # Mark this minute as processed to prevent duplicates
+        if hasattr(self, 'processed_minutes'):
+            self.processed_minutes.add(minute_key)
         
         # Clear accumulator for next minute
         self.minute_accumulator = None
@@ -1741,7 +1829,7 @@ class LiveWorker:
                     pieces_for_recipe.extend(acc.pieces_by_gate.get(gate, []))
                     batches_for_recipe.extend(acc.batches_by_gate.get(gate, []))
                 
-                # Count metrics (always track, even without batches)
+                # Count metrics from actual piece data (with 3s lookback + deduplication)
                 pieces_count = len(pieces_for_recipe)
                 weight_sum = sum(p.weight_g for p in pieces_for_recipe)
                 batch_count = len(batches_for_recipe)
@@ -2134,6 +2222,10 @@ class LiveWorker:
                 # Poll for new pieces for M3/M4 calculations only
                 # Batch detection now happens in real-time in the backend!
                 pieces = self.poll_new_pieces()
+                
+                # Sort by timestamp to ensure chronological processing
+                # (lookback can return pieces slightly out of order)
+                pieces.sort(key=lambda p: p.timestamp)
                 
                 for piece in pieces:
                     self.process_piece(piece)

@@ -217,8 +217,30 @@ class RecipeManager {
 
   /**
    * Get recipe spec for a gate
+   * IMPORTANT: For transitioning gates, returns the ORIGINAL recipe (not the new one)
+   * This ensures pieces are assigned based on the recipe that's actually running
    */
   getRecipeForGate(gate) {
+    const machineState = require('../services/machineState');
+    const state = machineState.getState();
+    
+    // Check if this gate is transitioning - if so, use the ORIGINAL recipe
+    if (state.transitioningGates?.includes(gate) && state.transitionStartRecipes?.[gate]) {
+      const originalRecipe = state.transitionStartRecipes[gate];
+      // Get the recipe spec using the ORIGINAL recipe ID
+      if (originalRecipe.recipeId) {
+        const spec = this.recipes.get(originalRecipe.recipeId);
+        if (spec) {
+          return spec;
+        }
+      }
+      // Fallback: parse from recipe name if ID lookup fails
+      if (originalRecipe.recipeName) {
+        return this.parseRecipeName(originalRecipe.recipeId, originalRecipe.recipeName);
+      }
+    }
+    
+    // Normal case: use current assignment
     const recipeId = this.gateAssignments.get(gate);
     if (!recipeId) return null;
     return this.recipes.get(recipeId);
@@ -314,13 +336,26 @@ class RecipeManager {
     // Clear warned gates on reload (new program may have different gate configs)
     this.warnedGates.clear();
     
-    // Reset gates whose recipe changed or became inactive
+    // Get transitioning gates - DO NOT reset these!
+    // They should keep their pieces/weight until batch completes
+    const machineState = require('../services/machineState');
+    const transitioningGates = machineState.getTransitioningGates() || [];
+    
+    // Only reset gates that:
+    // 1. Had a recipe change AND
+    // 2. Are NOT in the transitioning list
     for (let g = gates.GATE_MIN; g <= gates.GATE_MAX; g++) {
       const oldRecipe = oldAssignments.get(g);
       const newRecipe = this.gateAssignments.get(g);
       
       if (oldRecipe !== newRecipe) {
-        // Recipe changed or gate became inactive/active
+        // Check if this gate is transitioning - if so, DON'T reset it!
+        if (transitioningGates.includes(g)) {
+          console.log(`⏳ Gate ${g}: Recipe changed (${oldRecipe} → ${newRecipe}) - NOT resetting (transitioning)`);
+          continue;
+        }
+        
+        // Recipe changed or gate became inactive/active - safe to reset
         gates.resetGate(g);
         if (oldRecipe && newRecipe) {
           console.log(`🔄 Gate ${g}: Recipe changed (${oldRecipe} → ${newRecipe}) - reset to 0`);

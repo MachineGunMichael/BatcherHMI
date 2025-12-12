@@ -171,19 +171,75 @@ router.post("/piece", verifyPlcSecret, async (req, res) => {
       if (result.batchComplete) {
         console.log(`🎉 [BATCH COMPLETE] Gate ${g}: ${result.pieces} pieces, ${result.grams.toFixed(1)}g → RESET`);
         
-        // ✅ Write batch completion to SQLite (single source of truth)
+        // ✅ Check if this gate is transitioning
+        const transitioningGates = machineState.getTransitioningGates();
+        const isTransitioning = transitioningGates.includes(g);
+        
+        // ⚠️ IMPORTANT: Capture old program ID BEFORE any transition state changes
+        // This ensures the batch goes to the correct (old) program
+        const oldProgramIdForBatch = machineState.getTransitionOldProgramId();
+        
+        // Get the appropriate recipe for stats
+        let recipeForStats = recipeManager.getRecipeForGate(g);
+        let recipeIdForStats = recipeForStats?.id || null;
+        let recipeName = recipeForStats?.name || 'unknown';
+        
+        // For transitioning gates, also capture the original recipe info BEFORE clearing
+        let originalRecipeInfo = null;
+        if (isTransitioning) {
+          const state = machineState.getState();
+          originalRecipeInfo = state.transitionStartRecipes?.[g];
+          if (originalRecipeInfo) {
+            recipeIdForStats = originalRecipeInfo.recipeId;
+            recipeName = originalRecipeInfo.recipeName;
+          }
+        }
+        
+        // ✅ FIRST: Write batch completion to SQLite (before any state changes)
+        let programIdForBatch;
         try {
-          const recipe = recipeManager.getRecipeForGate(g);
-          const programId = getCurrentProgramId();
+          if (isTransitioning && oldProgramIdForBatch) {
+            programIdForBatch = oldProgramIdForBatch;
+            console.log(`   📝 Writing batch to OLD program ${programIdForBatch} (gate ${g} transitioning, recipe: ${recipeName})`);
+          } else {
+            programIdForBatch = getCurrentProgramId();
+          }
           
           db.prepare(`
             INSERT INTO batch_completions (gate, completed_at, pieces, weight_g, recipe_id, program_id)
             VALUES (?, ?, ?, ?, ?, ?)
-          `).run(g, tsIso, result.pieces, result.grams, recipe?.id || null, programId);
+          `).run(g, tsIso, result.pieces, result.grams, recipeIdForStats, programIdForBatch);
           
-          console.log(`   📝 Batch completion written to SQLite (recipe: ${recipe?.name || 'unknown'})`);
+          console.log(`   📝 Batch completion written to SQLite (recipe: ${recipeName}, recipeId: ${recipeIdForStats}, program: ${programIdForBatch})`);
         } catch (err) {
           console.error(`   ❌ Failed to write batch completion to SQLite:`, err);
+        }
+        
+        // ✅ THEN: Complete the gate transition (this clears transition state for this gate)
+        if (isTransitioning) {
+          console.log(`   🔄 [TRANSITION] Gate ${g} completed batch with original recipe: ${recipeName}`);
+          
+          // Complete this gate's transition (removes it from transitioning list)
+          machineState.completeGateTransition(g);
+          
+          // Reload recipe manager to update this gate to new recipe
+          recipeManager.loadGateAssignments();
+          
+          // Check if ALL transitions are now complete
+          if (!machineState.hasTransitioningGates()) {
+            console.log(`   ✅ [TRANSITION COMPLETE] All gates have finished their batches`);
+            
+            // Finalize the old program's stats
+            const { handleAllTransitionsComplete } = require('./machine');
+            const finalizeResult = handleAllTransitionsComplete();
+            if (finalizeResult.success) {
+              console.log(`   ✅ Old program ${oldProgramIdForBatch} finalized with all batch data`);
+            } else {
+              console.error(`   ❌ Failed to finalize old program:`, finalizeResult.error);
+            }
+            
+            broadcast("transition_complete", { ts: tsIso });
+          }
         }
         
         // Broadcast reset (pieces=0, grams=0)

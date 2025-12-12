@@ -468,16 +468,26 @@ function createMachineStateSchema() {
       id INTEGER PRIMARY KEY CHECK (id = 1),
       state TEXT NOT NULL DEFAULT 'idle' CHECK (state IN ('idle', 'running', 'paused', 'transitioning')),
       current_program_id INTEGER,
-      active_recipes TEXT, -- JSON array of recipe objects
+      active_recipes TEXT, -- JSON array of recipe objects (current target)
       program_start_recipes TEXT, -- JSON snapshot for comparison
+      transitioning_gates TEXT, -- JSON array of gate numbers currently transitioning
+      transition_start_recipes TEXT, -- JSON map {gate: recipe} for original recipes at transition start
       last_updated TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (current_program_id) REFERENCES programs(id) ON DELETE SET NULL
     );
     
     -- Ensure singleton row exists
-    INSERT OR IGNORE INTO machine_state (id, state, active_recipes, program_start_recipes)
-    VALUES (1, 'idle', '[]', '[]');
+    INSERT OR IGNORE INTO machine_state (id, state, active_recipes, program_start_recipes, transitioning_gates, transition_start_recipes)
+    VALUES (1, 'idle', '[]', '[]', '[]', '{}');
   `);
+  
+  // Add new columns if they don't exist (for existing databases)
+  if (!columnExists('machine_state', 'transitioning_gates')) {
+    run(`ALTER TABLE machine_state ADD COLUMN transitioning_gates TEXT DEFAULT '[]';`);
+  }
+  if (!columnExists('machine_state', 'transition_start_recipes')) {
+    run(`ALTER TABLE machine_state ADD COLUMN transition_start_recipes TEXT DEFAULT '{}';`);
+  }
   
   console.log('✅ Machine state schema created.');
 }

@@ -14,6 +14,8 @@ export function useMachineState() {
     currentProgramId: null,
     activeRecipes: [],
     programStartRecipes: [],
+    transitioningGates: [],
+    transitionStartRecipes: {},
     lastUpdated: null,
   });
   const [isConnected, setIsConnected] = useState(false);
@@ -105,6 +107,8 @@ export function useMachineState() {
     activeRecipes: machineState.activeRecipes,
     currentProgramId: machineState.currentProgramId,
     programStartRecipes: machineState.programStartRecipes,
+    transitioningGates: machineState.transitioningGates || [],
+    transitionStartRecipes: machineState.transitionStartRecipes || {},
     lastUpdated: machineState.lastUpdated,
     isConnected,
     error,

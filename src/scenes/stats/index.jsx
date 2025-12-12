@@ -1491,6 +1491,7 @@ const Stats = () => {
                       axisBottom={{
                         format: (value) => value.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
                         tickRotation: -45,
+                        tickValues: 5,
                         legend: '',
                         legendOffset: 0,
                         legendPosition: 'middle'
@@ -1536,6 +1537,7 @@ const Stats = () => {
                       axisBottom={{
                         format: (value) => value.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
                         tickRotation: -45,
+                        tickValues: 5,
                         legend: '',
                         legendOffset: 0,
                         legendPosition: 'middle'
@@ -1582,6 +1584,7 @@ const Stats = () => {
                       axisBottom={{
                         format: (value) => value.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
                         tickRotation: -45,
+                        tickValues: 5,
                         legend: '',
                         legendOffset: 0,
                         legendPosition: 'middle'

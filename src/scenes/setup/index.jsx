@@ -23,6 +23,7 @@ import { tokens } from "../../theme";
 import { useAppContext } from "../../context/AppContext";
 import api from "../../services/api";
 import useMachineState from "../../hooks/useMachineState";
+import { getSyncedAnimationStyle } from "../../utils/animationSync";
 
 const Setup = () => {
   const theme = useTheme();
@@ -89,12 +90,23 @@ const Setup = () => {
 
   // Machine control state
   // Machine state from backend via SSE
-  const {
-    state: backendMachineState,
+  const { 
+    state: backendMachineState, 
     activeRecipes: backendActiveRecipes,
     currentProgramId: backendProgramId,
     isConnected: machineConnected,
+    transitioningGates: backendTransitioningGates,
   } = useMachineState();
+  
+  // Track transitioning gates (for visual indicator and edit permissions)
+  const [transitioningGates, setTransitioningGates] = useState([]);
+  
+  // Sync transitioning gates from backend
+  useEffect(() => {
+    if (backendTransitioningGates !== undefined) {
+      setTransitioningGates(backendTransitioningGates);
+    }
+  }, [backendTransitioningGates]);
   
   // Local machine state (synced with backend)
   const [machineState, setMachineState] = useState("idle");
@@ -1255,13 +1267,30 @@ const Setup = () => {
 
         {/* Active Recipes - Below Assigned Recipes */}
         <Box mt={6}>
-          <Typography
-            variant="h4"
-            fontWeight="bold"
-            sx={{ mb: 2, color: colors.tealAccent[500] }}
-          >
-            Active Recipes
-          </Typography>
+          <Box display="flex" alignItems="center" gap={2} mb={2}>
+            <Typography
+              variant="h4"
+              fontWeight="bold"
+              sx={{ color: colors.tealAccent[500] }}
+            >
+              Active Recipes
+            </Typography>
+            {transitioningGates.length > 0 && (
+              <Typography
+                variant="body2"
+                sx={{
+                  color: theme.palette.action.disabled,
+                  backgroundColor: theme.palette.action.disabledBackground,
+                  border: `0.2px solid ${theme.palette.action.disabled}`,
+                  px: 1.5,
+                  py: 0.5,
+                  borderRadius: "4px",
+                }}
+              >
+                Gates {transitioningGates.join(", ")} completing batches.
+              </Typography>
+            )}
+          </Box>
 
           {activeRecipes.length === 0 ? (
             <Typography>No active recipes. Send recipes from "Assigned Recipes" to activate them.</Typography>
@@ -1338,19 +1367,29 @@ const Setup = () => {
                         </Box>
                         
                         {/* Gate assignments - square boxes */}
-                        {[1, 2, 3, 4, 5, 6, 7, 8].map(gate => (
-                          <Box 
-                            key={`${i}-${gate}`} 
-                            sx={{
-                              backgroundColor: recipe.gates.includes(gate) ? recipeColor : undefined,
-                              display: 'flex',
-                              alignItems: 'center',
-                              justifyContent: 'center',
-                              minHeight: '20px',
-                              height: '20px'
-                            }}
-                          />
-                        ))}
+                        {[1, 2, 3, 4, 5, 6, 7, 8].map(gate => {
+                          const isTransitioning = transitioningGates.includes(gate) && recipe.gates.includes(gate);
+                          return (
+                            <Box 
+                              key={`${i}-${gate}`} 
+                              sx={{
+                                backgroundColor: recipe.gates.includes(gate) ? recipeColor : undefined,
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                minHeight: '20px',
+                                height: '20px',
+                                // Pulsing animation for transitioning gates (uses synced timing)
+                                ...(isTransitioning && {
+                                  ...getSyncedAnimationStyle(),
+                                  border: `2px solid ${theme.palette.mode === 'dark' 
+                                    ? 'rgba(255, 255, 255, 0.5)' 
+                                    : 'rgba(0, 0, 0, 0.38)'}`,
+                                }),
+                              }}
+                            />
+                          );
+                        })}
                         
                         {/* Spacer column */}
                         <Box />
@@ -1383,47 +1422,81 @@ const Setup = () => {
                           </Typography>
                         </Box>
                         
-                        {/* Edit button */}
-                        <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '20px' }}>
-                          <Button
-                            size="small"
-                            onClick={() => handleEditActive(i)}
-                            disabled={machineState === "running"}
-                            sx={{ 
-                              color: colors.tealAccent[500],
-                              minWidth: 'auto',
-                              padding: '2px 8px',
-                              fontSize: '0.75rem',
-                              '&:hover': {
-                                backgroundColor: colors.tealAccent[500],
-                                color: '#fff',
-                              }
-                            }}
-                          >
-                            Edit
-                          </Button>
-                        </Box>
-
-                        {/* Remove button */}
-                        <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '20px' }}>
-                          <Button
-                            size="small"
-                            onClick={() => handleRemoveActiveRecipe(i)}
-                            disabled={machineState === "running"}
-                            sx={{ 
-                              color: colors.redAccent[500],
-                              minWidth: 'auto',
-                              padding: '2px 8px',
-                              fontSize: '0.75rem',
-                              '&:hover': {
-                                backgroundColor: colors.redAccent[500],
-                                color: '#fff',
-                              }
-                            }}
-                          >
-                            Remove
-                          </Button>
-                        </Box>
+                        {/* Edit and Remove buttons - or Transitioning text */}
+                        {(() => {
+                          const isRecipeTransitioning = recipe.gates.some(gate => transitioningGates.includes(gate));
+                          
+                          if (isRecipeTransitioning) {
+                            // Show "Transitioning" spanning both columns, centered
+                            return (
+                              <>
+                                <Box sx={{ 
+                                  p: 0.5, 
+                                  mr: 1.3,
+                                  display: 'flex', 
+                                  alignItems: 'center', 
+                                  justifyContent: 'center', 
+                                  minHeight: '20px',
+                                  gridColumn: 'span 2'
+                                }}>
+                                  <Typography 
+                                    variant="body2" 
+                                    sx={{ 
+                                      color: theme.palette.action.disabled,
+                                      fontSize: '0.75rem'
+                                    }}
+                                  >
+                                    TRANSITIONING
+                                  </Typography>
+                                </Box>
+                              </>
+                            );
+                          }
+                          
+                          // Show Edit and Remove buttons
+                          return (
+                            <>
+                              <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '20px' }}>
+                                <Button
+                                  size="small"
+                                  onClick={() => handleEditActive(i)}
+                                  disabled={machineState === "running"}
+                                  sx={{ 
+                                    color: colors.tealAccent[500],
+                                    minWidth: 'auto',
+                                    padding: '2px 8px',
+                                    fontSize: '0.75rem',
+                                    '&:hover': {
+                                      backgroundColor: colors.tealAccent[500],
+                                      color: '#fff',
+                                    }
+                                  }}
+                                >
+                                  Edit
+                                </Button>
+                              </Box>
+                              <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '20px' }}>
+                                <Button
+                                  size="small"
+                                  onClick={() => handleRemoveActiveRecipe(i)}
+                                  disabled={machineState === "running"}
+                                  sx={{ 
+                                    color: colors.redAccent[500],
+                                    minWidth: 'auto',
+                                    padding: '2px 8px',
+                                    fontSize: '0.75rem',
+                                    '&:hover': {
+                                      backgroundColor: colors.redAccent[500],
+                                      color: '#fff',
+                                    }
+                                  }}
+                                >
+                                  Remove
+                                </Button>
+                              </Box>
+                            </>
+                          );
+                        })()}
 
                         {/* Edit row - shown when editing */}
                         {editingActiveIndex === i && (

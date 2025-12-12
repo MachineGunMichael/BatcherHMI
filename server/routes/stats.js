@@ -178,37 +178,76 @@ router.get('/programs/:id/assignments', verifyToken, (req, res) => {
 /**
  * GET /api/stats/programs/:id/pieces-histogram
  * Get piece weight distribution histogram for a specific program from InfluxDB
+ * Uses pieces from start_ts to last batch completion (to match batch_completions totals)
  */
 router.get('/programs/:id/pieces-histogram', verifyToken, async (req, res) => {
   try {
     const programId = parseInt(req.params.id);
     
-    // Get program time range from SQLite
+    // Get program time range and total pieces from batch completions
     const stats = db.prepare(`
       SELECT start_ts, end_ts 
       FROM program_stats 
       WHERE program_id = ?
     `).get(programId);
 
-    if (!stats || !stats.start_ts || !stats.end_ts) {
+    if (!stats || !stats.start_ts) {
       return res.status(404).json({ message: 'Program time range not found' });
     }
+    
+    // Get the last batch completion time from batch_completions
+    const batchInfo = db.prepare(`
+      SELECT 
+        MAX(completed_at) as last_batch_time,
+        SUM(pieces) as total_batched_pieces
+      FROM batch_completions 
+      WHERE program_id = ?
+    `).get(programId);
+    
+    // Get total expected pieces (batched + rejected) from program_stats
+    const programStats = db.prepare(`
+      SELECT total_items_batched, total_items_rejected
+      FROM program_stats WHERE program_id = ?
+    `).get(programId);
+    
+    const totalBatched = programStats?.total_items_batched || batchInfo?.total_batched_pieces || 0;
+    const totalRejected = programStats?.total_items_rejected || 0;
+    const expectedPieces = totalBatched + totalRejected;
+    
+    // Use MAX(end_ts, last_batch_time) to include:
+    // - Rejected pieces (up to end_ts when transition started)
+    // - Batched pieces (up to last_batch_time, which may be after end_ts for transition batches)
+    const lastBatchTime = batchInfo?.last_batch_time;
+    const endTs = stats.end_ts;
+    let endTime = endTs;
+    if (lastBatchTime && new Date(lastBatchTime) > new Date(endTs)) {
+      endTime = lastBatchTime;
+    }
+    
+    console.log(`[Histogram] Program ${programId}: start=${stats.start_ts}, end=${endTime}, expectedPieces=${expectedPieces} (batched: ${totalBatched}, rejected: ${totalRejected})`);
 
-    // Query InfluxDB for all pieces in the time range
+    // Query InfluxDB for pieces from start to last batch completion
     const influx = require('../services/influx');
     const query = `
       SELECT weight_g
       FROM pieces
       WHERE time >= '${stats.start_ts}' 
-        AND time <= '${stats.end_ts}'
+        AND time <= '${endTime}'
     `;
 
     const iterator = await influx.query(query);
     
     // Convert result to JavaScript array
-    const weights = [];
+    let weights = [];
     for await (const row of iterator) {
       weights.push(Number(row.weight_g));
+    }
+    
+    // Limit to expected pieces from batch_completions to ensure consistency
+    // This handles cases where pieces in gates at transition time shouldn't be counted
+    if (expectedPieces > 0 && weights.length > expectedPieces) {
+      console.log(`[Histogram] Limiting ${weights.length} InfluxDB pieces to ${expectedPieces} (from batch_completions)`);
+      weights = weights.slice(0, expectedPieces);
     }
     
     if (weights.length === 0) {
@@ -216,6 +255,7 @@ router.get('/programs/:id/pieces-histogram', verifyToken, async (req, res) => {
     }
 
     const totalPieces = weights.length;
+    console.log(`[Histogram] Returning ${totalPieces} pieces for histogram`);
 
     // Calculate histogram bins with 5g bin size
     const minWeight = Math.min(...weights);
@@ -378,46 +418,65 @@ router.get('/programs/:id/gate-dwell', verifyToken, (req, res) => {
 
 /**
  * GET /api/stats/programs/:id/history
- * Get per-minute time series data for a program from SQLite (live worker writes M3 to SQLite)
+ * Get per-minute time series data for a program from SQLite
+ * All data calculated from batch_completions (source of truth) filtered by program end_ts
  */
 router.get('/programs/:id/history', verifyToken, async (req, res) => {
   try {
     const programId = parseInt(req.params.id);
     
-    // Query SQLite kpi_minute_recipes table (where live worker writes M3 data)
-    const kpiData = db.prepare(`
-      SELECT 
-        timestamp,
-        recipe_name,
-        batches_min,
-        pieces_processed,
-        weight_processed_g
-      FROM kpi_minute_recipes
-      WHERE program_id = ?
-      ORDER BY timestamp ASC
-    `).all(programId);
+    // Get program end_ts to filter out transition batches that completed after program ended
+    const programInfo = db.prepare(`
+      SELECT end_ts FROM program_stats WHERE program_id = ?
+    `).get(programId);
     
-    console.log(`[History] Found ${kpiData.length} per-minute records for program ${programId}`);
+    const endTs = programInfo?.end_ts;
+    console.log(`[History] Program ${programId} end_ts: ${endTs}`);
     
-    // Debug: Log first few rows to see actual values
-    if (kpiData.length > 0) {
-      console.log(`[History] Sample data:`, kpiData.slice(0, 3).map(r => ({
-        recipe: r.recipe_name,
-        batches: r.batches_min,
-        pieces: r.pieces_processed,
-        weight: r.weight_processed_g
-      })));
+    // Get batches, pieces, weight per minute from batch_completions
+    // Filter by end_ts to exclude transition batches that completed after program ended
+    let batchData;
+    if (endTs) {
+      batchData = db.prepare(`
+        SELECT 
+          strftime('%Y-%m-%dT%H:%M:00Z', completed_at) as minute,
+          r.name as recipe_name,
+          COUNT(*) as batch_count,
+          SUM(bc.pieces) as pieces_in_batches,
+          SUM(bc.weight_g) as weight_in_batches
+        FROM batch_completions bc
+        LEFT JOIN recipes r ON bc.recipe_id = r.id
+        WHERE bc.program_id = ?
+          AND bc.completed_at <= ?
+        GROUP BY minute, bc.recipe_id
+        ORDER BY minute ASC
+      `).all(programId, endTs);
+    } else {
+      batchData = db.prepare(`
+        SELECT 
+          strftime('%Y-%m-%dT%H:%M:00Z', completed_at) as minute,
+          r.name as recipe_name,
+          COUNT(*) as batch_count,
+          SUM(bc.pieces) as pieces_in_batches,
+          SUM(bc.weight_g) as weight_in_batches
+        FROM batch_completions bc
+        LEFT JOIN recipes r ON bc.recipe_id = r.id
+        WHERE bc.program_id = ?
+        GROUP BY minute, bc.recipe_id
+        ORDER BY minute ASC
+      `).all(programId);
     }
     
-    // Transform SQLite data to match the format expected by frontend
-    // Group by recipe and convert timestamps to milliseconds
+    console.log(`[History] Found ${batchData.length} batch records from batch_completions for program ${programId}`);
+    
+    // Build all data from batch_completions (source of truth)
     const batchesPerRecipe = {};
     const piecesPerRecipe = {};
     const weightPerRecipe = {};
     
-    kpiData.forEach(row => {
-      const recipe = row.recipe_name;
-      const timestamp = new Date(row.timestamp).getTime(); // Convert to milliseconds
+    batchData.forEach(row => {
+      const recipe = row.recipe_name || 'Unknown';
+      const timestamp = new Date(row.minute).getTime();
       
       if (!batchesPerRecipe[recipe]) {
         batchesPerRecipe[recipe] = [];
@@ -431,17 +490,17 @@ router.get('/programs/:id/history', verifyToken, async (req, res) => {
       
       batchesPerRecipe[recipe].push({
         t: timestamp,
-        v: row.batches_min || 0
+        v: row.batch_count || 0
       });
       
       piecesPerRecipe[recipe].push({
         t: timestamp,
-        v: row.pieces_processed || 0
+        v: row.pieces_in_batches || 0
       });
       
       weightPerRecipe[recipe].push({
         t: timestamp,
-        v: row.weight_processed_g || 0
+        v: row.weight_in_batches || 0
       });
     });
     
@@ -471,11 +530,23 @@ router.get('/programs/:id/pieces', verifyToken, async (req, res) => {
       WHERE program_id = ?
     `).get(programId);
     
-    if (!programStats || !programStats.start_ts || !programStats.end_ts) {
+    if (!programStats || !programStats.start_ts) {
       return res.json({ pieces: [] });
     }
     
-    console.log(`[Pieces] Fetching piece weights for program ${programId} (${programStats.start_ts} to ${programStats.end_ts})`);
+    // Get the last batch completion time - use this as end cutoff to match batch_completions
+    const batchInfo = db.prepare(`
+      SELECT 
+        MAX(completed_at) as last_batch_time,
+        SUM(pieces) as total_batched_pieces
+      FROM batch_completions 
+      WHERE program_id = ?
+    `).get(programId);
+    
+    const endTime = batchInfo?.last_batch_time || programStats.end_ts;
+    const expectedPieces = batchInfo?.total_batched_pieces || 0;
+    
+    console.log(`[Pieces] Fetching piece weights for program ${programId} (${programStats.start_ts} to ${endTime}, expected: ${expectedPieces})`);
     
     // Query InfluxDB for all pieces in this time range
     const influx = require('../services/influx');
@@ -483,7 +554,7 @@ router.get('/programs/:id/pieces', verifyToken, async (req, res) => {
       SELECT time, weight_g, gate
       FROM pieces
       WHERE time >= '${programStats.start_ts}'
-        AND time <= '${programStats.end_ts}'
+        AND time <= '${endTime}'
       ORDER BY time ASC
     `;
     
@@ -511,6 +582,12 @@ router.get('/programs/:id/pieces', verifyToken, async (req, res) => {
     const MAX_BUFFER_SIZE = 5000; // Process in chunks to limit memory
     
     for await (const row of iterator) {
+      // Stop if we've reached expected pieces from batch_completions
+      // This ensures we don't count pieces that were in gates at transition time
+      if (expectedPieces > 0 && pieceCount >= expectedPieces) {
+        break;
+      }
+      
       if (row.gate && row.gate !== 0) {
         const t = new Date(row.time).getTime();
         const w = Number(row.weight_g);
