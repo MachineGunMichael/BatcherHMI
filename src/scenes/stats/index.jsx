@@ -339,7 +339,7 @@ const Stats = () => {
       <Header title="Stats" subtitle="Historic Program & Recipe Analysis" />
 
       <Box 
-        mt="40px" 
+        mt="72px" 
         display="flex" 
         flexDirection="column" 
         gap={8}

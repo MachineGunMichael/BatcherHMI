@@ -120,7 +120,7 @@ const AnnotatedMachineImage = ({ colorMap, assignmentsByGate, overlayByGate, tra
         alt="machine"
         style={{
           position: 'absolute',
-          top: '40%',
+          top: '35%',
           left: '19%',
           transform: 'translate(-50%, -50%)',
           maxHeight: '100%'

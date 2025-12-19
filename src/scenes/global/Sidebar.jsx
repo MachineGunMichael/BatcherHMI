@@ -151,27 +151,42 @@ const Sidebar = () => {
     >
       {/* Logo positioned outside ProSidebar for unrestricted placement */}
       {!isCollapsed && (
-        <Box
-          onClick={() => setIsCollapsed(!isCollapsed)}
-          sx={{
-            position: "absolute",
-            top: "-30px", // Adjust this value to move logo up/down
-            left: "50%",
-            transform: "translateX(-50%)",
-            cursor: "pointer",
-            zIndex: 10,
-          }}
-        >
-          <img
-            alt="AG Automation logo"
-            height="250px"
-            src={theme.palette.mode === 'dark' 
-              ? `/assets/agautomation_white.png`
-              : `/assets/agautomation.png`
-            }
-            style={{ cursor: "pointer" }}
+        <>
+          {/* Logo image - visible but not clickable */}
+          <Box
+            sx={{
+              position: "absolute",
+              top: "-30px",
+              left: "50%",
+              transform: "translateX(-50%)",
+              zIndex: 5,
+              pointerEvents: "none", // Not clickable
+            }}
+          >
+            <img
+              alt="AG Automation logo"
+              height="250px"
+              src={theme.palette.mode === 'dark' 
+                ? `/assets/agautomation_white.png`
+                : `/assets/agautomation.png`
+              }
+            />
+          </Box>
+          {/* Clickable overlay - only covers the logo area above menu items */}
+          <Box
+            onClick={() => setIsCollapsed(!isCollapsed)}
+            sx={{
+              position: "absolute",
+              top: "-30px",
+              left: "50%",
+              transform: "translateX(-50%)",
+              width: "300px", // Approximate logo width
+              height: "190px", // Only the part above menu items (160px spacer + some buffer)
+              cursor: "pointer",
+              zIndex: 100,
+            }}
           />
-        </Box>
+        </>
       )}
 
       <ProSidebar
@@ -194,7 +209,7 @@ const Sidebar = () => {
               onClick={() => setIsCollapsed(!isCollapsed)}
               icon={<HomeOutlinedIcon />}
               style={{
-                margin: "30px 0 20px 0",
+                margin: "30px 0 50px 0",
                 color: colors.primary[800],
               }}
             />
@@ -202,7 +217,7 @@ const Sidebar = () => {
 
           {/* Spacer to push menu items below the logo */}
           {!isCollapsed && (
-            <Box sx={{ height: "130px" }} /> // Adjust to match logo height + desired gap
+            <Box sx={{ height: "160px" }} /> // Adjust to match logo height + desired gap
           )}
 
           {/* Menu Items */}
