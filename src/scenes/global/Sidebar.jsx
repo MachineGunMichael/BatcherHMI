@@ -149,6 +149,31 @@ const Sidebar = () => {
         },
       }}
     >
+      {/* Logo positioned outside ProSidebar for unrestricted placement */}
+      {!isCollapsed && (
+        <Box
+          onClick={() => setIsCollapsed(!isCollapsed)}
+          sx={{
+            position: "absolute",
+            top: "-30px", // Adjust this value to move logo up/down
+            left: "50%",
+            transform: "translateX(-50%)",
+            cursor: "pointer",
+            zIndex: 10,
+          }}
+        >
+          <img
+            alt="AG Automation logo"
+            height="250px"
+            src={theme.palette.mode === 'dark' 
+              ? `/assets/agautomation_white.png`
+              : `/assets/agautomation.png`
+            }
+            style={{ cursor: "pointer" }}
+          />
+        </Box>
+      )}
+
       <ProSidebar
         collapsed={isCollapsed}
         style={{
@@ -163,33 +188,22 @@ const Sidebar = () => {
             backgroundColor: colors.primary[800],
           }}
         >
-        {/* Toggle collapse button */}
+        {/* Toggle button when collapsed - uses MenuItem for consistent alignment */}
+          {isCollapsed && (
             <MenuItem
-            onClick={() => setIsCollapsed(!isCollapsed)}
-            icon={isCollapsed ? <HomeOutlinedIcon /> : undefined}
-            style={{
-              margin: "30px 0 50px 0",
-              color: colors.tealAccent[500],
-            }}
-          >
-            {!isCollapsed && (
-              <Box 
-                display="flex" 
-                justifyContent="center" 
-                alignItems="center"
-                width="100%" // Ensure the Box takes full width
-              >
-                <Box display="flex" alignItems="center">
-                  <img
-                    alt="logo"
-                    height="40px"
-                    src={`../../assets/atlas4.png`}
-                    style={{ cursor: "pointer" }}
-                  />
-                </Box>
-              </Box>
-            )}
-          </MenuItem>
+              onClick={() => setIsCollapsed(!isCollapsed)}
+              icon={<HomeOutlinedIcon />}
+              style={{
+                margin: "30px 0 20px 0",
+                color: colors.primary[800],
+              }}
+            />
+          )}
+
+          {/* Spacer to push menu items below the logo */}
+          {!isCollapsed && (
+            <Box sx={{ height: "130px" }} /> // Adjust to match logo height + desired gap
+          )}
 
           {/* Menu Items */}
           <Box

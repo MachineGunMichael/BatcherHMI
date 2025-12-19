@@ -533,8 +533,10 @@ class LiveWorker:
                     print(f"   ▶️  Recipes changed while paused - starting new program {new_program_id}")
                     self.start_program(new_program_id, active_recipes)
                 else:
-                    # Same program - just resume
+                    # Same program - check if recipes changed (merged transition)
                     print(f"   ▶️  Resuming program {self.program_id}")
+                    # Reload gate_to_recipe mapping to pick up any recipe changes
+                    self.reload_gate_to_recipe(active_recipes)
                 self.paused = False
         
         elif new_state == 'paused':
@@ -622,6 +624,50 @@ class LiveWorker:
         
         # Reset processed minutes set for new program
         self.processed_minutes: set = set()
+    
+    def reload_gate_to_recipe(self, active_recipes):
+        """Reload gate_to_recipe mapping without resetting other state
+        Used during merged transitions when recipes change but program stays the same
+        """
+        print(f"   🔄 Reloading gate_to_recipe for merged transition...")
+        
+        # Reload recipes from database to pick up any newly created ones
+        self.load_recipes()
+        
+        # Convert active_recipes to gate assignments
+        gate_map = self.machine_client.recipes_to_gate_map(active_recipes)
+        
+        # Track what changed
+        old_gates = set(self.gate_to_recipe.keys())
+        new_gates = set()
+        
+        # Update gate_to_recipe mapping
+        self.gate_to_recipe.clear()
+        for gate, recipe_data in gate_map.items():
+            recipe_name = recipe_data['recipeName']
+            # Find recipe_id from name
+            recipe_id = self.get_recipe_id_by_name(recipe_name)
+            if recipe_id:
+                # Ensure gate is integer for consistent lookup
+                int_gate = int(gate)
+                self.gate_to_recipe[int_gate] = recipe_id
+                new_gates.add(int_gate)
+            else:
+                print(f"   ⚠️  Recipe not found in database: {recipe_name}")
+        
+        # Log changes
+        added = new_gates - old_gates
+        removed = old_gates - new_gates
+        if added:
+            print(f"   ➕ Added gates: {sorted(added)}")
+        if removed:
+            print(f"   ➖ Removed gates: {sorted(removed)}")
+        print(f"   📋 Updated gate assignments: {self.gate_to_recipe}")
+        
+        # Update gate states for new gates
+        for gate in new_gates:
+            if gate not in self.gate_states:
+                self.gate_states[gate] = GateState(gate, self.gate_to_recipe[gate])
     
     def identify_gates_to_finish(self, state_data):
         """Identify which gates have in-progress batches during transition"""

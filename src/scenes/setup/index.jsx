@@ -90,16 +90,19 @@ const Setup = () => {
 
   // Machine control state
   // Machine state from backend via SSE
-  const { 
-    state: backendMachineState, 
+  const {
+    state: backendMachineState,
     activeRecipes: backendActiveRecipes,
     currentProgramId: backendProgramId,
     isConnected: machineConnected,
     transitioningGates: backendTransitioningGates,
+    completedTransitionGates: backendCompletedTransitionGates,
   } = useMachineState();
   
   // Track transitioning gates (for visual indicator and edit permissions)
   const [transitioningGates, setTransitioningGates] = useState([]);
+  // Track completed transition gates (gates that finished but other transitions still pending - LOCKED)
+  const [completedTransitionGates, setCompletedTransitionGates] = useState([]);
   
   // Sync transitioning gates from backend
   useEffect(() => {
@@ -107,6 +110,13 @@ const Setup = () => {
       setTransitioningGates(backendTransitioningGates);
     }
   }, [backendTransitioningGates]);
+  
+  // Sync completed transition gates from backend
+  useEffect(() => {
+    if (backendCompletedTransitionGates !== undefined) {
+      setCompletedTransitionGates(backendCompletedTransitionGates);
+    }
+  }, [backendCompletedTransitionGates]);
   
   // Local machine state (synced with backend)
   const [machineState, setMachineState] = useState("idle");
@@ -1275,7 +1285,7 @@ const Setup = () => {
             >
               Active Recipes
             </Typography>
-            {transitioningGates.length > 0 && (
+            {(transitioningGates.length > 0 || completedTransitionGates.length > 0) && (
               <Typography
                 variant="body2"
                 sx={{
@@ -1287,7 +1297,11 @@ const Setup = () => {
                   borderRadius: "4px",
                 }}
               >
-                Gates {transitioningGates.join(", ")} completing batches.
+                {transitioningGates.length > 0 
+                  ? `Gates ${transitioningGates.join(", ")} completing batches.`
+                  : `Waiting for all transitions to complete.`}
+                {completedTransitionGates.length > 0 && transitioningGates.length > 0 && 
+                  ` Gates ${completedTransitionGates.join(", ")} completed.`}
               </Typography>
             )}
           </Box>
@@ -1422,9 +1436,11 @@ const Setup = () => {
                           </Typography>
                         </Box>
                         
-                        {/* Edit and Remove buttons - or Transitioning text */}
+                        {/* Edit and Remove buttons - or Transitioning/Locked text */}
                         {(() => {
                           const isRecipeTransitioning = recipe.gates.some(gate => transitioningGates.includes(gate));
+                          const isRecipeLocked = recipe.gates.some(gate => completedTransitionGates.includes(gate));
+                          const isInTransitionPeriod = transitioningGates.length > 0 || completedTransitionGates.length > 0;
                           
                           if (isRecipeTransitioning) {
                             // Show "Transitioning" spanning both columns, centered
@@ -1447,6 +1463,33 @@ const Setup = () => {
                                     }}
                                   >
                                     TRANSITIONING
+                                  </Typography>
+                                </Box>
+                              </>
+                            );
+                          }
+                          
+                          if (isRecipeLocked && isInTransitionPeriod) {
+                            // Recipe has completed transition but other gates still transitioning - LOCKED
+                            return (
+                              <>
+                                <Box sx={{ 
+                                  p: 0.5, 
+                                  mr: 1.3,
+                                  display: 'flex', 
+                                  alignItems: 'center', 
+                                  justifyContent: 'center', 
+                                  minHeight: '20px',
+                                  gridColumn: 'span 2'
+                                }}>
+                                  <Typography 
+                                    variant="body2" 
+                                    sx={{ 
+                                      color: theme.palette.action.disabled,
+                                      fontSize: '0.75rem'
+                                    }}
+                                  >
+                                    LOCKED
                                   </Typography>
                                 </Box>
                               </>

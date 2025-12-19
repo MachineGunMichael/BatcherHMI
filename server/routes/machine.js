@@ -131,8 +131,74 @@ function handleStart(currentState, res) {
     // Check if there are already gates transitioning (user edited while paused)
     const alreadyTransitioning = machineState.hasTransitioningGates();
     
+    // Check if we're already in a transition period (merged transitions)
+    const existingTransitionOldProgramId = machineState.getTransitionOldProgramId();
+    const isInTransitionPeriod = machineState.isInTransitionPeriod();
+    
     if (changed || alreadyTransitioning) {
-      // Recipes changed: create NEW program and use per-gate transition
+      
+      // MERGED TRANSITIONS: If we're already in a transition period, DON'T create a new program
+      if (isInTransitionPeriod && existingTransitionOldProgramId) {
+        console.log('[Machine API] 🔄 MERGED TRANSITION: Already in transition period, NOT creating new program');
+        console.log(`[Machine API] Old program ${existingTransitionOldProgramId} still being finalized`);
+        console.log(`[Machine API] Current program: ${currentState.currentProgramId}`);
+        
+        const currentProgramId = currentState.currentProgramId;
+        
+        // UPDATE recipe_stats for current program to reflect the new recipe configuration
+        // Delete old recipe_stats and create new ones with current activeRecipes
+        console.log(`[Machine API] Updating recipe_stats for program ${currentProgramId} with new recipes`);
+        
+        // Delete existing recipe_stats for current program
+        db.prepare(`DELETE FROM recipe_stats WHERE program_id = ?`).run(currentProgramId);
+        
+        // Create new recipe_stats with current activeRecipes
+        const activeRecipes = machineState.getActiveRecipes();
+        for (const recipe of activeRecipes) {
+          const gatesAssigned = (recipe.gates || []).join(',');
+          db.prepare(`
+            INSERT INTO recipe_stats (
+              program_id, recipe_id, gates_assigned,
+              total_batches, total_batched_weight_g, total_reject_weight_g, total_giveaway_weight_g,
+              total_items_batched, total_items_rejected
+            ) VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0)
+          `).run(currentProgramId, recipe.recipeId, gatesAssigned);
+          console.log(`[Machine API] Updated recipe_stats for recipe ${recipe.recipeId} (${recipe.recipeName}) on gates [${gatesAssigned}]`);
+        }
+        
+        // Get current transitioning gates
+        const transitioningGates = machineState.getTransitioningGates();
+        console.log(`[Machine API] Transitioning gates: ${transitioningGates.join(', ') || 'none'}`);
+        console.log(`[Machine API] Completed transition gates: ${machineState.getCompletedTransitionGates().join(', ') || 'none'}`);
+        
+        // Just resume running with the existing program
+        machineState.updateState({ 
+          state: 'running',
+        });
+        
+        // Broadcast recipe_change event so Python worker reloads its recipe mappings
+        const recipeChangeEvent = { 
+          action: 'recipes_updated', 
+          programId: currentProgramId,
+          activeRecipes: activeRecipes.map(r => ({ recipeId: r.recipeId, recipeName: r.recipeName, gates: r.gates })),
+          ts: new Date().toISOString() 
+        };
+        console.log('[Machine API] Broadcasting recipes_updated event for merged transition');
+        eventBus.broadcast('program_change', recipeChangeEvent);
+        
+        return res.json({
+          success: true,
+          action: 'merged_transition_resume',
+          recipesChanged: true,
+          oldProgramId: existingTransitionOldProgramId,
+          currentProgramId: currentProgramId,
+          transitioningGates: transitioningGates,
+          completedTransitionGates: machineState.getCompletedTransitionGates(),
+          state: machineState.getState(),
+        });
+      }
+      
+      // FIRST TRANSITION: Create NEW program and use per-gate transition
       console.log('[Machine API] Recipes changed, creating new program with per-gate transition');
       
       const oldProgramId = currentState.currentProgramId;
@@ -222,6 +288,7 @@ function handleStart(currentState, res) {
         newProgramId,
         programName,
         transitioningGates: transitioningGates,
+        completedTransitionGates: machineState.getCompletedTransitionGates(),
         state: machineState.getState(),
       });
       

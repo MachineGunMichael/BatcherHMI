@@ -15,6 +15,7 @@ export function useMachineState() {
     activeRecipes: [],
     programStartRecipes: [],
     transitioningGates: [],
+    completedTransitionGates: [],
     transitionStartRecipes: {},
     lastUpdated: null,
   });
@@ -108,6 +109,7 @@ export function useMachineState() {
     currentProgramId: machineState.currentProgramId,
     programStartRecipes: machineState.programStartRecipes,
     transitioningGates: machineState.transitioningGates || [],
+    completedTransitionGates: machineState.completedTransitionGates || [],
     transitionStartRecipes: machineState.transitionStartRecipes || {},
     lastUpdated: machineState.lastUpdated,
     isConnected,

@@ -253,9 +253,10 @@ let slotToColor = {}; // { slotIndex: colorIndex }
  * @param {Array} PALETTE - Color palette
  * @param {String} totalColor - Color for Total
  */
-function buildColorMap(recipeNames, PALETTE, totalColor, activeRecipes = [], transitionStartRecipes = {}, programStartRecipes = []) {
+function buildColorMap(recipeNames, PALETTE, totalColor, activeRecipes = [], transitionStartRecipes = {}, programStartRecipes = [], completedTransitionGates = []) {
   const map = {};
   const hasTransitioning = Object.keys(transitionStartRecipes).length > 0;
+  const completedGatesSet = new Set(completedTransitionGates);
   
   // DURING TRANSITIONS: Use programStartRecipes for ALL color assignments
   // This freezes colors so nothing shifts until transitions complete
@@ -269,7 +270,18 @@ function buildColorMap(recipeNames, PALETTE, totalColor, activeRecipes = [], tra
     });
     
     // Assign colors based on programStartRecipes positions (frozen)
+    // BUT skip recipes that are no longer active AND all their gates have completed transitioning
     programStartRecipes.forEach((recipe, slotIndex) => {
+      const isStillActive = activeRecipes.some(r => r.recipeName === recipe.recipeName);
+      const recipeGates = recipe.gates || [];
+      const allGatesCompleted = recipeGates.length > 0 && recipeGates.every(g => completedGatesSet.has(g));
+      
+      // Skip old recipes whose gates have all completed (remove from legend)
+      if (!isStillActive && allGatesCompleted) {
+        // Don't add to map - this removes it from the legend
+        return;
+      }
+      
       const color = PALETTE[slotIndex % PALETTE.length];
       map[recipe.recipeName] = color;
       slotToColor[slotIndex] = color;
@@ -927,6 +939,7 @@ export function useDashboardData() {
           activeRecipes: tickActiveRecipes,
           transitionStartRecipes: tickTransitionStartRecipes,
           programStartRecipes: tickProgramStartRecipes,
+          completedTransitionGates: tickCompletedTransitionGates,
         } = JSON.parse(ev.data);
         const to = new Date(ts);
         
@@ -973,7 +986,7 @@ export function useDashboardData() {
         if (newRecipeNames.length > 0 || hasTransitioning) {
           // Use activeRecipes for colorMap - these are the NEW recipes
           // buildColorMap also adds transitioning recipes from transitionStartRecipes
-          const newColorMap = buildColorMap(newRecipeNames, PALETTE, TOTAL_COLOR, tickActiveRecipes || [], tickTransitionStartRecipes || {}, tickProgramStartRecipes || []);
+          const newColorMap = buildColorMap(newRecipeNames, PALETTE, TOTAL_COLOR, tickActiveRecipes || [], tickTransitionStartRecipes || {}, tickProgramStartRecipes || [], tickCompletedTransitionGates || []);
           console.log('[SSE TICK] colorMap update - newRecipes:', newRecipeNames, 'newColorMap keys:', Object.keys(newColorMap));
           setColorMap(prev => {
             // Merge: keep existing colors, add/update new ones
@@ -981,15 +994,13 @@ export function useDashboardData() {
             Object.entries(newColorMap).forEach(([key, color]) => {
               merged[key] = color;
             });
-            // Only remove old recipes when there are NO transitions
-            // During transitions, keep all colors frozen
-            if (!hasTransitioning) {
-              Object.keys(merged).forEach(key => {
-                if (key !== "Total" && !newColorMap[key]) {
-                  delete merged[key];
-                }
-              });
-            }
+            // Remove old recipes that are no longer in newColorMap
+            // buildColorMap now handles filtering out completed transition recipes
+            Object.keys(merged).forEach(key => {
+              if (key !== "Total" && !newColorMap[key]) {
+                delete merged[key];
+              }
+            });
             console.log('[SSE TICK] colorMap merged - transitioning:', hasTransitioning, 'keys:', Object.keys(merged));
             return merged;
           });

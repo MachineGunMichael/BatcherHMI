@@ -15,6 +15,7 @@ function runMigrations() {
     const hasTransitioningGates = columns.some(c => c.name === 'transitioning_gates');
     const hasTransitionStartRecipes = columns.some(c => c.name === 'transition_start_recipes');
     const hasTransitionOldProgramId = columns.some(c => c.name === 'transition_old_program_id');
+    const hasCompletedTransitionGates = columns.some(c => c.name === 'completed_transition_gates');
     
     if (!hasTransitioningGates) {
       console.log('[Migration] Adding transitioning_gates column to machine_state...');
@@ -32,6 +33,12 @@ function runMigrations() {
       console.log('[Migration] Adding transition_old_program_id column to machine_state...');
       db.prepare(`ALTER TABLE machine_state ADD COLUMN transition_old_program_id INTEGER DEFAULT NULL`).run();
       console.log('[Migration] ✅ Added transition_old_program_id column');
+    }
+    
+    if (!hasCompletedTransitionGates) {
+      console.log('[Migration] Adding completed_transition_gates column to machine_state...');
+      db.prepare(`ALTER TABLE machine_state ADD COLUMN completed_transition_gates TEXT DEFAULT '[]'`).run();
+      console.log('[Migration] ✅ Added completed_transition_gates column');
     }
   } catch (err) {
     console.error('[Migration] Error running migrations:', err);

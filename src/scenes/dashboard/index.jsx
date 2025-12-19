@@ -125,7 +125,7 @@ const AnnotatedMachineImage = ({ colorMap, assignmentsByGate, overlayByGate, tra
           transform: 'translate(-50%, -50%)',
           maxHeight: '100%'
         }}
-        src="../../assets/BatchMind2.png"
+        src="../../assets/BatchMind.png"
       />
       {annotationPositions.map((pos, idx) => {
         const program = assignmentsByGate[pos.gate] || "—";

@@ -195,7 +195,7 @@ router.get('/programs/:id/pieces-histogram', verifyToken, async (req, res) => {
       return res.status(404).json({ message: 'Program time range not found' });
     }
     
-    // Get the last batch completion time from batch_completions
+    // If they go to new program B → B has data before A is finalized (okay, but needs careful handling)    // Get the last batch completion time from batch_completions
     const batchInfo = db.prepare(`
       SELECT 
         MAX(completed_at) as last_batch_time,
