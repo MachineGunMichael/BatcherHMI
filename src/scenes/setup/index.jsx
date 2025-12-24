@@ -16,6 +16,11 @@ import {
   Checkbox,
   Autocomplete,
   Paper,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogContentText,
+  DialogActions,
 } from "@mui/material";
 import Header from "../../components/Header";
 import MachineControls from "../../components/MachineControls";
@@ -88,6 +93,10 @@ const Setup = () => {
   const [editActiveError, setEditActiveError] = useState("");
   const [editActiveSuccess, setEditActiveSuccess] = useState("");
 
+  // Skip transition dialog state
+  const [skipDialogOpen, setSkipDialogOpen] = useState(false);
+  const [skipRecipeIndex, setSkipRecipeIndex] = useState(null);
+
   // Machine control state
   // Machine state from backend via SSE
   const {
@@ -97,6 +106,10 @@ const Setup = () => {
     isConnected: machineConnected,
     transitioningGates: backendTransitioningGates,
     completedTransitionGates: backendCompletedTransitionGates,
+    transitionStartRecipes: backendTransitionStartRecipes,
+    programStartRecipes: backendProgramStartRecipes,
+    transitionOldProgramId: backendTransitionOldProgramId,
+    registeredTransitioningGates: backendRegisteredTransitioningGates,
   } = useMachineState();
   
   // Track transitioning gates (for visual indicator and edit permissions)
@@ -129,11 +142,136 @@ const Setup = () => {
   }, [backendMachineState]);
 
   // Sync active recipes from backend (SSE is the single source of truth)
+  // Also include removed recipes/gates that are still transitioning (from transitionStartRecipes)
+  // Handles both full recipe removal AND partial gate removal
+  // Maintain order using programStartRecipes as reference
   useEffect(() => {
     if (backendActiveRecipes !== undefined) {
-      setActiveRecipes(backendActiveRecipes);
+      const activeRecipeNames = new Set(backendActiveRecipes.map(r => r.recipeName));
+      
+      // Build a set of all gates currently assigned to active recipes
+      const activeGates = new Set();
+      for (const recipe of backendActiveRecipes) {
+        for (const gate of (recipe.gates || [])) {
+          activeGates.add(gate);
+        }
+      }
+      
+      // Find recipes/gates that were removed but are still transitioning
+      // Case 1: Full recipe removal - recipe name not in activeRecipes
+      // Case 2: Partial gate removal - recipe exists but gate was removed
+      const removedRecipesByName = {};
+      for (const gate of (backendTransitioningGates || [])) {
+        const originalRecipe = backendTransitionStartRecipes?.[gate];
+        if (!originalRecipe) continue;
+        
+        const recipeName = originalRecipe.recipeName;
+        const isFullRemoval = !activeRecipeNames.has(recipeName);
+        const isPartialRemoval = !activeGates.has(gate);
+        
+        if (isFullRemoval || isPartialRemoval) {
+          // This gate is transitioning and is either:
+          // - Part of a fully removed recipe
+          // - A gate that was removed from an existing recipe
+          if (!removedRecipesByName[recipeName]) {
+            removedRecipesByName[recipeName] = {
+              recipeName: recipeName,
+              recipeId: originalRecipe.recipeId,
+              params: originalRecipe.params,
+              gates: [],
+              isRemovedTransitioning: true, // Flag to identify removed recipes/gates
+            };
+          }
+          // Only add gate if not already in the list
+          if (!removedRecipesByName[recipeName].gates.includes(gate)) {
+            removedRecipesByName[recipeName].gates.push(gate);
+          }
+        }
+      }
+      
+      // Build display list maintaining order from programStartRecipes
+      const displayList = [];
+      const addedRecipeNames = new Set();
+      
+      // First, go through programStartRecipes to maintain original order
+      const programStart = backendProgramStartRecipes || [];
+      for (const refRecipe of programStart) {
+        const name = refRecipe.recipeName;
+        
+        // Check if this recipe has removed/transitioning gates
+        const removedEntry = removedRecipesByName[name];
+        const activeRecipe = backendActiveRecipes.find(r => r.recipeName === name);
+        
+        if (removedEntry && !activeRecipe) {
+          // Full recipe removal OR edit (replacement with different recipe)
+          displayList.push(removedEntry);
+          addedRecipeNames.add(name);
+          
+          // Check if this is an EDIT: gates have a NEW different recipe in activeRecipes
+          // Only mark as replacement if the gate is still transitioning
+          const removedGates = removedEntry.gates;
+          const replacementRecipes = new Map(); // Map of recipeName -> recipe with matching gates
+          
+          for (const gate of removedGates) {
+            // Only consider gates that are still transitioning
+            if (!backendTransitioningGates.includes(gate)) continue;
+            
+            const newRecipeForGate = backendActiveRecipes.find(r => 
+              r.gates?.includes(gate) && r.recipeName !== name
+            );
+            if (newRecipeForGate && !addedRecipeNames.has(newRecipeForGate.recipeName)) {
+              // Track this as a replacement recipe
+              if (!replacementRecipes.has(newRecipeForGate.recipeName)) {
+                replacementRecipes.set(newRecipeForGate.recipeName, {
+                  ...newRecipeForGate,
+                  _isReplacementRecipe: true,
+                  _replacesRecipe: name,
+                });
+              }
+            }
+          }
+          
+          // Add all replacement recipes right after the removed entry
+          for (const replacementEntry of replacementRecipes.values()) {
+            displayList.push(replacementEntry);
+            addedRecipeNames.add(replacementEntry.recipeName);
+          }
+        } else if (activeRecipe) {
+          // Recipe is still active - add it
+          displayList.push(activeRecipe);
+          addedRecipeNames.add(name);
+          
+          // If there are removed gates from this recipe, add a separate entry for them
+          if (removedEntry) {
+            // Create entry for removed gates with unique key
+            const removedGatesEntry = {
+              ...removedEntry,
+              recipeName: removedEntry.recipeName, // Keep same name for display
+              _isPartialRemoval: true, // Internal flag to distinguish from full removal
+            };
+            displayList.push(removedGatesEntry);
+          }
+        }
+      }
+      
+      // Add any active recipes that weren't in programStartRecipes (newly added recipes)
+      for (const recipe of backendActiveRecipes) {
+        if (!addedRecipeNames.has(recipe.recipeName)) {
+          displayList.push(recipe);
+          addedRecipeNames.add(recipe.recipeName);
+        }
+      }
+      
+      // Add any removed recipes that weren't in programStartRecipes (edge case)
+      for (const removedRecipe of Object.values(removedRecipesByName)) {
+        if (!addedRecipeNames.has(removedRecipe.recipeName) && !removedRecipe._isPartialRemoval) {
+          displayList.push(removedRecipe);
+        }
+      }
+      
+      setActiveRecipes(displayList);
     }
-  }, [backendActiveRecipes]);
+  }, [backendActiveRecipes, backendTransitioningGates, backendTransitionStartRecipes, backendProgramStartRecipes]);
 
   // Load recipes from database and clean up old localStorage data
   useEffect(() => {
@@ -309,9 +447,12 @@ const Setup = () => {
       return;
     }
 
-    if (manualPieceCountEnabled && !manualPieceCount) {
-      setAddError("Please fill in piece count or disable the constraint");
+    if (manualPieceCountEnabled) {
+      const countVal = parseInt(manualPieceCount);
+      if (!manualPieceCount || isNaN(countVal) || countVal <= 0) {
+        setAddError(`Piece count value is required when piece count constraint is enabled. Enter a value > 0 or disable the constraint.`);
       return;
+      }
     }
 
     // Build recipe parameters
@@ -361,28 +502,28 @@ const Setup = () => {
       try {
         const response = await api.post("/settings/recipes", {
           name: recipeName,
-          piece_min_weight_g: params.pieceMinWeight,
-          piece_max_weight_g: params.pieceMaxWeight,
-          batch_min_weight_g: params.batchMinWeight,
-          batch_max_weight_g: params.batchMaxWeight,
-          min_pieces_per_batch:
-            params.countType === "min" || params.countType === "exact"
-              ? params.countValue
-              : null,
-          max_pieces_per_batch:
-            params.countType === "max" || params.countType === "exact"
-              ? params.countValue
-              : null,
-        });
-        
+        piece_min_weight_g: params.pieceMinWeight,
+        piece_max_weight_g: params.pieceMaxWeight,
+        batch_min_weight_g: params.batchMinWeight,
+        batch_max_weight_g: params.batchMaxWeight,
+        min_pieces_per_batch:
+          params.countType === "min" || params.countType === "exact"
+            ? params.countValue
+            : null,
+        max_pieces_per_batch:
+          params.countType === "max" || params.countType === "exact"
+            ? params.countValue
+            : null,
+      });
+
         // Get the new recipe ID from response (API returns { recipe: {...} })
         recipeId = response.data?.recipe?.id || null;
         
         // Reload recipes to include the new one
-        await loadRecipes();
-        
+      await loadRecipes();
+
         console.log(`[Setup] Auto-saved new recipe: ${recipeName} (ID: ${recipeId})`);
-      } catch (error) {
+    } catch (error) {
         console.error("[Setup] Failed to auto-save recipe:", error);
         console.error("[Setup] Error details:", error.response?.data || error.message);
         setAddError(`Failed to save recipe: ${error.response?.data?.message || error.message}`);
@@ -421,7 +562,7 @@ const Setup = () => {
       pieceMaxWeight: recipe.params.pieceMaxWeight || '',
       batchMinWeight: recipe.params.batchMinWeight || '',
       batchMaxWeight: recipe.params.batchMaxWeight || '',
-      countType: recipe.params.countType || 'min',
+      countType: recipe.params.countType || 'NA', // Default to NA if null/undefined
       countValue: recipe.params.countValue || '',
       gates: recipe.gates
     });
@@ -441,6 +582,16 @@ const Setup = () => {
       setEditAssignedError("Please select at least one gate.");
       setTimeout(() => setEditAssignedError(""), 5000);
       return;
+    }
+
+    // Validate piece count: if type is Min/Max/Exact, value must be provided and > 0
+    if (editAssignedData.countType && editAssignedData.countType !== 'NA') {
+      const countVal = parseInt(editAssignedData.countValue);
+      if (!editAssignedData.countValue || isNaN(countVal) || countVal <= 0) {
+        setEditAssignedError(`Piece count value is required when type is "${editAssignedData.countType}". Use "NA" for no piece count constraint.`);
+        setTimeout(() => setEditAssignedError(""), 5000);
+        return;
+      }
     }
 
     const newParams = {
@@ -492,18 +643,29 @@ const Setup = () => {
     setEditAssignedError("");
   };
 
+  // Helper to clean recipes before sending to backend (strip frontend-only flags)
+  const cleanRecipesForBackend = (recipes) => {
+    return recipes
+      .filter(r => !r.isRemovedTransitioning) // Don't send removed-transitioning recipes
+      .map(r => {
+        const { isRemovedTransitioning, ...cleanRecipe } = r;
+        return cleanRecipe;
+      });
+  };
+
   // Send programs to machine (move from assigned to active)
   const handleSendPrograms = async () => {
     try {
       console.log("[Setup] Activating recipes:", assignedRecipes);
       
-      // Move assigned recipes to active recipes
-      const newActiveRecipes = [...activeRecipes, ...assignedRecipes];
+      // Move assigned recipes to active recipes (only non-removed ones from current active)
+      const currentActiveClean = activeRecipes.filter(r => !r.isRemovedTransitioning);
+      const newActiveRecipes = [...currentActiveClean, ...assignedRecipes];
       setActiveRecipes(newActiveRecipes);
       setAssignedRecipes([]);
       
-      // Sync to backend
-      await api.post('/machine/recipes', { recipes: newActiveRecipes });
+      // Sync to backend (cleaned)
+      await api.post('/machine/recipes', { recipes: cleanRecipesForBackend(newActiveRecipes) });
       console.log("[Setup] Active recipes synced to backend");
     } catch (error) {
       console.error("[Setup] Failed to activate recipes:", error);
@@ -515,7 +677,7 @@ const Setup = () => {
   // Sync active recipes to backend
   const syncActiveRecipesToBackend = async () => {
     try {
-      await api.post('/machine/recipes', { recipes: activeRecipes });
+      await api.post('/machine/recipes', { recipes: cleanRecipesForBackend(activeRecipes) });
       console.log('[Setup] Synced active recipes to backend');
     } catch (error) {
       console.error('[Setup] Failed to sync active recipes:', error);
@@ -525,19 +687,21 @@ const Setup = () => {
   // Remove active recipe
   const handleRemoveActiveRecipe = async (index) => {
     // Get updated recipes without the removed one
-    const updatedRecipes = activeRecipes.filter((_, i) => i !== index);
+    // Filter out removed-transitioning recipes when building the list to send to backend
+    const updatedRecipes = activeRecipes
+      .filter((r, i) => i !== index && !r.isRemovedTransitioning);
     
     // Push updated recipes to backend (so it knows about the removal)
     // This will trigger a program change when Start is pressed (like edit does)
     try {
-      await api.post('/machine/recipes', { recipes: updatedRecipes });
+      await api.post('/machine/recipes', { recipes: cleanRecipesForBackend(updatedRecipes) });
       console.log('[Setup] Updated active recipes on backend after removal');
     } catch (error) {
       console.error('[Setup] Failed to update active recipes on backend:', error);
-      // Still update local state even if backend fails
     }
     
-    setActiveRecipes(updatedRecipes);
+    // DON'T update local state here - let the sync useEffect handle it
+    // The removed recipe will stay visible via transitionStartRecipes until transition completes
     setEditingActiveIndex(null);
     setEditActiveData(null);
   };
@@ -551,7 +715,7 @@ const Setup = () => {
       pieceMaxWeight: recipe.params.pieceMaxWeight || '',
       batchMinWeight: recipe.params.batchMinWeight || '',
       batchMaxWeight: recipe.params.batchMaxWeight || '',
-      countType: recipe.params.countType || 'min',
+      countType: recipe.params.countType || 'NA', // Default to NA if null/undefined
       countValue: recipe.params.countValue || '',
       gates: recipe.gates
     });
@@ -564,6 +728,51 @@ const Setup = () => {
     setEditActiveError("");
   };
 
+  // Open skip transition dialog
+  const handleOpenSkipDialog = (recipeIndex) => {
+    setSkipRecipeIndex(recipeIndex);
+    setSkipDialogOpen(true);
+  };
+
+  // Close skip transition dialog
+  const handleCloseSkipDialog = () => {
+    setSkipDialogOpen(false);
+    setSkipRecipeIndex(null);
+  };
+
+  // Confirm skip transition - force complete batches on all transitioning gates for this recipe
+  const handleConfirmSkip = async () => {
+    if (skipRecipeIndex === null) return;
+    
+    const recipe = activeRecipes[skipRecipeIndex];
+    if (!recipe) {
+      handleCloseSkipDialog();
+      return;
+    }
+    
+    // Find all gates for this recipe that are currently transitioning
+    const gatesToSkip = recipe.gates.filter(gate => transitioningGates.includes(gate));
+    
+    if (gatesToSkip.length === 0) {
+      handleCloseSkipDialog();
+      return;
+    }
+    
+    try {
+      // Call backend to force-complete batches on these gates
+      for (const gate of gatesToSkip) {
+        await api.post('/machine/skip-transition', { gate });
+      }
+      console.log(`[Setup] Skipped transition for gates: ${gatesToSkip.join(', ')}`);
+    } catch (error) {
+      console.error('[Setup] Failed to skip transition:', error);
+      setEditActiveError(`Failed to skip transition: ${error.response?.data?.message || error.message}`);
+      setTimeout(() => setEditActiveError(""), 5000);
+    }
+    
+    handleCloseSkipDialog();
+  };
+
   // Accept editing active recipe
   const handleAcceptEditActive = async () => {
     // Validate at least one gate is selected
@@ -571,6 +780,16 @@ const Setup = () => {
       setEditActiveError("Please select at least one gate.");
       setTimeout(() => setEditActiveError(""), 5000);
       return;
+    }
+
+    // Validate piece count: if type is Min/Max/Exact, value must be provided and > 0
+    if (editActiveData.countType && editActiveData.countType !== 'NA') {
+      const countVal = parseInt(editActiveData.countValue);
+      if (!editActiveData.countValue || isNaN(countVal) || countVal <= 0) {
+        setEditActiveError(`Piece count value is required when type is "${editActiveData.countType}". Use "NA" for no piece count constraint.`);
+        setTimeout(() => setEditActiveError(""), 5000);
+        return;
+      }
     }
 
     const newParams = {
@@ -618,7 +837,7 @@ const Setup = () => {
 
     // Push updated recipes to backend (so it knows about the edit)
     try {
-      await api.post('/machine/recipes', { recipes: updatedRecipes });
+      await api.post('/machine/recipes', { recipes: cleanRecipesForBackend(updatedRecipes) });
       console.log('[Setup] Updated active recipes on backend after edit');
     } catch (error) {
       console.error('[Setup] Failed to update active recipes on backend:', error);
@@ -662,7 +881,7 @@ const Setup = () => {
         {/* Top Section: Recipe Selection and Machine Controls */}
         <Box display="flex" gap={16} mb={6}>
           {/* Recipe Selection (Left) */}
-          <Box sx={{ width: "50%" }}>
+        <Box sx={{ width: "50%" }}>
           <FormControl component="fieldset" fullWidth>
             <FormLabel component="legend">
               <Typography
@@ -924,7 +1143,7 @@ const Setup = () => {
             <>
               {/* Recipe Assignment Table */}
               <Paper sx={{ p: 3, backgroundColor: colors.primary[200], mb: 3 }}>
-                <Box display="grid" gridTemplateColumns="250px repeat(8, 20px) 60px repeat(6, 80px) 80px 80px" gap="2px">
+                <Box display="grid" gridTemplateColumns="300px repeat(8, 20px) 60px repeat(6, 80px) 80px 80px" gap="2px">
                   {/* Header Level 1 - Grouped headers */}
                   <Box sx={{ p: 0, display: 'flex', alignItems: 'center', minHeight: '20px' }}>
                     <Typography variant="body2" fontWeight="bold">Recipe</Typography>
@@ -1058,7 +1277,7 @@ const Setup = () => {
                             Edit
                           </Button>
                         </Box>
-
+                        
                         {/* Remove button */}
                         <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '20px' }}>
                           <Button
@@ -1304,7 +1523,7 @@ const Setup = () => {
                   ` Gates ${completedTransitionGates.join(", ")} completed.`}
               </Typography>
             )}
-          </Box>
+      </Box>
 
           {activeRecipes.length === 0 ? (
             <Typography>No active recipes. Send recipes from "Assigned Recipes" to activate them.</Typography>
@@ -1312,7 +1531,7 @@ const Setup = () => {
             <>
               {/* Active Recipe Table */}
               <Paper sx={{ p: 3, backgroundColor: colors.primary[200], mb: 3 }}>
-                <Box display="grid" gridTemplateColumns="250px repeat(8, 20px) 60px repeat(6, 80px) 80px 80px" gap="2px">
+                <Box display="grid" gridTemplateColumns="300px repeat(8, 20px) 60px repeat(6, 80px) 80px 80px 80px" gap="2px">
                   {/* Header Level 1 - Grouped headers */}
                   <Box sx={{ p: 0, display: 'flex', alignItems: 'center', minHeight: '20px' }}>
                     <Typography variant="body2" fontWeight="bold">Recipe</Typography>
@@ -1331,7 +1550,7 @@ const Setup = () => {
                   <Box sx={{ pl: 0, display: 'flex', alignItems: 'center', justifyContent: 'flex-start', minHeight: '20px', gridColumn: 'span 2' }}>
                     <Typography variant="body2" fontWeight="bold">Pieces</Typography>
                   </Box>
-                  <Box sx={{ pl: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '20px', gridColumn: 'span 2' }}>
+                  <Box sx={{ pl: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '20px', gridColumn: 'span 3' }}>
                     <Typography variant="body2" fontWeight="bold"> </Typography>
                   </Box>
 
@@ -1364,35 +1583,83 @@ const Setup = () => {
                   <Box sx={{ p: 0, display: 'flex', alignItems: 'center', minHeight: '20px', mb: 1 }}>
                     <Typography variant="body2" fontWeight="bold">Max</Typography>
                   </Box>
-                  <Box sx={{ p: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '20px', mb: 1, gridColumn: 'span 2' }}>
-                    {/* Empty cells for Action columns */}
+                  <Box sx={{ p: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '20px', mb: 1, gridColumn: 'span 3' }}>
+                    {/* Empty cells for Action columns (Edit, Remove, Skip) */}
                   </Box>
 
                   {/* Recipe rows */}
                   {activeRecipes.map((recipe, i) => {
                     // Use same color palette as Stats page
                     const recipeColor = recipeColors[i % recipeColors.length];
+                    
+                    // Create unique key for partial removal and replacement entries
+                    const rowKey = recipe._isPartialRemoval 
+                      ? `${i}-removed-${recipe.recipeName}` 
+                      : recipe._isReplacementRecipe
+                        ? `${i}-replacement-${recipe.recipeName}`
+                        : `${i}-${recipe.recipeName}`;
+                    
+                    // Determine recipe name color based on transition status
+                    // - Red: Recipe being removed/replaced (outgoing)
+                    // - Teal: Replacement recipe (incoming, for edits) - only while gates are still transitioning
+                    // - Teal: New recipe waiting to activate (incoming, for additions)
+                    const isOnTransitioningGate = recipe.gates.some(g => transitioningGates.includes(g));
+                    const isOnCompletedGate = recipe.gates.some(g => completedTransitionGates.includes(g));
+                    const isActivelyTransitioning = isOnTransitioningGate || isOnCompletedGate;
+                    
+                    // Only show replacement styling if gates are still transitioning
+                    const showAsReplacement = recipe._isReplacementRecipe && isActivelyTransitioning;
+                    
+                    let recipeNameColor = undefined;
+                    if (recipe.isRemovedTransitioning) {
+                      // This recipe is being removed or replaced (full or partial)
+                      recipeNameColor = colors.redAccent[500];
+                    } else if (showAsReplacement) {
+                      // This is a replacement recipe for an edit (gates still transitioning)
+                      recipeNameColor = colors.tealAccent[500];
+                    } else if (isActivelyTransitioning) {
+                      // This is a new/addition recipe waiting to fully activate
+                      recipeNameColor = colors.tealAccent[500];
+                    }
 
                     return (
-                      <React.Fragment key={i}>
-                        {/* Recipe name - left-aligned */}
-                        <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', minHeight: '20px' }}>
-                          <Typography variant="body2">{recipe.recipeName}</Typography>
+                      <React.Fragment key={rowKey}>
+                        {/* Recipe name - left-aligned, colored by transition status */}
+                        <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', height: '28px' }}>
+                          <Typography 
+                            variant="body2" 
+                            sx={{ 
+                              color: recipeNameColor,
+                              fontWeight: recipeNameColor ? 600 : undefined, // Bold when transitioning
+                              fontStyle: (recipe._isPartialRemoval || showAsReplacement) ? 'italic' : undefined,
+                            }}
+                          >
+                            {recipe._isPartialRemoval 
+                              ? `↳ Gate${recipe.gates.length > 1 ? 's' : ''} ${recipe.gates.join(', ')} (removing)`
+                              : showAsReplacement
+                                ? `↳ ${recipe.recipeName} (replacing)`
+                                : recipe.recipeName
+                            }
+                          </Typography>
                         </Box>
                         
                         {/* Gate assignments - square boxes */}
                         {[1, 2, 3, 4, 5, 6, 7, 8].map(gate => {
-                          const isTransitioning = transitioningGates.includes(gate) && recipe.gates.includes(gate);
+                          // Only pulse for outgoing recipes (isRemovedTransitioning or _isPartialRemoval)
+                          // Replacement recipes show solid squares (they're waiting to come in)
+                          const isOutgoingRecipe = recipe.isRemovedTransitioning || recipe._isPartialRemoval;
+                          const isTransitioning = isOutgoingRecipe && transitioningGates.includes(gate) && recipe.gates.includes(gate);
                           return (
                             <Box 
-                              key={`${i}-${gate}`} 
+                              key={`${rowKey}-${gate}`} 
                               sx={{
                                 backgroundColor: recipe.gates.includes(gate) ? recipeColor : undefined,
                                 display: 'flex',
                                 alignItems: 'center',
                                 justifyContent: 'center',
-                                minHeight: '20px',
+                                width: '20px',
                                 height: '20px',
+                                alignSelf: 'center',
                                 // Pulsing animation for transitioning gates (uses synced timing)
                                 ...(isTransitioning && {
                                   ...getSyncedAnimationStyle(),
@@ -1406,29 +1673,29 @@ const Setup = () => {
                         })}
                         
                         {/* Spacer column */}
-                        <Box />
+                        <Box sx={{ height: '28px' }} />
                         
                         {/* Recipe specifications */}
-                        <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'left', minHeight: '20px' }}>
+                        <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'left', height: '28px' }}>
                           <Typography variant="body2">{recipe.params.pieceMinWeight || '-'}</Typography>
                         </Box>
-                        <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'left', minHeight: '20px' }}>
+                        <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'left', height: '28px' }}>
                           <Typography variant="body2">{recipe.params.pieceMaxWeight || '-'}</Typography>
                         </Box>
-                        <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'left', minHeight: '20px' }}>
+                        <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'left', height: '28px' }}>
                           <Typography variant="body2">{recipe.params.batchMinWeight || '-'}</Typography>
                         </Box>
-                        <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'left', minHeight: '20px' }}>
+                        <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'left', height: '28px' }}>
                           <Typography variant="body2">{recipe.params.batchMaxWeight || '-'}</Typography>
                         </Box>
-                        <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'left', minHeight: '20px' }}>
+                        <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'left', height: '28px' }}>
                           <Typography variant="body2">
                             {recipe.params.countType === 'min' || recipe.params.countType === 'exact' 
                               ? recipe.params.countValue || '-' 
                               : '-'}
                           </Typography>
                         </Box>
-                        <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'left', minHeight: '20px' }}>
+                        <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'left', height: '28px' }}>
                           <Typography variant="body2">
                             {recipe.params.countType === 'max' || recipe.params.countType === 'exact' 
                               ? recipe.params.countValue || '-' 
@@ -1438,12 +1705,23 @@ const Setup = () => {
                         
                         {/* Edit and Remove buttons - or Transitioning/Locked text */}
                         {(() => {
+                          // Check if this is a removed recipe (still transitioning but no longer in activeRecipes)
+                          const isRemovedRecipe = recipe.isRemovedTransitioning === true;
                           const isRecipeTransitioning = recipe.gates.some(gate => transitioningGates.includes(gate));
                           const isRecipeLocked = recipe.gates.some(gate => completedTransitionGates.includes(gate));
                           const isInTransitionPeriod = transitioningGates.length > 0 || completedTransitionGates.length > 0;
                           
-                          if (isRecipeTransitioning) {
-                            // Show "Transitioning" spanning both columns, centered
+                          // Removed/replaced recipes show as transitioning
+                          // SKIP button only available when THIS RECIPE's gates have been registered with a program
+                          // (i.e., they are in registeredTransitioningGates - meaning Start was pressed after the edit/removal)
+                          if (isRemovedRecipe) {
+                            // This is the outgoing recipe - show TRANSITIONING
+                            // Only show SKIP if at least one of this recipe's gates is in registeredTransitioningGates
+                            // This means the edit/removal was done and Start was pressed, registering it with a program
+                            const recipeGates = recipe.gates || [];
+                            const hasRegisteredGate = recipeGates.some(g => backendRegisteredTransitioningGates.includes(g));
+                            const canSkip = hasRegisteredGate;
+                            
                             return (
                               <>
                                 <Box sx={{ 
@@ -1452,7 +1730,7 @@ const Setup = () => {
                                   display: 'flex', 
                                   alignItems: 'center', 
                                   justifyContent: 'center', 
-                                  minHeight: '20px',
+                                  height: '28px',
                                   gridColumn: 'span 2'
                                 }}>
                                   <Typography 
@@ -1465,6 +1743,57 @@ const Setup = () => {
                                     TRANSITIONING
                                   </Typography>
                                 </Box>
+                                {canSkip ? (
+                                  <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'center', height: '28px' }}>
+                                    <Button
+                                      size="small"
+                                      onClick={() => handleOpenSkipDialog(i)}
+                                      sx={{ 
+                                        color: colors.orangeAccent[500],
+                                        minWidth: 'auto',
+                                        padding: '2px 8px',
+                                        fontSize: '0.75rem',
+                                        '&:hover': {
+                                          backgroundColor: colors.orangeAccent[500],
+                                          color: '#fff',
+                                        }
+                                      }}
+                                    >
+                                      SKIP
+                                    </Button>
+                                  </Box>
+                                ) : (
+                                  <Box sx={{ p: 0.5, height: '28px' }} />
+                                )}
+                              </>
+                            );
+                          }
+                          
+                          // New/replacement recipes on transitioning gates - show TRANSITIONING without SKIP
+                          if (isRecipeTransitioning) {
+                            return (
+                              <>
+                                <Box sx={{ 
+                                  p: 0.5,
+                                  mr: 1.3,  
+                                  display: 'flex', 
+                                  alignItems: 'center', 
+                                  justifyContent: 'center', 
+                                  height: '28px',
+                                  gridColumn: 'span 2'
+                                }}>
+                                  <Typography 
+                                    variant="body2" 
+                                    sx={{ 
+                                      color: theme.palette.action.disabled,
+                                      fontSize: '0.75rem'
+                                    }}
+                                  >
+                                    TRANSITIONING
+                                  </Typography>
+                                </Box>
+                                {/* Empty third column - no SKIP for incoming recipes */}
+                                <Box sx={{ p: 0.5, height: '28px' }} />
                               </>
                             );
                           }
@@ -1475,11 +1804,11 @@ const Setup = () => {
                               <>
                                 <Box sx={{ 
                                   p: 0.5, 
-                                  mr: 1.3,
+                                  mr: 7.2, 
                                   display: 'flex', 
                                   alignItems: 'center', 
                                   justifyContent: 'center', 
-                                  minHeight: '20px',
+                                  height: '28px',
                                   gridColumn: 'span 2'
                                 }}>
                                   <Typography 
@@ -1492,6 +1821,8 @@ const Setup = () => {
                                     LOCKED
                                   </Typography>
                                 </Box>
+                                {/* Empty third column for Skip */}
+                                <Box sx={{ p: 0.5, height: '28px' }} />
                               </>
                             );
                           }
@@ -1499,7 +1830,7 @@ const Setup = () => {
                           // Show Edit and Remove buttons
                           return (
                             <>
-                              <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '20px' }}>
+                              <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'center', height: '28px' }}>
                                 <Button
                                   size="small"
                                   onClick={() => handleEditActive(i)}
@@ -1518,7 +1849,7 @@ const Setup = () => {
                                   Edit
                                 </Button>
                               </Box>
-                              <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '20px' }}>
+                              <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'center', height: '28px' }}>
                                 <Button
                                   size="small"
                                   onClick={() => handleRemoveActiveRecipe(i)}
@@ -1537,6 +1868,8 @@ const Setup = () => {
                                   Remove
                                 </Button>
                               </Box>
+                              {/* Empty third column (Skip column placeholder) */}
+                              <Box sx={{ p: 0.5, height: '28px' }} />
                             </>
                           );
                         })()}
@@ -1703,6 +2036,8 @@ const Setup = () => {
                                 CANCEL
                               </Button>
                             </Box>
+                            {/* Empty third column (Skip column space) */}
+                            <Box sx={{ p: 0.5, minHeight: '20px' }} />
                           </>
                         )}
                       </React.Fragment>
@@ -1710,22 +2045,75 @@ const Setup = () => {
                   })}
                 </Box>
               </Paper>
+              
+              {/* Error/Success messages for Active Recipes */}
+              {editActiveError && (
+                <Typography variant="body2" sx={{ color: colors.redAccent[500], mt: 1 }}>
+                  {editActiveError}
+                </Typography>
+              )}
+
+              {editActiveSuccess && (
+                <Typography variant="body2" sx={{ color: colors.tealAccent[400], mt: 1 }}>
+                  {editActiveSuccess}
+                </Typography>
+              )}
             </>
-          )}
-
-          {editActiveError && (
-            <Typography variant="body2" sx={{ color: colors.redAccent[500], mt: 2 }}>
-              {editActiveError}
-            </Typography>
-          )}
-
-          {editActiveSuccess && (
-            <Typography variant="body1" sx={{ color: colors.tealAccent[400], mt: 2 }}>
-              {editActiveSuccess}
-            </Typography>
           )}
         </Box>
       </Box>
+
+      {/* Skip Transition Confirmation Dialog */}
+      <Dialog
+        open={skipDialogOpen}
+        onClose={handleCloseSkipDialog}
+        PaperProps={{
+          sx: {
+            backgroundColor: theme.palette.mode === 'dark' ? colors.primary[700] : colors.primary[200],
+            backgroundImage: 'none',
+          }
+        }}
+      >
+        <DialogTitle sx={{ 
+          fontWeight: 'bold',
+          color: colors.tealAccent[500]
+        }}>
+          Skip Transition?
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText sx={{ 
+            color: theme.palette.mode === 'dark' ? colors.grey[100] : colors.grey[800]
+          }}>
+            Are you sure you want to end the transition period and directly start the new recipe?
+            This will register the current batch as incomplete.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button 
+            onClick={handleCloseSkipDialog} 
+            sx={{ 
+              color: theme.palette.mode === 'dark' ? colors.grey[100] : colors.grey[900],
+              '&:hover': {
+                backgroundColor: theme.palette.mode === 'dark' ? colors.grey[500] : colors.grey[400],
+              }
+            }}
+          >
+            Cancel
+          </Button>
+          <Button 
+            onClick={handleConfirmSkip} 
+            sx={{ 
+              color: colors.tealAccent[500],
+              '&:hover': {
+                backgroundColor: colors.tealAccent[500],
+                color: '#fff',
+              }
+            }}
+          >
+            Confirm Skip
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 };

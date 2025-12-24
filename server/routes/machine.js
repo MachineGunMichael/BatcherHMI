@@ -171,9 +171,15 @@ function handleStart(currentState, res) {
         console.log(`[Machine API] Transitioning gates: ${transitioningGates.join(', ') || 'none'}`);
         console.log(`[Machine API] Completed transition gates: ${machineState.getCompletedTransitionGates().join(', ') || 'none'}`);
         
+        // Register any NEW transitioning gates that weren't registered before
+        const currentRegisteredGates = currentState.registeredTransitioningGates || [];
+        const newRegisteredGates = [...new Set([...currentRegisteredGates, ...transitioningGates])];
+        console.log(`[Machine API] Registered transitioning gates (before: ${currentRegisteredGates.join(', ') || 'none'}, after: ${newRegisteredGates.join(', ') || 'none'})`);
+        
         // Just resume running with the existing program
         machineState.updateState({ 
           state: 'running',
+          registeredTransitioningGates: newRegisteredGates,
         });
         
         // Broadcast recipe_change event so Python worker reloads its recipe mappings
@@ -261,9 +267,11 @@ function handleStart(currentState, res) {
       }
       
       // 6. Update state to running with new program
+      // Also register all currently transitioning gates as "registered" (can be skipped)
       machineState.updateState({ 
         state: 'running',
         currentProgramId: newProgramId,
+        registeredTransitioningGates: transitioningGates.slice(), // Copy current transitioning gates as registered
       });
       
       // 7. Snapshot recipes if no transitions, otherwise keep old programStartRecipes frozen
@@ -479,6 +487,10 @@ function handleAllTransitionsComplete() {
     
     if (!oldProgramId) {
       console.log('[Machine API] No old program ID stored - transitions may have already completed');
+      // Still need to clear transitions and snapshot recipes to clean up UI state
+      // Use atomic update to ensure consistent state in one SSE broadcast
+      machineState.finalizeTransitions();
+      console.log('[Machine API] Finalized transitions (no old program to finalize)');
       return { success: true, message: 'No pending transition' };
     }
     
@@ -492,11 +504,9 @@ function handleAllTransitionsComplete() {
     // Clear the stored old program ID
     machineState.clearTransitionOldProgramId();
     
-    // Clear transition state
-    machineState.clearTransitions();
-    
-    // Snapshot recipes for the new program
-    machineState.snapshotRecipes();
+    // Clear transition state AND snapshot recipes atomically
+    // This ensures the frontend gets a consistent state in one SSE broadcast
+    machineState.finalizeTransitions();
     
     // Broadcast program_change so dashboard resets rejects display
     const currentState = machineState.getState();
@@ -718,6 +728,8 @@ router.post('/recipes', (req, res) => {
           error: 'Invalid recipe structure. Each recipe must have recipeName, gates, and params' 
         });
       }
+      // IMPORTANT: Strip frontend-only flags that should NOT be stored in the database
+      delete recipe.isRemovedTransitioning;
     }
     
     // Ensure all recipes exist in database and update recipeId to match recipeName
@@ -881,6 +893,131 @@ router.get('/stream', (req, res) => {
   });
   
   console.log('[Machine API] SSE client connected');
+});
+
+/**
+ * POST /api/machine/skip-transition
+ * Force-complete a batch on a transitioning gate
+ * Body: { gate: number }
+ */
+router.post('/skip-transition', async (req, res) => {
+  try {
+    const { gate } = req.body;
+    
+    if (!gate || gate < 1 || gate > 8) {
+      return res.status(400).json({ error: 'Invalid gate number' });
+    }
+    
+    console.log(`[Machine API] Skip transition requested for gate ${gate}`);
+    
+    // Check if gate is actually transitioning
+    const transitioningGates = machineState.getTransitioningGates();
+    if (!transitioningGates.includes(gate)) {
+      return res.status(400).json({ error: `Gate ${gate} is not transitioning` });
+    }
+    
+    // Get current gate state (pieces and grams)
+    const gates = require('../state/gates');
+    const snapshot = gates.getSnapshot();
+    const gateState = snapshot.find(g => g.gate === gate);
+    const pieces = gateState?.pieces || 0;
+    const grams = gateState?.grams || 0;
+    
+    console.log(`[Machine API] Force-completing batch on gate ${gate}: ${pieces} pieces, ${grams.toFixed(1)}g`);
+    
+    // Get recipe info for stats (from transition start recipes - original recipe)
+    const state = machineState.getState();
+    const originalRecipeInfo = state.transitionStartRecipes?.[gate];
+    const recipeIdForStats = originalRecipeInfo?.recipeId || null;
+    const recipeName = originalRecipeInfo?.recipeName || 'unknown';
+    
+    // Get old program ID for batch attribution
+    const oldProgramId = machineState.getTransitionOldProgramId();
+    
+    // Write batch completion to SQLite (as incomplete batch)
+    const tsIso = new Date().toISOString();
+    let programIdForBatch;
+    
+    try {
+      if (oldProgramId) {
+        programIdForBatch = oldProgramId;
+        console.log(`[Machine API] Writing incomplete batch to OLD program ${programIdForBatch} (gate ${gate}, recipe: ${recipeName})`);
+      } else {
+        // Fallback: get current program
+        const programRow = db.prepare(`
+          SELECT p.id FROM programs p
+          JOIN program_stats ps ON p.id = ps.program_id
+          WHERE ps.end_ts IS NULL
+          ORDER BY ps.start_ts DESC
+          LIMIT 1
+        `).get();
+        programIdForBatch = programRow?.id || null;
+      }
+      
+      if (programIdForBatch && pieces > 0) {
+        db.prepare(`
+          INSERT INTO batch_completions (gate, completed_at, pieces, weight_g, recipe_id, program_id)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).run(gate, tsIso, pieces, grams, recipeIdForStats, programIdForBatch);
+        
+        console.log(`[Machine API] Incomplete batch written to SQLite (recipe: ${recipeName}, pieces: ${pieces}, grams: ${grams.toFixed(1)})`);
+      }
+    } catch (err) {
+      console.error(`[Machine API] Failed to write incomplete batch to SQLite:`, err);
+    }
+    
+    // Reset the gate
+    gates.resetGate(gate);
+    console.log(`[Machine API] Gate ${gate} reset to 0 pieces, 0 grams`);
+    
+    // Broadcast gate reset
+    const eventBus = require('../lib/eventBus');
+    eventBus.bus.emit('broadcast', { type: 'gate', data: { gate, pieces: 0, grams: 0, ts: tsIso } });
+    
+    // Write M2 reset to InfluxDB
+    const influx = require('../services/influx');
+    influx.writeGateState({
+      gate,
+      pieces_in_gate: 0,
+      weight_sum_g: 0,
+      ts: tsIso,
+    }).catch(err => console.error("M2 reset write failed:", err.message));
+    
+    // Complete this gate's transition
+    machineState.completeGateTransition(gate);
+    
+    // Reload recipe manager to update this gate to new recipe
+    const recipeManager = require('../lib/recipeManager');
+    recipeManager.loadGateAssignments();
+    
+    // Check if ALL transitions are now complete
+    if (!machineState.hasTransitioningGates()) {
+      console.log(`[Machine API] All gates have finished their batches after skip`);
+      
+      // Finalize the old program's stats
+      const finalizeResult = handleAllTransitionsComplete();
+      if (finalizeResult.success) {
+        console.log(`[Machine API] Old program ${oldProgramId} finalized after skip`);
+      }
+      
+      eventBus.bus.emit('broadcast', { type: 'transition_complete', data: { ts: tsIso } });
+    }
+    
+    // Broadcast full snapshot
+    const fullSnapshot = gates.getSnapshot();
+    eventBus.bus.emit('broadcast', { type: 'overlay', data: { ts: tsIso, overlay: fullSnapshot } });
+    
+    res.json({ 
+      success: true, 
+      message: `Gate ${gate} transition skipped`,
+      pieces,
+      grams: parseFloat(grams.toFixed(1))
+    });
+    
+  } catch (error) {
+    console.error('[Machine API] Error in skip-transition:', error);
+    res.status(500).json({ error: 'Failed to skip transition' });
+  }
 });
 
 // Export router and helper functions

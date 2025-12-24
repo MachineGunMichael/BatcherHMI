@@ -139,11 +139,30 @@ router.post("/piece", verifyPlcSecret, async (req, res) => {
 
     // ✨ RE-ASSIGN PIECE based on active recipes (ignore simulator's gate)
     // Find all eligible gates where piece weight falls within recipe bounds
+    // Also consider transitioning gates that still need to complete their batch
     const eligibleGates = [];
+    const transitioningGates = machineState.getTransitioningGates();
+    const currentMachineState = machineState.getState();
+    
     for (let gate = gates.GATE_MIN; gate <= gates.GATE_MAX; gate++) {
+      // First check if gate has a current recipe
       const recipe = recipeManager.getRecipeForGate(gate);
       if (recipe && w >= recipe.pieceMin && w <= recipe.pieceMax) {
         eligibleGates.push(gate);
+        continue;
+      }
+      
+      // If no current recipe, check if gate is transitioning with original recipe
+      // This ensures removed recipes can still complete their batches
+      if (transitioningGates.includes(gate)) {
+        const originalRecipe = currentMachineState.transitionStartRecipes?.[gate];
+        if (originalRecipe?.params) {
+          const pieceMin = originalRecipe.params.pieceMinWeight || 0;
+          const pieceMax = originalRecipe.params.pieceMaxWeight || Infinity;
+          if (w >= pieceMin && w <= pieceMax) {
+            eligibleGates.push(gate);
+          }
+        }
       }
     }
     
@@ -165,6 +184,18 @@ router.post("/piece", verifyPlcSecret, async (req, res) => {
       // ✨ ATOMIC BATCH DETECTION WITH PROMISE QUEUE ✨
       // This ensures pieces are ALWAYS processed sequentially, never lost
       const result = await gates.processPieceAtomic(g, w, (pieces, grams) => {
+        // ✨ For transitioning gates, use ORIGINAL recipe from transitionStartRecipes
+        // This ensures removed recipes can still complete their batches
+        const transitioningGates = machineState.getTransitioningGates();
+        if (transitioningGates.includes(g)) {
+          const state = machineState.getState();
+          const originalRecipe = state.transitionStartRecipes?.[g];
+          if (originalRecipe?.params) {
+            // Use original recipe parameters to check batch completion
+            return recipeManager.isBatchCompleteWithParams(g, pieces, grams, originalRecipe.params);
+          }
+        }
+        // Normal case: use current recipe assignment
         return recipeManager.isBatchComplete(g, pieces, grams);
       });
       

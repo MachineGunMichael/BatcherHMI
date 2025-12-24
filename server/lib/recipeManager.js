@@ -323,6 +323,76 @@ class RecipeManager {
   }
 
   /**
+   * Check if batch is complete using provided parameters (for transitioning gates)
+   * This is used when a recipe has been removed but the gate still needs to complete its batch
+   * @param {number} gate - Gate number
+   * @param {number} pieces - Current piece count
+   * @param {number} grams - Current weight in grams
+   * @param {object} params - Recipe parameters from transitionStartRecipes
+   * @returns {boolean} - True if batch is complete
+   */
+  isBatchCompleteWithParams(gate, pieces, grams, params) {
+    // Extract parameters (params structure from frontend/machine state)
+    const batchMin = params.batchMinWeight || 0;
+    const batchMax = params.batchMaxWeight || 0;
+    const countType = params.countType || null;
+    const countVal = params.countValue || null;
+
+    // Weight-based completion
+    let weightCondition = false;
+    if (batchMin > 0) {
+      if (batchMax > 0) {
+        weightCondition = grams >= batchMin && grams <= batchMax;
+        if (grams > batchMax) {
+          console.log(`⚠️  Gate ${gate} (transitioning): Weight exceeded max bound (${grams.toFixed(1)}g > ${batchMax}g)`);
+        }
+      } else {
+        weightCondition = grams >= batchMin;
+      }
+    }
+
+    // Count-based completion
+    let countCondition = false;
+    if (countType && countVal !== null && countType !== 'NA') {
+      if (countType === 'exact') {
+        countCondition = pieces === countVal;
+        if (pieces > countVal) {
+          console.log(`⚠️  Gate ${gate} (transitioning): Count exceeded exact bound (${pieces} > ${countVal})`);
+        }
+      } else if (countType === 'min') {
+        countCondition = pieces >= countVal;
+      } else if (countType === 'max') {
+        countCondition = pieces >= countVal;
+        if (pieces > countVal) {
+          console.log(`⚠️  Gate ${gate} (transitioning): Count exceeded max bound (${pieces} > ${countVal})`);
+        }
+      }
+    }
+
+    // Determine completion (OR logic)
+    let isComplete = false;
+    let reason = '';
+    
+    if (batchMin > 0 && countType && countVal !== null && countType !== 'NA') {
+      isComplete = weightCondition || countCondition;
+      if (weightCondition) reason = `weight ${grams.toFixed(1)}g >= ${batchMin}g`;
+      if (countCondition) reason = `count ${pieces} ${countType} ${countVal}`;
+    } else if (batchMin > 0) {
+      isComplete = weightCondition;
+      if (weightCondition) reason = `weight ${grams.toFixed(1)}g >= ${batchMin}g`;
+    } else if (countType && countVal !== null && countType !== 'NA') {
+      isComplete = countCondition;
+      if (countCondition) reason = `count ${pieces} ${countType} ${countVal}`;
+    }
+
+    if (isComplete) {
+      console.log(`✅ Gate ${gate} (TRANSITIONING): BATCH COMPLETE - ${reason}`);
+    }
+
+    return isComplete;
+  }
+
+  /**
    * Reload recipes and assignments (call when program changes)
    */
   reload() {
@@ -392,9 +462,20 @@ bus.on('program:changed', () => {
 
 // Auto-reload assignments when machine state changes (NEW - machine state integration)
 bus.on('machine:state-changed', (state) => {
-  console.log(`📢 Machine state changed to: ${state.state}, ${state.activeRecipes?.length || 0} active recipes, reloading assignments...`);
+  console.log(`📢 Machine state changed to: ${state.state}, ${state.activeRecipes?.length || 0} active recipes`);
+  console.log(`📢 transitioningGates: ${JSON.stringify(state.transitioningGates)}`);
+  console.log(`📢 Reloading assignments...`);
   try {
     recipeManager.reload();  // Use reload() instead of just loadGateAssignments() to reset gates
+    // Log which gates have assignments after reload
+    const gateAssignments = [];
+    for (let g = 1; g <= 8; g++) {
+      const recipe = recipeManager.getRecipeForGate(g);
+      if (recipe) {
+        gateAssignments.push(`Gate ${g}: ${recipe.name}`);
+      }
+    }
+    console.log(`📢 After reload, gate assignments: ${gateAssignments.join(', ') || 'none'}`);
   } catch (e) {
     console.error('❌ Failed to reload assignments on machine state change:', e);
   }

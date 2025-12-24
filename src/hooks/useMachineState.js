@@ -111,6 +111,8 @@ export function useMachineState() {
     transitioningGates: machineState.transitioningGates || [],
     completedTransitionGates: machineState.completedTransitionGates || [],
     transitionStartRecipes: machineState.transitionStartRecipes || {},
+    transitionOldProgramId: machineState.transitionOldProgramId || null,
+    registeredTransitioningGates: machineState.registeredTransitioningGates || [],
     lastUpdated: machineState.lastUpdated,
     isConnected,
     error,

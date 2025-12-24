@@ -6,7 +6,7 @@ const eventBus = require('../lib/eventBus');
 
 /**
  * Get current machine state
- * @returns {Object} { state, currentProgramId, activeRecipes, programStartRecipes, transitioningGates, transitionStartRecipes, completedTransitionGates, transitionOldProgramId, lastUpdated }
+ * @returns {Object} { state, currentProgramId, activeRecipes, programStartRecipes, transitioningGates, transitionStartRecipes, completedTransitionGates, transitionOldProgramId, registeredTransitioningGates, lastUpdated }
  */
 function getState() {
   const row = db.prepare(`
@@ -19,6 +19,7 @@ function getState() {
       transition_start_recipes as transitionStartRecipes,
       completed_transition_gates as completedTransitionGates,
       transition_old_program_id as transitionOldProgramId,
+      registered_transitioning_gates as registeredTransitioningGates,
       last_updated as lastUpdated
     FROM machine_state 
     WHERE id = 1
@@ -35,6 +36,7 @@ function getState() {
     transitioningGates: JSON.parse(row.transitioningGates || '[]'),
     transitionStartRecipes: JSON.parse(row.transitionStartRecipes || '{}'),
     completedTransitionGates: JSON.parse(row.completedTransitionGates || '[]'),
+    registeredTransitioningGates: JSON.parse(row.registeredTransitioningGates || '[]'),
   };
   
   // Removed verbose logging - getState is called frequently
@@ -47,8 +49,8 @@ function getState() {
  * @param {Object} updates - Partial state updates
  */
 function updateState(updates) {
-  const allowed = ['state', 'currentProgramId', 'activeRecipes', 'programStartRecipes', 'transitioningGates', 'transitionStartRecipes', 'completedTransitionGates'];
-  const jsonFields = ['activeRecipes', 'programStartRecipes', 'transitioningGates', 'transitionStartRecipes', 'completedTransitionGates'];
+  const allowed = ['state', 'currentProgramId', 'activeRecipes', 'programStartRecipes', 'transitioningGates', 'transitionStartRecipes', 'completedTransitionGates', 'registeredTransitioningGates'];
+  const jsonFields = ['activeRecipes', 'programStartRecipes', 'transitioningGates', 'transitionStartRecipes', 'completedTransitionGates', 'registeredTransitioningGates'];
   const sets = [];
   const params = { id: 1 };
   
@@ -122,6 +124,33 @@ function snapshotRecipes() {
 }
 
 /**
+ * Clear all transitions AND snapshot recipes in a single atomic update
+ * This ensures the frontend gets a consistent state in one SSE broadcast
+ */
+function finalizeTransitions() {
+  const state = getState();
+  console.log('[MachineState] 🎯 FINALIZING TRANSITIONS');
+  console.log('[MachineState] Current activeRecipes:', JSON.stringify(state.activeRecipes?.map(r => r.recipeName)));
+  console.log('[MachineState] Current transitioningGates:', JSON.stringify(state.transitioningGates));
+  console.log('[MachineState] Current transitionStartRecipes keys:', Object.keys(state.transitionStartRecipes || {}));
+  
+  updateState({
+    transitioningGates: [],
+    transitionStartRecipes: {},
+    completedTransitionGates: [],
+    registeredTransitioningGates: [],
+    programStartRecipes: state.activeRecipes,
+  });
+  
+  // Verify the update worked
+  const newState = getState();
+  console.log('[MachineState] ✅ After finalization:');
+  console.log('[MachineState] - transitioningGates:', JSON.stringify(newState.transitioningGates));
+  console.log('[MachineState] - transitionStartRecipes:', JSON.stringify(newState.transitionStartRecipes));
+  console.log('[MachineState] - programStartRecipes:', JSON.stringify(newState.programStartRecipes?.map(r => r.recipeName)));
+}
+
+/**
  * Clear all state (on stop)
  */
 function reset() {
@@ -141,6 +170,7 @@ function reset() {
     transitioningGates: [],
     transitionStartRecipes: {},
     completedTransitionGates: [],
+    registeredTransitioningGates: [],
   });
 }
 
@@ -230,6 +260,9 @@ function completeGateTransition(gate) {
   const newTransitionStartRecipes = { ...state.transitionStartRecipes };
   delete newTransitionStartRecipes[gate];
   
+  // Also remove from registeredTransitioningGates
+  const newRegisteredTransitioningGates = (state.registeredTransitioningGates || []).filter(g => g !== gate);
+  
   // Add to completedTransitionGates (locked until all transitions done)
   const completedGates = new Set(state.completedTransitionGates || []);
   completedGates.add(gate);
@@ -238,6 +271,7 @@ function completeGateTransition(gate) {
     transitioningGates: newTransitioningGates,
     transitionStartRecipes: newTransitionStartRecipes,
     completedTransitionGates: Array.from(completedGates),
+    registeredTransitioningGates: newRegisteredTransitioningGates,
   });
   
   console.log(`[MachineState] Completed transition for gate ${gate}, ${newTransitioningGates.length} gates still transitioning, ${completedGates.size} gates completed (locked)`);
@@ -318,6 +352,7 @@ module.exports = {
   setActiveRecipes,
   recipesChanged,
   snapshotRecipes,
+  finalizeTransitions,
   reset,
   isValidTransition,
   startGateTransition,

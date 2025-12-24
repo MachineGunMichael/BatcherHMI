@@ -488,6 +488,9 @@ function createMachineStateSchema() {
   if (!columnExists('machine_state', 'transition_start_recipes')) {
     run(`ALTER TABLE machine_state ADD COLUMN transition_start_recipes TEXT DEFAULT '{}';`);
   }
+  if (!columnExists('machine_state', 'registered_transitioning_gates')) {
+    run(`ALTER TABLE machine_state ADD COLUMN registered_transitioning_gates TEXT DEFAULT '[]';`);
+  }
   
   console.log('✅ Machine state schema created.');
 }

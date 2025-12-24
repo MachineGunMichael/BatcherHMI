@@ -48,6 +48,26 @@ function runMigrations() {
 // Run migrations before starting server
 runMigrations();
 
+// Clear stale transition state on startup (ensures clean start)
+function clearStaleTransitionState() {
+  try {
+    console.log('[Startup] Clearing stale transition state...');
+    db.prepare(`
+      UPDATE machine_state 
+      SET transitioning_gates = '[]',
+          transition_start_recipes = '{}',
+          completed_transition_gates = '[]',
+          transition_old_program_id = NULL
+      WHERE id = 1
+    `).run();
+    console.log('[Startup] ✅ Transition state cleared');
+  } catch (err) {
+    console.error('[Startup] Error clearing transition state:', err);
+  }
+}
+
+clearStaleTransitionState();
+
 const authRoutes = require('./routes/auth');
 const programRoutes = require('./routes/programs');
 const settingsRoutes = require('./routes/settings');
