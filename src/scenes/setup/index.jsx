@@ -21,7 +21,12 @@ import {
   DialogContent,
   DialogContentText,
   DialogActions,
+  IconButton,
+  Tooltip,
 } from "@mui/material";
+import StarIcon from "@mui/icons-material/Star";
+import StarBorderIcon from "@mui/icons-material/StarBorder";
+import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import Header from "../../components/Header";
 import MachineControls from "../../components/MachineControls";
 import { tokens } from "../../theme";
@@ -51,8 +56,20 @@ const Setup = () => {
   const [recipes, setRecipes] = useState([]);
   const [loadingRecipes, setLoadingRecipes] = useState(true);
 
-  // Mode state
-  const [mode, setMode] = useState("preset"); // preset or manual
+  // Mode state: presetProgram, preset, manual, manualProgram
+  const [mode, setMode] = useState("preset");
+
+  // Saved programs state
+  const [savedPrograms, setSavedPrograms] = useState([]);
+  const [loadingSavedPrograms, setLoadingSavedPrograms] = useState(true);
+  const [selectedSavedProgram, setSelectedSavedProgram] = useState(null);
+
+  // Manual program creation state
+  const [programRecipes, setProgramRecipes] = useState([]); // Recipes being added to new program
+  const [programName, setProgramName] = useState("");
+  const [programSelectedRecipe, setProgramSelectedRecipe] = useState(null);
+  const [programGates, setProgramGates] = useState([]);
+  const [programError, setProgramError] = useState("");
 
   // Preset mode state
   const [selectedRecipe, setSelectedRecipe] = useState(null);
@@ -97,6 +114,12 @@ const Setup = () => {
   // Skip transition dialog state
   const [skipDialogOpen, setSkipDialogOpen] = useState(false);
   const [skipRecipeIndex, setSkipRecipeIndex] = useState(null);
+
+  // Delete confirmation dialog state
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [deleteItemType, setDeleteItemType] = useState(null); // 'recipe' or 'program'
+  const [deleteItemId, setDeleteItemId] = useState(null);
+  const [deleteItemName, setDeleteItemName] = useState("");
 
   // Machine control state
   // Machine state from backend via SSE
@@ -280,6 +303,7 @@ const Setup = () => {
     // Remove old activeRecipes from localStorage (backend is now source of truth)
     localStorage.removeItem('activeRecipes');
     loadRecipes();
+    loadSavedPrograms();
   }, []);
 
   // NOTE: assignedRecipes persistence is handled by AppContext
@@ -297,6 +321,19 @@ const Setup = () => {
       setRecipes([]);
     } finally {
       setLoadingRecipes(false);
+    }
+  };
+
+  const loadSavedPrograms = async () => {
+    try {
+      setLoadingSavedPrograms(true);
+      const response = await api.get("/settings/saved-programs");
+      setSavedPrograms(response.data.programs || []);
+    } catch (error) {
+      console.error("Failed to load saved programs:", error);
+      setSavedPrograms([]);
+    } finally {
+      setLoadingSavedPrograms(false);
     }
   };
 
@@ -390,6 +427,91 @@ const Setup = () => {
     ...activeRecipes.flatMap((r) => r.gates || [])
   ];
 
+  // Check if all gates are already used (no available gates for new recipes)
+  const allGatesUsed = [1, 2, 3, 4, 5, 6, 7, 8].every(gate => usedGates.includes(gate));
+
+  // Toggle recipe favorite
+  const handleToggleRecipeFavorite = async (recipeId, e) => {
+    e.stopPropagation(); // Prevent dropdown selection
+    try {
+      await api.patch(`/settings/recipes/${recipeId}/favorite`);
+      // Refresh recipes list
+      const response = await api.get("/settings/recipes");
+      setRecipes(response.data.recipes || []);
+    } catch (error) {
+      console.error("Failed to toggle recipe favorite:", error);
+    }
+  };
+
+  // Open delete confirmation dialog for recipe
+  const handleDeleteRecipe = (recipeId, recipeName, e) => {
+    e.stopPropagation(); // Prevent dropdown selection
+    setDeleteItemType('recipe');
+    setDeleteItemId(recipeId);
+    setDeleteItemName(recipeName);
+    setDeleteDialogOpen(true);
+  };
+
+  // Toggle saved program favorite
+  const handleToggleProgramFavorite = async (programId, e) => {
+    e.stopPropagation(); // Prevent dropdown selection
+    try {
+      await api.patch(`/settings/saved-programs/${programId}/favorite`);
+      // Refresh programs list
+      const response = await api.get("/settings/saved-programs");
+      setSavedPrograms(response.data.programs || []);
+    } catch (error) {
+      console.error("Failed to toggle program favorite:", error);
+    }
+  };
+
+  // Open delete confirmation dialog for program
+  const handleDeleteProgram = (programId, programName, e) => {
+    e.stopPropagation(); // Prevent dropdown selection
+    setDeleteItemType('program');
+    setDeleteItemId(programId);
+    setDeleteItemName(programName);
+    setDeleteDialogOpen(true);
+  };
+
+  // Close delete dialog
+  const handleCloseDeleteDialog = () => {
+    setDeleteDialogOpen(false);
+    setDeleteItemType(null);
+    setDeleteItemId(null);
+    setDeleteItemName("");
+  };
+
+  // Confirm delete
+  const handleConfirmDelete = async () => {
+    try {
+      if (deleteItemType === 'recipe') {
+        await api.delete(`/settings/recipes/${deleteItemId}`);
+        // Refresh recipes list
+        const response = await api.get("/settings/recipes");
+        setRecipes(response.data.recipes || []);
+        // Clear selection if deleted recipe was selected
+        if (selectedRecipe?.id === deleteItemId) {
+          setSelectedRecipe(null);
+        }
+      } else if (deleteItemType === 'program') {
+        await api.delete(`/settings/saved-programs/${deleteItemId}`);
+        // Refresh programs list
+        const response = await api.get("/settings/saved-programs");
+        setSavedPrograms(response.data.programs || []);
+        // Clear selection if deleted program was selected
+        if (selectedSavedProgram?.id === deleteItemId) {
+          setSelectedSavedProgram(null);
+        }
+      }
+    } catch (error) {
+      console.error(`Failed to delete ${deleteItemType}:`, error);
+      setAddError(`Failed to delete ${deleteItemType}. It may be in use.`);
+      setTimeout(() => setAddError(""), 5000);
+    }
+    handleCloseDeleteDialog();
+  };
+
   // Add preset recipe
   const handleAddPreset = () => {
     if (!selectedRecipe || presetGates.length === 0) {
@@ -463,6 +585,18 @@ const Setup = () => {
       if (!manualPieceCount || isNaN(countVal) || countVal <= 0) {
         setAddError(`Piece count value is required when piece count constraint is enabled. Enter a value > 0 or disable the constraint.`);
       return;
+      }
+    }
+
+    // Validate display name uniqueness if provided
+    if (manualDisplayName && manualDisplayName.trim()) {
+      const existingWithName = recipes.find(
+        (r) => r.display_name && r.display_name.toLowerCase() === manualDisplayName.trim().toLowerCase()
+      );
+      if (existingWithName) {
+        setAddError(`A recipe with the name "${manualDisplayName}" already exists. Please choose a different name.`);
+        setTimeout(() => setAddError(""), 5000);
+        return;
       }
     }
 
@@ -556,6 +690,155 @@ const Setup = () => {
     setAssignedRecipes([...assignedRecipes, newAssignment]);
     resetManualForm();
     setAddError("");
+  };
+
+  // ============== SAVED PROGRAM HANDLERS ==============
+
+  // Check if a saved program can be added (both tables must be empty)
+  const canAddSavedProgram = assignedRecipes.length === 0 && 
+    activeRecipes.filter(r => !r.isRemovedTransitioning && !r._isPartialRemoval).length === 0;
+
+  // Add saved program to assigned recipes
+  const handleAddSavedProgram = () => {
+    if (!selectedSavedProgram) {
+      setAddError("Please select a program");
+      return;
+    }
+
+    if (!canAddSavedProgram) {
+      setAddError("Cannot add program: Please remove all assigned and active recipes first");
+      return;
+    }
+
+    // Convert saved program recipes to assigned recipes format
+    const programRecipesToAdd = selectedSavedProgram.recipes.map(recipe => ({
+      type: "preset",
+      recipeId: recipe.recipe_id,
+      recipeName: recipe.recipe_name,
+      displayName: recipe.display_name,
+      params: recipe.params,
+      gates: recipe.gates,
+    }));
+
+    setAssignedRecipes(programRecipesToAdd);
+    setSelectedSavedProgram(null);
+    setAddError("");
+  };
+
+  // ============== MANUAL PROGRAM HANDLERS ==============
+
+  // Get gates already used in the manual program
+  const programUsedGates = programRecipes.flatMap(r => r.gates);
+
+  // Toggle gate for manual program recipe
+  const toggleProgramGate = (gate) => {
+    if (programGates.includes(gate)) {
+      setProgramGates(programGates.filter(g => g !== gate));
+    } else {
+      setProgramGates([...programGates, gate]);
+    }
+  };
+
+  // Add recipe to manual program
+  const handleAddRecipeToProgram = () => {
+    if (!programSelectedRecipe) {
+      setProgramError("Please select a recipe");
+      return;
+    }
+
+    if (programGates.length === 0) {
+      setProgramError("Please assign at least one gate");
+      return;
+    }
+
+    // Check for gate conflicts
+    const conflictingGates = programGates.filter(g => programUsedGates.includes(g));
+    if (conflictingGates.length > 0) {
+      setProgramError(`Gate(s) ${conflictingGates.join(', ')} already assigned to another recipe`);
+      return;
+    }
+
+    const newRecipe = {
+      recipeId: programSelectedRecipe.id,
+      recipeName: programSelectedRecipe.name,
+      displayName: programSelectedRecipe.display_name || null,
+      params: parseRecipeName(programSelectedRecipe.name),
+      gates: programGates,
+    };
+
+    setProgramRecipes([...programRecipes, newRecipe]);
+    setProgramSelectedRecipe(null);
+    setProgramGates([]);
+    setProgramError("");
+  };
+
+  // Remove recipe from manual program
+  const handleRemoveProgramRecipe = (index) => {
+    setProgramRecipes(programRecipes.filter((_, i) => i !== index));
+  };
+
+  // Save and add manual program
+  const handleSaveAndAddProgram = async () => {
+    if (programRecipes.length === 0) {
+      setProgramError("Please add at least one recipe to the program");
+      return;
+    }
+
+    if (!programName.trim()) {
+      setProgramError("Please enter a program name");
+      return;
+    }
+
+    if (!canAddSavedProgram) {
+      setProgramError("Cannot add program: Please remove all assigned and active recipes first");
+      return;
+    }
+
+    try {
+      // Save program to database
+      const response = await api.post("/settings/saved-programs", {
+        name: `program_${Date.now()}`, // Unique internal name
+        display_name: programName.trim(),
+        recipes: programRecipes,
+      });
+
+      console.log("[Setup] Saved program created:", response.data);
+
+      // Reload saved programs list
+      await loadSavedPrograms();
+
+      // Add program recipes to assigned recipes
+      const recipesToAdd = programRecipes.map(recipe => ({
+        type: "preset",
+        recipeId: recipe.recipeId,
+        recipeName: recipe.recipeName,
+        displayName: recipe.displayName,
+        params: recipe.params,
+        gates: recipe.gates,
+      }));
+
+      setAssignedRecipes(recipesToAdd);
+
+      // Reset manual program form
+      setProgramRecipes([]);
+      setProgramName("");
+      setProgramSelectedRecipe(null);
+      setProgramGates([]);
+      setProgramError("");
+
+    } catch (error) {
+      console.error("[Setup] Failed to save program:", error);
+      setProgramError(error.response?.data?.message || "Failed to save program");
+    }
+  };
+
+  // Reset manual program form
+  const resetProgramForm = () => {
+    setProgramRecipes([]);
+    setProgramName("");
+    setProgramSelectedRecipe(null);
+    setProgramGates([]);
+    setProgramError("");
   };
 
 
@@ -932,61 +1215,348 @@ const Setup = () => {
                 fontWeight="bold"
                 sx={{ mb: 2, color: colors.tealAccent[500] }}
               >
-                Recipe Selection
+                Program Selection
               </Typography>
             </FormLabel>
             <RadioGroup row value={mode} onChange={handleModeChange} name="recipe-mode">
               <FormControlLabel
+                value="presetProgram"
+                control={<Radio color="secondary" />}
+                label="Existing Program"
+              />
+              <FormControlLabel
                 value="preset"
                 control={<Radio color="secondary" />}
-                label="Pre-specified Recipe"
+                label="Existing Recipe"
+              />
+              <FormControlLabel
+                value="manualProgram"
+                control={<Radio color="secondary" />}
+                label="Manual Program"
               />
               <FormControlLabel
                 value="manual"
                 control={<Radio color="secondary" />}
-                label="Manual Setup"
+                label="Manual Recipe"
               />
             </RadioGroup>
           </FormControl>
 
+          {/* Pre-specified Program Selection */}
+          {mode === "presetProgram" && (
+            <Box mt={2} display="flex" flexDirection="column" gap={2}>
+              {!canAddSavedProgram && machineState !== "running" ? (
+                <Typography variant="body2" sx={{ color: colors.redAccent[500] }}>
+                  To add a program, first remove all active and assigned recipes.
+                </Typography>
+              ) : !canAddSavedProgram ? null : (
+                <>
+                  <Autocomplete
+                    options={savedPrograms}
+                    getOptionLabel={(option) => 
+                      option.display_name 
+                        ? `${option.display_name}` 
+                        : option.name
+                    }
+                    renderOption={(props, option) => {
+                      const { key, ...otherProps } = props;
+                      return (
+                        <li key={option.id} {...otherProps} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                          <Box sx={{ display: 'flex', alignItems: 'center', flex: 1, minWidth: 0 }}>
+                            {option.is_favorite ? (
+                              <StarIcon sx={{ color: colors.tealAccent[500], fontSize: '18px', mr: 1 }} />
+                            ) : null}
+                            <Typography noWrap sx={{ flex: 1 }}>
+                              {option.display_name || option.name}
+                            </Typography>
+                            <Typography variant="caption" sx={{ ml: 1, color: colors.grey[500], flexShrink: 0 }}>
+                              ({option.recipes?.length || 0} recipes)
+                            </Typography>
+                          </Box>
+                          <Box sx={{ display: 'flex', ml: 1, flexShrink: 0 }}>
+                            <Tooltip title={option.is_favorite ? "Remove from favorites" : "Add to favorites"}>
+                              <IconButton
+                                size="small"
+                                onClick={(e) => handleToggleProgramFavorite(option.id, e)}
+                                sx={{ p: 0.5 }}
+                              >
+                                {option.is_favorite ? (
+                                  <StarIcon sx={{ fontSize: '18px', color: colors.tealAccent[500] }} />
+                                ) : (
+                                  <StarBorderIcon sx={{ fontSize: '18px', color: colors.grey[500] }} />
+                                )}
+                              </IconButton>
+                            </Tooltip>
+                            <Tooltip title="Delete program">
+                              <IconButton
+                                size="small"
+                                onClick={(e) => handleDeleteProgram(option.id, option.display_name || option.name, e)}
+                                sx={{ p: 0.5 }}
+                              >
+                                <DeleteOutlineIcon sx={{ fontSize: '18px', color: colors.redAccent[500] }} />
+                              </IconButton>
+                            </Tooltip>
+                          </Box>
+                        </li>
+                      );
+                    }}
+                    value={selectedSavedProgram}
+                    onChange={(event, newValue) => setSelectedSavedProgram(newValue)}
+                    loading={loadingSavedPrograms}
+                    renderInput={(params) => (
+                      <TextField
+                        {...params}
+                        label="Select Program"
+                        color="secondary"
+                        placeholder="Type to search..."
+                      />
+                    )}
+                    sx={{ width: "100%" }}
+                  />
+
+                  <Button
+                    variant="contained"
+                    color="secondary"
+                    onClick={handleAddSavedProgram}
+                    disabled={!selectedSavedProgram}
+                  >
+                    Add Program
+                  </Button>
+                </>
+              )}
+            </Box>
+          )}
+
           {/* Preset Recipe Selection */}
           {mode === "preset" && (
             <Box mt={2} display="flex" flexDirection="column" gap={2}>
-              <Autocomplete
-                options={recipes.filter(
-                  (recipe) =>
-                    !assignedRecipes.some((assigned) => assigned.recipeName === recipe.name) &&
-                    !activeRecipes.some((active) => active.recipeName === recipe.name)
-                )}
-                getOptionLabel={(option) => 
-                  option.display_name 
-                    ? `${option.display_name} (${option.name})` 
-                    : option.name
-                }
-                renderOption={(props, option) => (
-                  <li {...props} key={option.id}>
-                    {option.display_name 
-                      ? `${option.display_name} (${option.name})` 
-                      : option.name
-                    }
-                  </li>
-                )}
-                value={selectedRecipe}
-                onChange={(event, newValue) => setSelectedRecipe(newValue)}
-                loading={loadingRecipes}
-                renderInput={(params) => (
-                  <TextField
-                    {...params}
-                    label="Select Recipe"
-                    color="secondary"
-                    placeholder="Type to search (e.g., R_15_)"
-                  />
-                )}
-                sx={{ width: "100%" }}
-              />
-
-              {selectedRecipe && (
+              {allGatesUsed && machineState !== "running" ? (
+                <Typography variant="body2" sx={{ color: colors.redAccent[500] }}>
+                  To add a recipe, first remove at least one active or assigned recipe.
+                </Typography>
+              ) : allGatesUsed ? null : (
                 <>
+                  <Autocomplete
+                    options={recipes.filter(
+                      (recipe) =>
+                        !assignedRecipes.some((assigned) => assigned.recipeName === recipe.name) &&
+                        !activeRecipes.some((active) => active.recipeName === recipe.name)
+                    )}
+                    getOptionLabel={(option) => 
+                      option.display_name 
+                        ? `${option.display_name} (${option.name})` 
+                        : option.name
+                    }
+                    renderOption={(props, option) => {
+                      const { key, ...otherProps } = props;
+                      return (
+                        <li key={option.id} {...otherProps} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                          <Box sx={{ display: 'flex', alignItems: 'center', flex: 1, minWidth: 0 }}>
+                            {option.is_favorite ? (
+                              <StarIcon sx={{ color: colors.tealAccent[500], fontSize: '18px', mr: 1 }} />
+                            ) : null}
+                            <Typography noWrap sx={{ flex: 1 }}>
+                              {option.display_name 
+                                ? `${option.display_name} (${option.name})` 
+                                : option.name
+                              }
+                            </Typography>
+                          </Box>
+                          <Box sx={{ display: 'flex', ml: 1, flexShrink: 0 }}>
+                            <Tooltip title={option.is_favorite ? "Remove from favorites" : "Add to favorites"}>
+                              <IconButton
+                                size="small"
+                                onClick={(e) => handleToggleRecipeFavorite(option.id, e)}
+                                sx={{ p: 0.5 }}
+                              >
+                                {option.is_favorite ? (
+                                  <StarIcon sx={{ fontSize: '18px', color: colors.tealAccent[500] }} />
+                                ) : (
+                                  <StarBorderIcon sx={{ fontSize: '18px', color: colors.grey[500] }} />
+                                )}
+                              </IconButton>
+                            </Tooltip>
+                            <Tooltip title="Delete recipe">
+                              <IconButton
+                                size="small"
+                                onClick={(e) => handleDeleteRecipe(option.id, option.display_name || option.name, e)}
+                                sx={{ p: 0.5 }}
+                              >
+                                <DeleteOutlineIcon sx={{ fontSize: '18px', color: colors.redAccent[500] }} />
+                              </IconButton>
+                            </Tooltip>
+                          </Box>
+                        </li>
+                      );
+                    }}
+                    value={selectedRecipe}
+                    onChange={(event, newValue) => setSelectedRecipe(newValue)}
+                    loading={loadingRecipes}
+                    renderInput={(params) => (
+                      <TextField
+                        {...params}
+                        label="Select Recipe"
+                        color="secondary"
+                        placeholder="Type to search (e.g., R_15_)"
+                      />
+                    )}
+                    sx={{ width: "100%" }}
+                  />
+
+                  {selectedRecipe && (
+                    <>
+                      <Typography variant="h6" sx={{ mt: 1 }}>
+                        Assign to Gates:
+                      </Typography>
+                      <Box display="grid" gridTemplateColumns="repeat(4, 1fr)" gap={1}>
+                        {Array.from({ length: 8 }, (_, i) => i + 1).map((gate) => (
+                          <FormControlLabel
+                            key={gate}
+                            control={
+                              <Checkbox
+                                checked={presetGates.includes(gate)}
+                                onChange={() => togglePresetGate(gate)}
+                                disabled={usedGates.includes(gate)}
+                                color="secondary"
+                              />
+                            }
+                            label={`Gate ${gate}`}
+                          />
+                        ))}
+                      </Box>
+                    </>
+                  )}
+
+                  <Button
+                    variant="contained"
+                    color="secondary"
+                    onClick={handleAddPreset}
+                    disabled={!canAddPreset}
+                  >
+                    Add Recipe
+                  </Button>
+                </>
+              )}
+            </Box>
+          )}
+
+          {/* Manual Setup */}
+          {mode === "manual" && (
+            <Box mt={2} display="flex" flexDirection="column" gap={2}>
+              {allGatesUsed && machineState !== "running" ? (
+                <Typography variant="body2" sx={{ color: colors.redAccent[500] }}>
+                  To add a recipe, first remove at least one active or assigned recipe.
+                </Typography>
+              ) : allGatesUsed ? null : (
+                <>
+                  {/* Recipe Name (Optional) */}
+                  <TextField
+                    label="Recipe Name (optional)"
+                    color="secondary"
+                    fullWidth
+                    value={manualDisplayName}
+                    onChange={(e) => setManualDisplayName(e.target.value)}
+                    placeholder=""
+                  />
+
+                  {/* Piece Weight Bounds (Required) */}
+                  <Typography variant="h6" sx={{ mt: 1 }}>
+                    Piece Weight Bounds (required)
+                  </Typography>
+                  <Box display="flex" gap={2}>
+                    <TextField
+                      label="Piece Min Weight (g)"
+                      type="number"
+                      color="secondary"
+                      fullWidth
+                      value={manualPieceMin}
+                      onChange={(e) => setManualPieceMin(e.target.value)}
+                      inputProps={{ step: 1 }}
+                    />
+                    <TextField
+                      label="Piece Max Weight (g)"
+                      type="number"
+                      color="secondary"
+                      fullWidth
+                      value={manualPieceMax}
+                      onChange={(e) => setManualPieceMax(e.target.value)}
+                      inputProps={{ step: 1 }}
+                    />
+                  </Box>
+
+                  {/* Batch Weight Constraints (Optional) */}
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={manualBatchWeightEnabled}
+                        onChange={(e) => setManualBatchWeightEnabled(e.target.checked)}
+                        color="secondary"
+                      />
+                    }
+                    label="Apply Batch Weight Constraints"
+                  />
+                  {manualBatchWeightEnabled && (
+                    <Box display="flex" gap={2}>
+                      <TextField
+                        label="Batch Min Weight (g)"
+                        type="number"
+                        color="secondary"
+                        fullWidth
+                        value={manualBatchMin}
+                        onChange={(e) => setManualBatchMin(e.target.value)}
+                        inputProps={{ step: 1 }}
+                      />
+                      <TextField
+                        label="Batch Max Weight (g)"
+                        type="number"
+                        color="secondary"
+                        fullWidth
+                        value={manualBatchMax}
+                        onChange={(e) => setManualBatchMax(e.target.value)}
+                        inputProps={{ step: 1 }}
+                      />
+                    </Box>
+                  )}
+
+                  {/* Piece Count Constraints (Optional) */}
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={manualPieceCountEnabled}
+                        onChange={(e) => setManualPieceCountEnabled(e.target.checked)}
+                        color="secondary"
+                      />
+                    }
+                    label="Apply Piece Count Constraints"
+                  />
+                  {manualPieceCountEnabled && (
+                    <Box display="flex" gap={2}>
+                      <FormControl fullWidth>
+                        <InputLabel color="secondary">Count Type</InputLabel>
+                        <Select
+                          value={manualPieceCountType}
+                          label="Count Type"
+                          onChange={(e) => setManualPieceCountType(e.target.value)}
+                          color="secondary"
+                        >
+                          <MenuItem value="min">Min</MenuItem>
+                          <MenuItem value="max">Max</MenuItem>
+                          <MenuItem value="exact">Exact</MenuItem>
+                        </Select>
+                      </FormControl>
+                      <TextField
+                        label="Count"
+                        type="number"
+                        color="secondary"
+                        fullWidth
+                        value={manualPieceCount}
+                        onChange={(e) => setManualPieceCount(e.target.value)}
+                        inputProps={{ step: 1 }}
+                      />
+                    </Box>
+                  )}
+
+                  {/* Gate Assignment */}
                   <Typography variant="h6" sx={{ mt: 1 }}>
                     Assign to Gates:
                   </Typography>
@@ -996,8 +1566,8 @@ const Setup = () => {
                         key={gate}
                         control={
                           <Checkbox
-                            checked={presetGates.includes(gate)}
-                            onChange={() => togglePresetGate(gate)}
+                            checked={manualGates.includes(gate)}
+                            onChange={() => toggleManualGate(gate)}
                             disabled={usedGates.includes(gate)}
                             color="secondary"
                           />
@@ -1006,164 +1576,184 @@ const Setup = () => {
                       />
                     ))}
                   </Box>
+
+                  <Button
+                    variant="contained"
+                    color="secondary"
+                    onClick={handleAddManual}
+                    disabled={!canAddManual}
+                  >
+                    Save and Add Recipe
+                  </Button>
+
+                  {addError && (
+                    <Typography variant="body2" sx={{ color: colors.redAccent[500] }}>
+                      {addError}
+                    </Typography>
+                  )}
                 </>
               )}
-
-              <Button
-                variant="contained"
-                color="secondary"
-                onClick={handleAddPreset}
-                disabled={!canAddPreset}
-              >
-                Add Recipe
-              </Button>
             </Box>
           )}
 
-          {/* Manual Setup */}
-          {mode === "manual" && (
+          {/* Manual Program Creation */}
+          {mode === "manualProgram" && (
             <Box mt={2} display="flex" flexDirection="column" gap={2}>
-              {/* Recipe Name (Optional) */}
-              <TextField
-                label="Recipe Name (optional)"
-                color="secondary"
-                fullWidth
-                value={manualDisplayName}
-                onChange={(e) => setManualDisplayName(e.target.value)}
-                placeholder=""
-              />
-
-              {/* Piece Weight Bounds (Required) */}
-              <Typography variant="h6" sx={{ mt: 1 }}>
-                Piece Weight Bounds (required)
-              </Typography>
-              <Box display="flex" gap={2}>
-                <TextField
-                  label="Piece Min Weight (g)"
-                  type="number"
-                  color="secondary"
-                  fullWidth
-                  value={manualPieceMin}
-                  onChange={(e) => setManualPieceMin(e.target.value)}
-                  inputProps={{ step: 1 }}
-                />
-                <TextField
-                  label="Piece Max Weight (g)"
-                  type="number"
-                  color="secondary"
-                  fullWidth
-                  value={manualPieceMax}
-                  onChange={(e) => setManualPieceMax(e.target.value)}
-                  inputProps={{ step: 1 }}
-                />
-              </Box>
-
-              {/* Batch Weight Constraints (Optional) */}
-              <FormControlLabel
-                control={
-                  <Checkbox
-                    checked={manualBatchWeightEnabled}
-                    onChange={(e) => setManualBatchWeightEnabled(e.target.checked)}
-                    color="secondary"
-                  />
-                }
-                label="Apply Batch Weight Constraints"
-              />
-              {manualBatchWeightEnabled && (
-                <Box display="flex" gap={2}>
-                  <TextField
-                    label="Batch Min Weight (g)"
-                    type="number"
-                    color="secondary"
-                    fullWidth
-                    value={manualBatchMin}
-                    onChange={(e) => setManualBatchMin(e.target.value)}
-                    inputProps={{ step: 1 }}
-                  />
-                  <TextField
-                    label="Batch Max Weight (g)"
-                    type="number"
-                    color="secondary"
-                    fullWidth
-                    value={manualBatchMax}
-                    onChange={(e) => setManualBatchMax(e.target.value)}
-                    inputProps={{ step: 1 }}
-                  />
-                </Box>
-              )}
-
-              {/* Piece Count Constraints (Optional) */}
-              <FormControlLabel
-                control={
-                  <Checkbox
-                    checked={manualPieceCountEnabled}
-                    onChange={(e) => setManualPieceCountEnabled(e.target.checked)}
-                    color="secondary"
-                  />
-                }
-                label="Apply Piece Count Constraints"
-              />
-              {manualPieceCountEnabled && (
-                <Box display="flex" gap={2}>
-                  <FormControl fullWidth>
-                    <InputLabel color="secondary">Count Type</InputLabel>
-                    <Select
-                      value={manualPieceCountType}
-                      label="Count Type"
-                      onChange={(e) => setManualPieceCountType(e.target.value)}
-                      color="secondary"
-                    >
-                      <MenuItem value="min">Min</MenuItem>
-                      <MenuItem value="max">Max</MenuItem>
-                      <MenuItem value="exact">Exact</MenuItem>
-                    </Select>
-                  </FormControl>
-                  <TextField
-                    label="Count"
-                    type="number"
-                    color="secondary"
-                    fullWidth
-                    value={manualPieceCount}
-                    onChange={(e) => setManualPieceCount(e.target.value)}
-                    inputProps={{ step: 1 }}
-                  />
-                </Box>
-              )}
-
-              {/* Gate Assignment */}
-              <Typography variant="h6" sx={{ mt: 1 }}>
-                Assign to Gates:
-              </Typography>
-              <Box display="grid" gridTemplateColumns="repeat(4, 1fr)" gap={1}>
-                {Array.from({ length: 8 }, (_, i) => i + 1).map((gate) => (
-                  <FormControlLabel
-                    key={gate}
-                    control={
-                      <Checkbox
-                        checked={manualGates.includes(gate)}
-                        onChange={() => toggleManualGate(gate)}
-                        disabled={usedGates.includes(gate)}
-                        color="secondary"
-                      />
-                    }
-                    label={`Gate ${gate}`}
-                  />
-                ))}
-              </Box>
-
-              <Button
-                variant="contained"
-                color="secondary"
-                onClick={handleAddManual}
-                disabled={!canAddManual}
-              >
-                Add Recipe
-              </Button>
-
-              {addError && (
+              {!canAddSavedProgram && machineState !== "running" ? (
                 <Typography variant="body2" sx={{ color: colors.redAccent[500] }}>
-                  {addError}
+                  To create and add a program, first remove all active and assigned recipes.
                 </Typography>
+              ) : !canAddSavedProgram ? null : (
+                <>
+                  {/* Recipe Selection for Program */}
+                  <Autocomplete
+                    options={recipes.filter(
+                      (recipe) => !programRecipes.some((pr) => pr.recipeName === recipe.name)
+                    )}
+                    getOptionLabel={(option) => 
+                      option.display_name 
+                        ? `${option.display_name} (${option.name})` 
+                        : option.name
+                    }
+                    renderOption={(props, option) => (
+                      <li {...props} key={option.id}>
+                        {option.display_name 
+                          ? `${option.display_name} (${option.name})` 
+                          : option.name
+                        }
+                      </li>
+                    )}
+                    value={programSelectedRecipe}
+                    onChange={(event, newValue) => setProgramSelectedRecipe(newValue)}
+                    loading={loadingRecipes}
+                    renderInput={(params) => (
+                      <TextField
+                        {...params}
+                        label="Select Recipe"
+                        color="secondary"
+                        placeholder="Type to search..."
+                      />
+                    )}
+                    sx={{ width: "100%" }}
+                  />
+
+                  {/* Gate Assignment for Program Recipe */}
+                  {programSelectedRecipe && (
+                    <>
+                      <Typography variant="h6">
+                        Assign to Gates:
+                      </Typography>
+                      <Box display="grid" gridTemplateColumns="repeat(4, 1fr)" gap={1}>
+                        {Array.from({ length: 8 }, (_, i) => i + 1).map((gate) => (
+                          <FormControlLabel
+                            key={gate}
+                            control={
+                              <Checkbox
+                                checked={programGates.includes(gate)}
+                                onChange={() => toggleProgramGate(gate)}
+                                disabled={programUsedGates.includes(gate)}
+                                color="secondary"
+                              />
+                            }
+                            label={`Gate ${gate}`}
+                          />
+                        ))}
+                      </Box>
+
+                      <Button
+                        variant="outlined"
+                        color="secondary"
+                        onClick={handleAddRecipeToProgram}
+                        disabled={programGates.length === 0}
+                      >
+                        Add Recipe to Program
+                      </Button>
+                    </>
+                  )}
+
+                  {/* Program Recipes Table */}
+                  {programRecipes.length > 0 && (
+                    <Paper sx={{ p: 2, mt: 2, backgroundColor: colors.primary[200] }}>
+                      <Box display="grid" gridTemplateColumns="250px repeat(8, 20px) 100px" gap="2px">
+                        {/* Header */}
+                        <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center' }}>
+                          <Typography variant="body2" fontWeight="bold">Recipe</Typography>
+                        </Box>
+                        {[1, 2, 3, 4, 5, 6, 7, 8].map(gate => (
+                          <Box key={gate} sx={{ p: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                            <Typography variant="body2" fontWeight="bold">{gate}</Typography>
+                          </Box>
+                        ))}
+                        <Box />
+
+                        {/* Recipe rows */}
+                        {programRecipes.map((recipe, i) => {
+                          const recipeColor = recipeColors[i % recipeColors.length];
+                          return (
+                            <React.Fragment key={i}>
+                              <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', height: '28px' }}>
+                                <Typography variant="body2">
+                                  {recipe.displayName || recipe.recipeName}
+                                </Typography>
+                              </Box>
+                              {[1, 2, 3, 4, 5, 6, 7, 8].map(gate => (
+                                <Box 
+                                  key={`${i}-${gate}`} 
+                                  sx={{
+                                    backgroundColor: recipe.gates.includes(gate) ? recipeColor : undefined,
+                                    width: '20px',
+                                    height: '20px',
+                                    alignSelf: 'center',
+                                  }}
+                                />
+                              ))}
+                              <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '28px' }}>
+                                <Button
+                                  size="small"
+                                  color="error"
+                                  onClick={() => handleRemoveProgramRecipe(i)}
+                                  sx={{ minWidth: 'auto', p: 0.5, fontSize: '0.7rem' }}
+                                >
+                                  REMOVE
+                                </Button>
+                              </Box>
+                            </React.Fragment>
+                          );
+                        })}
+                      </Box>
+                    </Paper>
+                  )}
+
+                  {/* Program Name */}
+                  {programRecipes.length > 0 && (
+                    <>
+                      <TextField
+                        label="Program Name"
+                        color="secondary"
+                        fullWidth
+                        value={programName}
+                        onChange={(e) => setProgramName(e.target.value)}
+                        placeholder="Enter a name for this program"
+                        sx={{ mt: 3 }}
+                      />
+
+                      <Button
+                        variant="contained"
+                        color="secondary"
+                        onClick={handleSaveAndAddProgram}
+                        disabled={!programName.trim()}
+                      >
+                        Save and Add Program
+                      </Button>
+                    </>
+                  )}
+
+                  {programError && (
+                    <Typography variant="body2" sx={{ color: colors.redAccent[500] }}>
+                      {programError}
+                    </Typography>
+                  )}
+                </>
               )}
             </Box>
           )}
@@ -2176,6 +2766,57 @@ const Setup = () => {
             }}
           >
             Confirm Skip
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Delete Confirmation Dialog */}
+      <Dialog
+        open={deleteDialogOpen}
+        onClose={handleCloseDeleteDialog}
+        PaperProps={{
+          sx: {
+            backgroundColor: theme.palette.mode === 'dark' ? colors.primary[700] : colors.primary[200],
+            backgroundImage: 'none',
+          }
+        }}
+      >
+        <DialogTitle sx={{ 
+          fontWeight: 'bold',
+          color: colors.redAccent[500]
+        }}>
+          Delete {deleteItemType === 'recipe' ? 'Recipe' : 'Program'}?
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText sx={{ 
+            color: theme.palette.mode === 'dark' ? colors.grey[100] : colors.grey[800]
+          }}>
+            Are you sure you want to delete "{deleteItemName}"? This action cannot be undone.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button 
+            onClick={handleCloseDeleteDialog} 
+            sx={{ 
+              color: theme.palette.mode === 'dark' ? colors.grey[100] : colors.grey[900],
+              '&:hover': {
+                backgroundColor: theme.palette.mode === 'dark' ? colors.grey[500] : colors.grey[400],
+              }
+            }}
+          >
+            Cancel
+          </Button>
+          <Button 
+            onClick={handleConfirmDelete} 
+            sx={{ 
+              color: colors.redAccent[500],
+              '&:hover': {
+                backgroundColor: colors.redAccent[500],
+                color: '#fff',
+              }
+            }}
+          >
+            Delete
           </Button>
         </DialogActions>
       </Dialog>

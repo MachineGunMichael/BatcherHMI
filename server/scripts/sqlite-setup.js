@@ -37,6 +37,8 @@ function createBaseSchema() {
     CREATE TABLE IF NOT EXISTS recipes (
       id                    INTEGER PRIMARY KEY AUTOINCREMENT,
       name                  TEXT NOT NULL UNIQUE,
+      display_name          TEXT,
+      is_favorite           INTEGER DEFAULT 0,
       piece_min_weight_g    REAL NOT NULL,
       piece_max_weight_g    REAL NOT NULL,
       batch_min_weight_g    REAL,
@@ -503,6 +505,42 @@ function createMachineStateSchema() {
   console.log('✅ Machine state schema created.');
 }
 
+/* --------- saved program templates schema --------- */
+function createSavedProgramsSchema() {
+  // Table for saved program templates (user-created programs for quick setup)
+  run(`
+    CREATE TABLE IF NOT EXISTS saved_programs (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      name        TEXT NOT NULL UNIQUE,
+      display_name TEXT,
+      is_favorite INTEGER DEFAULT 0,
+      created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TRIGGER IF NOT EXISTS trg_saved_programs_updated_at
+    AFTER UPDATE ON saved_programs FOR EACH ROW BEGIN
+      UPDATE saved_programs SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
+    END;
+  `);
+  
+  // Table for recipes within saved program templates
+  run(`
+    CREATE TABLE IF NOT EXISTS saved_program_recipes (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      saved_program_id  INTEGER NOT NULL,
+      recipe_id         INTEGER,
+      recipe_name       TEXT NOT NULL,
+      display_name      TEXT,
+      gates             TEXT NOT NULL,
+      params            TEXT NOT NULL,
+      FOREIGN KEY (saved_program_id) REFERENCES saved_programs(id) ON DELETE CASCADE,
+      FOREIGN KEY (recipe_id) REFERENCES recipes(id) ON DELETE SET NULL
+    );
+  `);
+  
+  console.log('✅ Saved programs schema created.');
+}
+
 /* ---------------------- main ---------------------- */
 function main() {
   createBaseSchema();
@@ -513,6 +551,7 @@ function main() {
   createMachineStateSchema();
   seedDefaultProgramIfEmpty();
   addRecipeDisplayName();
+  createSavedProgramsSchema();
   console.log('✅ SQLite setup complete.');
 }
 main();
