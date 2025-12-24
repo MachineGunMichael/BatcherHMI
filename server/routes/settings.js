@@ -41,6 +41,7 @@ router.get('/recipes', verifyToken, (req, res) => {
       SELECT 
         id,
         name,
+        display_name,
         piece_min_weight_g,
         piece_max_weight_g,
         batch_min_weight_g,
@@ -68,6 +69,7 @@ router.post('/recipes', verifyToken, requireRole('admin', 'manager', 'operator')
     
     const {
       name,
+      display_name,
       piece_min_weight_g,
       piece_max_weight_g,
       batch_min_weight_g,
@@ -92,15 +94,17 @@ router.post('/recipes', verifyToken, requireRole('admin', 'manager', 'operator')
     const result = db.prepare(`
       INSERT INTO recipes (
         name,
+        display_name,
         piece_min_weight_g,
         piece_max_weight_g,
         batch_min_weight_g,
         batch_max_weight_g,
         min_pieces_per_batch,
         max_pieces_per_batch
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       name,
+      display_name || null,
       piece_min_weight_g,
       piece_max_weight_g,
       batch_min_weight_g || null,

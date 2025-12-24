@@ -39,6 +39,7 @@ const Stats = () => {
   const [pieceWeights, setPieceWeights] = useState([]);
   const [loading, setLoading] = useState(true);
   const [visibleRecipes, setVisibleRecipes] = useState({});
+  const [allRecipes, setAllRecipes] = useState([]); // All recipes for display name lookup
   
   // Separate visibility state for sunburst charts
   const [visiblePiecesCategories, setVisiblePiecesCategories] = useState({
@@ -106,10 +107,49 @@ const Stats = () => {
     borderRadius: '4px',
   };
 
-  // Load programs on mount
+  // Load programs and recipes on mount
   useEffect(() => {
     fetchPrograms();
+    fetchAllRecipes();
   }, []);
+
+  // Fetch all recipes for display name lookup
+  const fetchAllRecipes = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/api/settings/recipes`, {
+        headers: getAuthHeaders()
+      });
+      if (response.ok) {
+        const data = await response.json();
+        setAllRecipes(data.recipes || []);
+      }
+    } catch (error) {
+      console.error("Error fetching recipes for display names:", error);
+    }
+  };
+
+  // Build display name mapping from recipes
+  const recipeDisplayNames = useMemo(() => {
+    const map = {};
+    allRecipes.forEach(recipe => {
+      if (recipe.name && recipe.display_name) {
+        map[recipe.name] = recipe.display_name;
+      }
+    });
+    return map;
+  }, [allRecipes]);
+
+  // Helper to get display name for a recipe (returns display_name if available, otherwise formatted name)
+  const getDisplayName = (recipeName) => {
+    if (!recipeName) return '';
+    const displayName = recipeDisplayNames[recipeName];
+    if (displayName) return displayName;
+    // Format: remove R_ prefix and _NA_0 suffix for cleaner display
+    let formatted = recipeName;
+    if (formatted.startsWith("R_")) formatted = formatted.substring(2);
+    if (formatted.endsWith("_NA_0")) formatted = formatted.slice(0, -5);
+    return formatted;
+  };
 
   // Load program details when selection changes
   useEffect(() => {
@@ -396,7 +436,7 @@ const Stats = () => {
                 {programStats && programStats.start_ts && programStats.end_ts && (
                   <Typography
                     variant="body2"
-                    sx={{ 
+                  sx={{
                       mb: 2,
                       color: isDarkMode ? colors.primary[1000] : colors.primary[1000],
                       fontStyle: 'italic'
@@ -438,22 +478,28 @@ const Stats = () => {
                 </Box>
                 <Box sx={{ pl: TABLE_HEADER2_PADDING, display: 'flex', alignItems: 'center', justifyContent: 'flex-start', minHeight: TABLE_HEADER1_HEIGHT, gridColumn: 'span 2' }}>
                   <Typography variant="body2" fontWeight="bold">Pieces</Typography>
-                </Box>
+                  </Box>
 
                 {/* Header Level 2 - Detail headers */}
                 <Box sx={{ p: TABLE_HEADER2_PADDING, display: 'flex', alignItems: 'center', minHeight: TABLE_HEADER2_HEIGHT, mb: 1 }}>
                   {/* Empty cell for Recipe column */}
-                </Box>
+                    </Box>
                 {[1, 2, 3, 4, 5, 6, 7, 8].map(gate => (
                   <Box key={gate} sx={{ p: TABLE_HEADER2_PADDING, display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: TABLE_HEADER2_HEIGHT, mb: 1 }}>
                     <Typography variant="body2" fontWeight="bold">{gate}</Typography>
-                  </Box>
+                    </Box>
                 ))}
                 {/* Spacer column */}
                 <Box sx={{ mb: 1 }}/>
                 <Box sx={{ p: TABLE_HEADER2_PADDING, display: 'flex', alignItems: 'center', minHeight: TABLE_HEADER2_HEIGHT, mb: 1 }}>
                   <Typography variant="body2" fontWeight="bold">Min</Typography>
+                  </Box>
+                <Box sx={{ p: TABLE_HEADER2_PADDING, display: 'flex', alignItems: 'center', minHeight: TABLE_HEADER2_HEIGHT, mb: 1 }}>
+                  <Typography variant="body2" fontWeight="bold">Max</Typography>
                 </Box>
+                <Box sx={{ p: TABLE_HEADER2_PADDING, display: 'flex', alignItems: 'center', minHeight: TABLE_HEADER2_HEIGHT, mb: 1 }}>
+                  <Typography variant="body2" fontWeight="bold">Min</Typography>
+              </Box>
                 <Box sx={{ p: TABLE_HEADER2_PADDING, display: 'flex', alignItems: 'center', minHeight: TABLE_HEADER2_HEIGHT, mb: 1 }}>
                   <Typography variant="body2" fontWeight="bold">Max</Typography>
                 </Box>
@@ -462,13 +508,7 @@ const Stats = () => {
                 </Box>
                 <Box sx={{ p: TABLE_HEADER2_PADDING, display: 'flex', alignItems: 'center', minHeight: TABLE_HEADER2_HEIGHT, mb: 1 }}>
                   <Typography variant="body2" fontWeight="bold">Max</Typography>
-                </Box>
-                <Box sx={{ p: TABLE_HEADER2_PADDING, display: 'flex', alignItems: 'center', minHeight: TABLE_HEADER2_HEIGHT, mb: 1 }}>
-                  <Typography variant="body2" fontWeight="bold">Min</Typography>
-                </Box>
-                <Box sx={{ p: TABLE_HEADER2_PADDING, display: 'flex', alignItems: 'center', minHeight: TABLE_HEADER2_HEIGHT, mb: 1 }}>
-                  <Typography variant="body2" fontWeight="bold">Max</Typography>
-                </Box>
+          </Box>
 
                 {/* Recipe rows */}
                 {gateGridData.recipes.map(recipe => {
@@ -477,14 +517,14 @@ const Stats = () => {
                     <React.Fragment key={recipe}>
                       {/* Recipe name - left-aligned, full width */}
                       <Box sx={{ p: TABLE_ROW_PADDING, display: 'flex', alignItems: 'center', minHeight: TABLE_ROW_HEIGHT }}>
-                        <Typography variant="body2">{recipe}</Typography>
+                        <Typography variant="body2">{getDisplayName(recipe)}</Typography>
                       </Box>
                       
                       {/* Gate assignments - square boxes */}
                       {[1, 2, 3, 4, 5, 6, 7, 8].map(gate => (
                         <Box 
                           key={`${recipe}-${gate}`} 
-                      sx={{
+              sx={{
                             backgroundColor: gateGridData.grid[recipe]?.[gate] ? recipeColorMap[recipe] : undefined,
                             display: 'flex',
                             alignItems: 'center',
@@ -553,61 +593,61 @@ const Stats = () => {
                 </Typography>
                 <Typography variant="h3" fontWeight="bold">
                   {(programStats.total_batches ?? 0).toLocaleString()}
-                </Typography>
-              </Box>
+                    </Typography>
+                  </Box>
 
               {/* Total Pieces */}
               <Box sx={{ minWidth: 0 }}>
                 <Typography variant="h5" fontWeight="bold" color={colors.tealAccent[500]} mb={1}>
                   Total Pieces
-                </Typography>
+                      </Typography>
                 <Typography variant="h3" fontWeight="bold">
                   {((programStats.total_items_batched ?? 0) + (programStats.total_items_rejected ?? 0)).toLocaleString()}
-                </Typography>
+                      </Typography>
                 <Box display="flex" flexDirection="column" gap={1} mt={1}>
                   <Typography variant="body1">
                     Batched: <strong>{(programStats.total_items_batched ?? 0).toLocaleString()}</strong>
-                  </Typography>
+                      </Typography>
                   <Typography variant="body1">
                     Rejected: <strong>{(programStats.total_items_rejected ?? 0).toLocaleString()}</strong>
-                  </Typography>
+                      </Typography>
                 </Box>
-              </Box>
+                    </Box>
 
               {/* Total Giveaway Percentage */}
               <Box sx={{ minWidth: 0 }}>
                 <Typography variant="h5" fontWeight="bold" color={colors.tealAccent[500]} mb={1}>
                   Total Giveaway
-                </Typography>
+                      </Typography>
                 <Typography variant="h3" fontWeight="bold">
                   {(((programStats.total_giveaway_weight_g ?? 0) / (programStats.total_batched_weight_g ?? 1)) * 100).toFixed(2)}%
-                </Typography>
+                      </Typography>
                 <Typography variant="body1" mt={1}>
                   {((programStats.total_giveaway_weight_g ?? 0) / 1000).toFixed(2)} kg of {((programStats.total_batched_weight_g ?? 0) / 1000).toFixed(2)} kg
-                </Typography>
+                      </Typography>
               </Box>
 
               {/* Total Weight */}
               <Box sx={{ minWidth: 0 }}>
                 <Typography variant="h5" fontWeight="bold" color={colors.tealAccent[500]} mb={1}>
                   Total Weight 
-                </Typography>
+                      </Typography>
                 <Typography variant="h3" fontWeight="bold">
                   {(((programStats.total_batched_weight_g ?? 0) + (programStats.total_reject_weight_g ?? 0)) / 1000).toFixed(2)} kg
-                </Typography>
+                      </Typography>
                 <Typography variant="body1" mt={1}>
                   Average piece weight: <strong>
                     {(((programStats.total_batched_weight_g ?? 0) + (programStats.total_reject_weight_g ?? 0)) / 
                       Math.max(1, (programStats.total_items_batched ?? 0) + (programStats.total_items_rejected ?? 0))).toFixed(2)} g
                   </strong>
-                </Typography>
-              </Box>
-
+                      </Typography>
+                    </Box>
+                    
               {/* Weight Distribution Pie Chart */}
               <Box sx={{ minWidth: 0, gridColumn: "span 1", overflow: "visible" }}>
                 <Typography variant="h5" fontWeight="bold" color={colors.tealAccent[500]} mb={1}>
                   Weight Distribution
-                </Typography>
+                      </Typography>
                 <Box height="210px" sx={{ overflow: "visible", "& svg": { overflow: "visible" } }}>
                   <ResponsivePie
                     data={weightDistributionData}
@@ -640,11 +680,11 @@ const Stats = () => {
               <Box sx={{ minWidth: 0, gridColumn: "span 1" }}>
                 <Typography variant="h5" fontWeight="bold" color={colors.tealAccent[500]} mb={0.5}>
                   Piece Weight Distribution
-                </Typography>
+                      </Typography>
                 {pieceDistribution && pieceDistribution.totalPieces > 0 && (
                   <Typography variant="body2" color={colors.grey[500]} mb={1}>
                     {pieceDistribution.totalPieces.toLocaleString()} pieces • {pieceDistribution.minWeight}g - {pieceDistribution.maxWeight}g
-                  </Typography>
+                      </Typography>
                 )}
                 {pieceDistribution && pieceDistribution.bins && pieceDistribution.bins.length > 0 ? (
                   <Box height="230px">
@@ -719,11 +759,11 @@ const Stats = () => {
                   <Box height="230px" display="flex" alignItems="center" justifyContent="center">
                     <Typography variant="body2" color={colors.grey[500]}>
                       {pieceDistribution === null ? 'Loading piece data...' : 'No piece data available'}
-                    </Typography>
-                  </Box>
+                      </Typography>
+                    </Box>
                 )}
-              </Box>
-            </Box>
+                  </Box>
+                </Box>
           </Box>
         )}
 
@@ -731,13 +771,13 @@ const Stats = () => {
         {selectedProgramId && recipeStats.length > 0 && (
           <Box>
             <Box mb="20px">
-              <Typography
-                variant="h4"
-                fontWeight="bold"
-                sx={{ color: colors.tealAccent[500] }}
-              >
+                  <Typography
+                    variant="h4"
+                    fontWeight="bold"
+                    sx={{ color: colors.tealAccent[500] }}
+                  >
                 Recipe Stats
-              </Typography>
+                  </Typography>
             </Box>
 
             {/* Key Insights */}
@@ -773,19 +813,19 @@ const Stats = () => {
                     <Box display="flex" alignItems="center" gap={1}>
                       <span style={{ color: colors.tealAccent[500], minWidth: '20px', display: 'inline-block' }}>✓</span>
                       <Typography variant="body1" sx={{ color: colors.primary[800] }}>
-                        Recipe <strong>{mostBatchesRecipe.recipe_name}</strong> processed <strong>{mostBatchesPercent}%</strong> of all batches
+                        Recipe <strong>{getDisplayName(mostBatchesRecipe.recipe_name)}</strong> processed <strong>{mostBatchesPercent}%</strong> of all batches
                       </Typography>
                     </Box>
                     <Box display="flex" alignItems="center" gap={1}>
                       <span style={{ color: colors.redAccent[500], minWidth: '20px', display: 'inline-block' }}>⚠</span>
                       <Typography variant="body1" sx={{ color: colors.primary[800] }}>
-                        Recipe <strong>{highestGiveawayRecipe.recipe_name}</strong> has highest giveaway at <strong>{(highestGiveawayRecipe.total_giveaway_pct || 0).toFixed(2)}%</strong>
+                        Recipe <strong>{getDisplayName(highestGiveawayRecipe.recipe_name)}</strong> has highest giveaway at <strong>{(highestGiveawayRecipe.total_giveaway_pct || 0).toFixed(2)}%</strong>
                       </Typography>
                     </Box>
                     <Box display="flex" alignItems="center" gap={1}>
                       <span style={{ color: colors.tealAccent[500], minWidth: '20px', display: 'inline-block' }}>✓</span>
                       <Typography variant="body1" sx={{ color: colors.primary[800] }}>
-                        Recipe <strong>{mostPiecesRecipe.recipe_name}</strong> processed the most pieces at <strong>{mostPiecesCount}</strong> pieces
+                        Recipe <strong>{getDisplayName(mostPiecesRecipe.recipe_name)}</strong> processed the most pieces at <strong>{mostPiecesCount}</strong> pieces
                       </Typography>
                     </Box>
                   </Box>
@@ -809,12 +849,12 @@ const Stats = () => {
                 <Typography variant="h5" color={colors.tealAccent[500]} mb={1}>
                   Recipes
                 </Typography>
-                <Box 
-                  display="flex"
+                  <Box 
+                    display="flex" 
                   flexDirection="column"
                   gap="8px"
                   mt={2}
-                >
+                  >
                   {recipeStats.map((recipe) => {
                     const recipeColor = recipeColorMap[recipe.recipe_name] || colors.grey[500];
                     return (
@@ -848,32 +888,32 @@ const Stats = () => {
                           sx={{ backgroundColor: recipeColor, flexShrink: 0 }} 
                         />
                         <Typography variant="body2" color={colors.primary[800]} >
-                          {recipe.recipe_name}
+                          {getDisplayName(recipe.recipe_name)}
                         </Typography>
                       </Box>
                     );
                   })}
+                  </Box>
                 </Box>
-              </Box>
 
               {/* Chart 1 - Total Batches */}
-              <Box sx={{ width: "100%", minWidth: 0 }}>
-                <Typography variant="h5" color={colors.tealAccent[500]} mb={1}>
+                  <Box sx={{ width: "100%", minWidth: 0 }}>
+                    <Typography variant="h5" color={colors.tealAccent[500]} mb={1}>
                   Total Batches
-                </Typography>
-                <Box height="300px" width="100%">
-                  <ResponsiveBar
+                    </Typography>
+                    <Box height="300px" width="100%">
+                      <ResponsiveBar
                     data={recipeStats
                       .filter(r => visibleRecipes[r.recipe_name] !== false)
                       .map(r => ({
-                        recipe: r.recipe_name,
+                        recipe: getDisplayName(r.recipe_name),
                         value: r.total_batches,
                         recipeColor: recipeColorMap[r.recipe_name] || colors.grey[500]
                       }))}
-                    keys={['value']}
+                        keys={['value']}
                     indexBy="recipe"
                     colors={({ data }) => data.recipeColor}
-                    theme={chartTheme}
+                        theme={chartTheme}
                     valueFormat={value => value.toFixed(1)}
                     padding={0.3}
                     margin={{ top: 20, right: 20, bottom: 20, left: 60 }}
@@ -903,32 +943,32 @@ const Stats = () => {
                     labelSkipHeight={12}
                     enableGridY={false}
                     labelTextColor="#ffffff"
-                  />
-                </Box>
-              </Box>
+                      />
+                    </Box>
+                  </Box>
 
               {/* Chart 2 - Average Weight per Batch */}
-              <Box sx={{ width: "100%", minWidth: 0 }}>
-                <Typography variant="h5" color={colors.tealAccent[500]} mb={1}>
+                  <Box sx={{ width: "100%", minWidth: 0 }}>
+                    <Typography variant="h5" color={colors.tealAccent[500]} mb={1}>
                   Average Weight per Batch (g)
-                </Typography>
-                <Box height="300px" width="100%">
-                  <ResponsiveBar
+                    </Typography>
+                    <Box height="300px" width="100%">
+                      <ResponsiveBar
                     data={recipeStats
                       .filter(r => visibleRecipes[r.recipe_name] !== false)
                       .map(r => {
                         const avgWeight = r.total_batches > 0 ? (r.total_weight_processed_g / r.total_batches) : 0;
                         return {
-                          recipe: r.recipe_name,
+                          recipe: getDisplayName(r.recipe_name),
                           value: avgWeight,
                           recipeColor: recipeColorMap[r.recipe_name] || colors.grey[500]
                         };
                       })}
-                    keys={['value']}
+                        keys={['value']}
                     indexBy="recipe"
                     colors={({ data }) => data.recipeColor}
                     valueFormat={value => value.toFixed(1)}
-                    theme={chartTheme}
+                        theme={chartTheme}
                     padding={0.3}
                     margin={{ top: 20, right: 20, bottom: 20, left: 60 }}
                     valueScale={{ type: 'linear' }}
@@ -957,29 +997,29 @@ const Stats = () => {
                     labelSkipHeight={12}
                     enableGridY={false}
                     labelTextColor="#ffffff"
-                  />
-                </Box>
-              </Box>
+                      />
+                    </Box>
+                  </Box>
 
               {/* Chart 3 - Average Pieces per Batch */}
-              <Box sx={{ width: "100%", minWidth: 0 }}>
-                <Typography variant="h5" color={colors.tealAccent[500]} mb={1}>
+                  <Box sx={{ width: "100%", minWidth: 0 }}>
+                    <Typography variant="h5" color={colors.tealAccent[500]} mb={1}>
                   Average Pieces per Batch
-                </Typography>
-                <Box height="300px" width="100%">
-                  <ResponsiveBar
+                    </Typography>
+                    <Box height="300px" width="100%">
+                      <ResponsiveBar
                     data={recipeStats
                       .filter(r => visibleRecipes[r.recipe_name] !== false)
                       .map(r => ({
-                        recipe: r.recipe_name,
+                        recipe: getDisplayName(r.recipe_name),
                         value: r.total_batches > 0 ? (r.total_items_batched / r.total_batches) : 0,
                         recipeColor: recipeColorMap[r.recipe_name] || colors.grey[500]
                       }))}
-                    keys={['value']}
+                        keys={['value']}
                     indexBy="recipe"
                     colors={({ data }) => data.recipeColor}
                     valueFormat={value => value.toFixed(1)}
-                    theme={chartTheme}
+                        theme={chartTheme}
                     padding={0.3}
                     margin={{ top: 20, right: 20, bottom: 20, left: 60 }}
                     valueScale={{ type: 'linear' }}
@@ -1009,10 +1049,10 @@ const Stats = () => {
                     enableGridY={false}
                     labelTextColor="#ffffff"
                   />
+                  </Box>
                 </Box>
               </Box>
-            </Box>
-
+              
             {/* Second Row - Giveaway Pie + Sunburst Charts */}
             <Box
               display="grid"
@@ -1028,8 +1068,8 @@ const Stats = () => {
               <Box sx={{ width: "100%", minWidth: 0 }}>
                 <Typography variant="h5" color={colors.tealAccent[500]} mb={1}>
                   Giveaway (%)
-                </Typography>
-                
+              </Typography>
+              
                 {/* Spacer to match sunburst legend height */}
                 <Box mb={9.0} />
                 
@@ -1038,8 +1078,8 @@ const Stats = () => {
                     data={recipeStats
                       .filter(r => visibleRecipes[r.recipe_name] !== false && r.total_giveaway_pct != null)
                       .map(r => ({
-                        id: r.recipe_name,
-                        label: r.recipe_name,
+                        id: getDisplayName(r.recipe_name),
+                        label: getDisplayName(r.recipe_name),
                         value: r.total_giveaway_pct || 0,
                         color: recipeColorMap[r.recipe_name] || colors.grey[500]
                       }))}
@@ -1141,12 +1181,12 @@ const Stats = () => {
                           />
                           <Typography variant="body2" color={colors.primary[800]}>
                             Rejected
-                          </Typography>
+                        </Typography>
                         </Box>
                       </Box>
                     </Box>
-                  </Box>
-                
+                      </Box>
+
                 <Box height="300px" width="100%">
                   <ResponsiveSunburst
                     key={`pieces-sunburst-${selectedProgramId}-${visiblePiecesCategories.batched}-${visiblePiecesCategories.rejected}`}
@@ -1169,19 +1209,20 @@ const Stats = () => {
                           
                           // Add an "inner ring" entry for this recipe
                           // Children ALWAYS present - hidden ones use background color for "gap" effect
+                          const displayName = getDisplayName(r.recipe_name);
                           outerRingSegments.push({
-                            name: r.recipe_name,
+                            name: displayName,
                             color: baseColor,
                             children: [
                               {
-                                name: `${r.recipe_name}_Batched`,
+                                name: `${displayName}_Batched`,
                                 // Use page background color if hidden to create "gap" effect (white/dark)
                                 color: visiblePiecesCategories.batched ? colorFamily[400] : colors.primary[100],
                                 value: batchedValue,
                                 hidden: !visiblePiecesCategories.batched // Flag for label filtering
                               },
                               {
-                                name: `${r.recipe_name}_Rejected`,
+                                name: `${displayName}_Rejected`,
                                 // Use page background color if hidden to create "gap" effect (white/dark)
                                 color: visiblePiecesCategories.rejected ? colorFamily[300] : colors.primary[100],
                                 value: rejectedValue,
@@ -1236,7 +1277,7 @@ const Stats = () => {
               <Box sx={{ width: "100%", minWidth: 0 }}>
                 <Typography variant="h5" color={colors.tealAccent[500]} mb={1}>
                   Total Weight (kg)
-                </Typography>
+                        </Typography>
                 
                   {/* Legend for Weight Sunburst */}
                   <Box display="flex" flexDirection="column" gap={1} mb={2}>
@@ -1244,7 +1285,7 @@ const Stats = () => {
                     <Box display="flex" alignItems="center" gap={1}>
                       <Typography variant="body2" sx={{ fontWeight: 'bold', width: 90 }}>
                         Inner Ring:
-                      </Typography>
+                        </Typography>
                       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                         <Typography variant="body2">Eligible</Typography>
                       </Box>
@@ -1281,7 +1322,7 @@ const Stats = () => {
                           />
                           <Typography variant="body2" color={colors.primary[800]}>
                             Batched
-                          </Typography>
+              </Typography>
                         </Box>
                         <Box
                           onClick={() => setVisibleWeightCategories(prev => ({ ...prev, rejected: !prev.rejected }))}
@@ -1308,7 +1349,7 @@ const Stats = () => {
                           />
                           <Typography variant="body2" color={colors.primary[800]}>
                             Rejected
-                          </Typography>
+                        </Typography>
                         </Box>
                         <Box
                           onClick={() => setVisibleWeightCategories(prev => ({ ...prev, giveaway: !prev.giveaway }))}
@@ -1359,25 +1400,26 @@ const Stats = () => {
                           const batchedValue = r.total_batched_weight_g || 0;
                           const rejectedValue = r.total_reject_weight_g || 0;
                           const giveawayValue = r.total_giveaway_weight_g || 0;
+                          const displayName = getDisplayName(r.recipe_name);
                           
                           // Children ALWAYS present - hidden ones use background color for "gap" effect
                           const children = [
                             {
-                              name: `${r.recipe_name}_Batched`,
+                              name: `${displayName}_Batched`,
                               // Use page background color if hidden to create "gap" effect (white/dark)
                               color: visibleWeightCategories.batched ? colorFamily[400] : colors.primary[100],
                               value: batchedValue,
                               hidden: !visibleWeightCategories.batched // Flag for label filtering
                             },
                             {
-                              name: `${r.recipe_name}_Rejected`,
+                              name: `${displayName}_Rejected`,
                               // Use page background color if hidden to create "gap" effect (white/dark)
                               color: visibleWeightCategories.rejected ? colorFamily[300] : colors.primary[100],
                               value: rejectedValue,
                               hidden: !visibleWeightCategories.rejected // Flag for label filtering
                             },
                             {
-                              name: `${r.recipe_name}_Giveaway`,
+                              name: `${displayName}_Giveaway`,
                               // Use page background color if hidden to create "gap" effect (white/dark)
                               color: visibleWeightCategories.giveaway ? colorFamily[200] : colors.primary[100],
                               value: giveawayValue,
@@ -1386,7 +1428,7 @@ const Stats = () => {
                           ];
                           
                           return {
-                            name: r.recipe_name,
+                            name: displayName,
                             color: baseColor,
                             children
                           };
@@ -1470,7 +1512,7 @@ const Stats = () => {
                 <Box sx={{ width: "100%", minWidth: 0 }}>
                   <Typography variant="h5" color={colors.tealAccent[500]} mb={1}>
                     Batches per Minute
-                  </Typography>
+                                </Typography>
                   <Box height="300px" width="100%">
                     <ResponsiveLine
                       data={batchesLineData}
@@ -1516,7 +1558,7 @@ const Stats = () => {
                 <Box sx={{ width: "100%", minWidth: 0 }}>
                   <Typography variant="h5" color={colors.tealAccent[500]} mb={1}>
                     Pieces per Minute
-                  </Typography>
+                                </Typography>
                   <Box height="300px" width="100%">
                     <ResponsiveLine
                       data={piecesLineData}
@@ -1563,7 +1605,7 @@ const Stats = () => {
                 <Box sx={{ width: "100%", minWidth: 0 }}>
                   <Typography variant="h5" color={colors.tealAccent[500]} mb={1}>
                     Weight per Minute (kg)
-                  </Typography>
+                                </Typography>
                   <Box height="300px" width="100%">
                     <ResponsiveLine
                       data={weightLineData}
@@ -1613,12 +1655,12 @@ const Stats = () => {
                           </Typography>
                           <Typography variant="body2" color={tooltipStyle.color}>
                             Weight: {(point.data.y / 1000).toFixed(2)} kg
-                          </Typography>
-                        </Box>
-                      )}
+                                </Typography>
+                              </Box>
+                              )}
                     />
-                  </Box>
-                </Box>
+                            </Box>
+                      </Box>
               </Box>
 
               {/* Piece Weight Distribution Scatter Plot - Full Width Row */}
@@ -1684,7 +1726,7 @@ const Stats = () => {
                           isInteractive={false}
                           animate={false}
                         />
-                      </Box>
+            </Box>
 
                       {/* Scatter Points - using ResponsiveLine with only scatter data, no line */}
                       <Box position="absolute" top={0} left={0} right={0} bottom={0}>
@@ -1736,11 +1778,11 @@ const Stats = () => {
                                 <Typography variant="body2" color={tooltipStyle.color}>
                                   Weight: {point.data.y.toFixed(1)} g
                                 </Typography>
-                              </Box>
+        </Box>
                             );
                           }}
                         />
-                      </Box>
+      </Box>
                     </Box>
                   </Box>
                 );

@@ -59,6 +59,7 @@ const Setup = () => {
   const [presetGates, setPresetGates] = useState([]);
 
   // Manual mode state
+  const [manualDisplayName, setManualDisplayName] = useState(""); // Optional custom name
   const [manualPieceMin, setManualPieceMin] = useState("");
   const [manualPieceMax, setManualPieceMax] = useState("");
   const [manualBatchWeightEnabled, setManualBatchWeightEnabled] = useState(false);
@@ -177,6 +178,7 @@ const Setup = () => {
             removedRecipesByName[recipeName] = {
               recipeName: recipeName,
               recipeId: originalRecipe.recipeId,
+              displayName: originalRecipe.displayName || originalRecipe.display_name || null, // Preserve display name
               params: originalRecipe.params,
               gates: [],
               isRemovedTransitioning: true, // Flag to identify removed recipes/gates
@@ -298,6 +300,13 @@ const Setup = () => {
     }
   };
 
+  // Helper to get the best display name for a recipe
+  // Returns displayName if available, otherwise recipeName
+  const getRecipeDisplayName = (recipe) => {
+    if (!recipe) return '';
+    return recipe.displayName || recipe.display_name || recipe.recipeName || recipe.name || '';
+  };
+
   // Parse recipe name to get parameters
   const parseRecipeName = (name) => {
     // Format: R_pieceMin_pieceMax_batchMin_batchMax_countType_countVal
@@ -350,6 +359,7 @@ const Setup = () => {
   };
 
   const resetManualForm = () => {
+    setManualDisplayName("");
     setManualPieceMin("");
     setManualPieceMax("");
     setManualBatchWeightEnabled(false);
@@ -415,6 +425,7 @@ const Setup = () => {
       type: "preset",
       recipeId: selectedRecipe.id,
       recipeName: selectedRecipe.name,
+      displayName: selectedRecipe.display_name || null,
       params: parseRecipeName(selectedRecipe.name),
       gates: presetGates,
     };
@@ -502,19 +513,20 @@ const Setup = () => {
       try {
         const response = await api.post("/settings/recipes", {
           name: recipeName,
-        piece_min_weight_g: params.pieceMinWeight,
-        piece_max_weight_g: params.pieceMaxWeight,
-        batch_min_weight_g: params.batchMinWeight,
-        batch_max_weight_g: params.batchMaxWeight,
-        min_pieces_per_batch:
-          params.countType === "min" || params.countType === "exact"
-            ? params.countValue
-            : null,
-        max_pieces_per_batch:
-          params.countType === "max" || params.countType === "exact"
-            ? params.countValue
-            : null,
-      });
+          display_name: manualDisplayName || null, // Optional custom name
+          piece_min_weight_g: params.pieceMinWeight,
+          piece_max_weight_g: params.pieceMaxWeight,
+          batch_min_weight_g: params.batchMinWeight,
+          batch_max_weight_g: params.batchMaxWeight,
+          min_pieces_per_batch:
+            params.countType === "min" || params.countType === "exact"
+              ? params.countValue
+              : null,
+          max_pieces_per_batch:
+            params.countType === "max" || params.countType === "exact"
+              ? params.countValue
+              : null,
+        });
 
         // Get the new recipe ID from response (API returns { recipe: {...} })
         recipeId = response.data?.recipe?.id || null;
@@ -535,6 +547,7 @@ const Setup = () => {
       type: "manual",
       recipeId: recipeId,
       recipeName,
+      displayName: manualDisplayName || null, // Optional custom name
       params,
       gates: manualGates,
     };
@@ -624,17 +637,32 @@ const Setup = () => {
     const oldRecipe = assignedRecipes[editingAssignedIndex];
     const recipeNameChanged = oldRecipe.recipeName !== newRecipeName;
     
+    // Look up the new recipe's display name from the recipes list
+    let newDisplayName = null;
+    let newRecipeId = recipeNameChanged ? null : oldRecipe.recipeId;
+    if (recipeNameChanged) {
+      const matchingRecipe = recipes.find(r => r.name === newRecipeName);
+      if (matchingRecipe) {
+        newDisplayName = matchingRecipe.display_name || null;
+        newRecipeId = matchingRecipe.id;
+      }
+    } else {
+      // Keep the original display name if recipe name didn't change
+      newDisplayName = oldRecipe.displayName || oldRecipe.display_name || null;
+    }
+    
     const updatedRecipes = [...assignedRecipes];
     updatedRecipes[editingAssignedIndex] = {
       ...updatedRecipes[editingAssignedIndex],
-      recipeId: recipeNameChanged ? null : oldRecipe.recipeId, // Clear if name changed
+      recipeId: newRecipeId,
       recipeName: newRecipeName,
+      displayName: newDisplayName,
       params: newParams,
       gates: editAssignedData.gates
     };
     
     if (recipeNameChanged) {
-      console.log(`[Setup] Assigned recipe name changed: ${oldRecipe.recipeName} → ${newRecipeName}, clearing recipeId`);
+      console.log(`[Setup] Assigned recipe name changed: ${oldRecipe.recipeName} → ${newRecipeName}, new displayName: ${newDisplayName}`);
     }
 
     setAssignedRecipes(updatedRecipes);
@@ -822,17 +850,32 @@ const Setup = () => {
     const oldRecipe = activeRecipes[editingActiveIndex];
     const recipeNameChanged = oldRecipe.recipeName !== newRecipeName;
     
+    // Look up the new recipe's display name from the recipes list
+    let newDisplayName = null;
+    let newRecipeId = recipeNameChanged ? null : oldRecipe.recipeId;
+    if (recipeNameChanged) {
+      const matchingRecipe = recipes.find(r => r.name === newRecipeName);
+      if (matchingRecipe) {
+        newDisplayName = matchingRecipe.display_name || null;
+        newRecipeId = matchingRecipe.id;
+      }
+    } else {
+      // Keep the original display name if recipe name didn't change
+      newDisplayName = oldRecipe.displayName || oldRecipe.display_name || null;
+    }
+    
     const updatedRecipes = [...activeRecipes];
     updatedRecipes[editingActiveIndex] = {
       ...updatedRecipes[editingActiveIndex],
-      recipeId: recipeNameChanged ? null : oldRecipe.recipeId, // Clear if name changed
+      recipeId: newRecipeId,
       recipeName: newRecipeName,
+      displayName: newDisplayName,
       params: newParams,
       gates: editActiveData.gates
     };
     
     if (recipeNameChanged) {
-      console.log(`[Setup] Recipe name changed: ${oldRecipe.recipeName} → ${newRecipeName}, clearing recipeId`);
+      console.log(`[Setup] Recipe name changed: ${oldRecipe.recipeName} → ${newRecipeName}, new displayName: ${newDisplayName}`);
     }
 
     // Push updated recipes to backend (so it knows about the edit)
@@ -915,7 +958,19 @@ const Setup = () => {
                     !assignedRecipes.some((assigned) => assigned.recipeName === recipe.name) &&
                     !activeRecipes.some((active) => active.recipeName === recipe.name)
                 )}
-                getOptionLabel={(option) => option.name}
+                getOptionLabel={(option) => 
+                  option.display_name 
+                    ? `${option.display_name} (${option.name})` 
+                    : option.name
+                }
+                renderOption={(props, option) => (
+                  <li {...props} key={option.id}>
+                    {option.display_name 
+                      ? `${option.display_name} (${option.name})` 
+                      : option.name
+                    }
+                  </li>
+                )}
                 value={selectedRecipe}
                 onChange={(event, newValue) => setSelectedRecipe(newValue)}
                 loading={loadingRecipes}
@@ -968,6 +1023,16 @@ const Setup = () => {
           {/* Manual Setup */}
           {mode === "manual" && (
             <Box mt={2} display="flex" flexDirection="column" gap={2}>
+              {/* Recipe Name (Optional) */}
+              <TextField
+                label="Recipe Name (optional)"
+                color="secondary"
+                fullWidth
+                value={manualDisplayName}
+                onChange={(e) => setManualDisplayName(e.target.value)}
+                placeholder=""
+              />
+
               {/* Piece Weight Bounds (Required) */}
               <Typography variant="h6" sx={{ mt: 1 }}>
                 Piece Weight Bounds (required)
@@ -1208,7 +1273,7 @@ const Setup = () => {
                       <React.Fragment key={i}>
                         {/* Recipe name - left-aligned */}
                         <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', minHeight: '20px' }}>
-                          <Typography variant="body2">{recipe.recipeName}</Typography>
+                          <Typography variant="body2">{getRecipeDisplayName(recipe)}</Typography>
                         </Box>
                         
                         {/* Gate assignments - square boxes */}
@@ -1637,8 +1702,8 @@ const Setup = () => {
                             {recipe._isPartialRemoval 
                               ? `↳ Gate${recipe.gates.length > 1 ? 's' : ''} ${recipe.gates.join(', ')} (removing)`
                               : showAsReplacement
-                                ? `↳ ${recipe.recipeName} (replacing)`
-                                : recipe.recipeName
+                                ? `↳ ${getRecipeDisplayName(recipe)} (replacing)`
+                                : getRecipeDisplayName(recipe)
                             }
                           </Typography>
                         </Box>

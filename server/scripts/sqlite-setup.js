@@ -460,6 +460,14 @@ function seedDefaultProgramIfEmpty() {
   console.log('⏩ Skipping recipe/program seed. Python worker will load them.');
 }
 
+/* -------------- add display_name to recipes -------------- */
+function addRecipeDisplayName() {
+  if (!columnExists('recipes', 'display_name')) {
+    run(`ALTER TABLE recipes ADD COLUMN display_name TEXT;`);
+    console.log('Added recipes.display_name');
+  }
+}
+
 /* -------------- machine state schema -------------- */
 function createMachineStateSchema() {
   run(`
@@ -504,6 +512,7 @@ function main() {
   createStatisticsSchema();
   createMachineStateSchema();
   seedDefaultProgramIfEmpty();
+  addRecipeDisplayName();
   console.log('✅ SQLite setup complete.');
 }
 main();

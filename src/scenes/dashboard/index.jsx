@@ -71,7 +71,7 @@ const ScatterNode = ({ node }) => {
 };
 
 /* ---------- Annotated machine image with per-gate overlay ---------- */
-const AnnotatedMachineImage = ({ colorMap, assignmentsByGate, overlayByGate, transitioningGates, gateToNewRecipe }) => {
+const AnnotatedMachineImage = ({ colorMap, assignmentsByGate, overlayByGate, transitioningGates, gateToNewRecipe, getDisplayName }) => {
   const theme = useTheme();
   const colors = tokens(theme.palette.mode);
 
@@ -154,7 +154,7 @@ const AnnotatedMachineImage = ({ colorMap, assignmentsByGate, overlayByGate, tra
             >
               <Box sx={{ backgroundColor: headColor, py: 0.1, px: 0.5, textAlign: 'left' }}>
                 <Typography variant="h8" color="#fff">
-                  G{pos.gate}: {formatRecipeName(program)}
+                  G{pos.gate}: {getDisplayName(program)}
                 </Typography>
               </Box>
               <Box sx={{ p: 0.5 }}>
@@ -267,6 +267,30 @@ const Dashboard = () => {
     });
     return names;
   }, [transitionStartRecipes]);
+
+  // Build map of recipeName -> displayName for showing friendly names
+  const recipeDisplayNames = useMemo(() => {
+    const map = {};
+    (activeRecipes || []).forEach(recipe => {
+      if (recipe.recipeName) {
+        map[recipe.recipeName] = recipe.displayName || recipe.display_name || null;
+      }
+    });
+    // Also include transitioning recipes
+    Object.values(transitionStartRecipes || {}).forEach(recipe => {
+      if (recipe && recipe.recipeName && !map[recipe.recipeName]) {
+        map[recipe.recipeName] = recipe.displayName || recipe.display_name || null;
+      }
+    });
+    return map;
+  }, [activeRecipes, transitionStartRecipes]);
+
+  // Helper to get display name for a recipe
+  const getDisplayName = (recipeName) => {
+    if (!recipeName || recipeName === "Total") return recipeName;
+    const displayName = recipeDisplayNames[recipeName];
+    return displayName || formatRecipeName(recipeName);
+  };
 
   // global toggles from AppContext
   const { dashboardVisibleSeries, setDashboardVisibleSeries } = useAppContext();
@@ -443,7 +467,7 @@ const Dashboard = () => {
           border: `1px solid ${point.serieColor}`,
         }}>
           <Typography variant="body2" sx={{ color: isDark ? "#eee" : "#111", fontWeight: 'bold' }}>
-            {formatRecipeName(point.serieId)}
+            {getDisplayName(point.serieId)}
           </Typography>
           <Typography variant="body2" sx={{ color: isDark ? "#eee" : "#111" }}>
             {formatTimeLabel(point.data.x)}: {Number(point.data.y).toFixed(2)}
@@ -490,7 +514,7 @@ const Dashboard = () => {
           border: `1px solid ${datum.color}`,
         }}>
           <Typography variant="body2" sx={{ color: isDark ? "#eee" : "#111", fontWeight: 'bold' }}>
-            {formatRecipeName(datum.id)}
+            {getDisplayName(datum.id)}
           </Typography>
           <Typography variant="body2" sx={{ color: isDark ? "#eee" : "#111" }}>
             {Number(datum.value).toFixed(1)}
@@ -714,6 +738,7 @@ const Dashboard = () => {
             overlayByGate={overlayByGate}
             transitioningGates={transitioningGates}
             gateToNewRecipe={gateToNewRecipe}
+            getDisplayName={getDisplayName}
           />
         </Box>
 
@@ -882,7 +907,7 @@ const Dashboard = () => {
                   }}
                 >
                   <Box width="10px" height="10px" borderRadius="50%" sx={{ backgroundColor: colorMap[name] || colors.primary[700] }} />
-                  <Typography variant="body2" fontSize="11px" color={colors.primary[800]}>{formatRecipeName(name)}</Typography>
+                  <Typography variant="body2" fontSize="11px" color={colors.primary[800]}>{getDisplayName(name)}</Typography>
                 </Box>
               );
             })}

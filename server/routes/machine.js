@@ -806,6 +806,7 @@ router.post('/recipes', (req, res) => {
           oldGateToRecipe[gate] = {
             recipeId: recipe.recipeId,
             recipeName: recipe.recipeName,
+            displayName: recipe.displayName || recipe.display_name || null,
             params: recipe.params,
           };
         }
@@ -818,6 +819,7 @@ router.post('/recipes', (req, res) => {
           newGateToRecipe[gate] = {
             recipeId: recipe.recipeId,
             recipeName: recipe.recipeName,
+            displayName: recipe.displayName || recipe.display_name || null,
             params: recipe.params,
           };
         }
