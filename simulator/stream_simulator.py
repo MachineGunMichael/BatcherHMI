@@ -200,14 +200,15 @@ class DataStreamSimulator:
               f"Rate: {rate:.1f} pieces/sec | Elapsed: {elapsed:.1f}s", end='', flush=True)
     
     def run(self):
-        """Run the simulator"""
+        """Run the simulator (loops infinitely)"""
         print("\n" + "=" * 70)
-        print("🚀 Starting Real-Time Data Stream Simulator")
+        print("🚀 Starting Real-Time Data Stream Simulator (Infinite Loop)")
         print("=" * 70)
         print(f"Server: {self.config.server_url}")
         print(f"Frequency: {self.config.pieces_per_second} pieces/sec")
         print(f"Interval: {1000/self.config.pieces_per_second:.1f}ms per piece")
         print(f"Batch size: {self.config.batch_size}")
+        print("Press Ctrl+C to stop")
         print("=" * 70 + "\n")
         
         if not self.pieces:
@@ -224,56 +225,66 @@ class DataStreamSimulator:
             print("   Continuing anyway...\n")
         
         self.start_time = time.time()
-        batch = []
         
         # Calculate sleep time between pieces (in seconds)
         sleep_interval = 1.0 / self.config.pieces_per_second
         
+        loop_count = 0
+        total_pieces_in_data = len(self.pieces)
+        
         try:
-            for i, piece in enumerate(self.pieces):
-                # Sleep to maintain desired frequency (clock-based to handle laptop sleep)
-                if i > 0:  # Don't sleep before first piece
-                    # Calculate expected time for this piece
-                    expected_time = self.start_time + (i * sleep_interval)
-                    actual_time = time.time()
-                    sleep_needed = expected_time - actual_time
+            while True:  # Infinite loop
+                loop_count += 1
+                loop_start_time = time.time()
+                loop_piece_count = 0
+                batch = []
+                
+                print(f"\n🔄 Starting loop #{loop_count} ({total_pieces_in_data:,} pieces)")
+                
+                for i, piece in enumerate(self.pieces):
+                    # Sleep to maintain desired frequency (clock-based to handle laptop sleep)
+                    if i > 0 or loop_count > 1:  # Don't sleep before very first piece
+                        # Calculate expected time for this piece in current loop
+                        expected_time = loop_start_time + (i * sleep_interval)
+                        actual_time = time.time()
+                        sleep_needed = expected_time - actual_time
+                        
+                        if sleep_needed > 0:
+                            time.sleep(sleep_needed)
+                        elif sleep_needed < -5:  # More than 5 seconds behind (laptop was asleep)
+                            print(f"\n⚠️  Detected time jump ({-sleep_needed:.1f}s behind schedule)")
+                            print(f"   Laptop may have been asleep. Catching up...")
+                            # Reset loop start time to catch up
+                            loop_start_time = actual_time - (i * sleep_interval)
                     
-                    if sleep_needed > 0:
-                        time.sleep(sleep_needed)
-                    elif sleep_needed < -5:  # More than 5 seconds behind (laptop was asleep)
-                        print(f"\n⚠️  Detected time jump ({-sleep_needed:.1f}s behind schedule)")
-                        print(f"   Laptop may have been asleep. Catching up...")
-                        # Reset start time to catch up
-                        self.start_time = actual_time - (i * sleep_interval)
+                    # Add to batch or send immediately
+                    batch.append(piece)
+                    
+                    if len(batch) >= self.config.batch_size:
+                        sent = self.send_batch(batch)
+                        self.pieces_sent += sent
+                        loop_piece_count += sent
+                        batch = []
+                        
+                        # Print stats every 100 pieces
+                        if self.pieces_sent % 100 == 0:
+                            self.print_stats()
                 
-                # Add to batch or send immediately
-                batch.append(piece)
-                
-                if len(batch) >= self.config.batch_size:
+                # Send any remaining pieces in batch
+                if batch:
                     sent = self.send_batch(batch)
                     self.pieces_sent += sent
-                    batch = []
-                    
-                    # Print stats every 100 pieces
-                    if self.pieces_sent % 100 == 0:
-                        self.print_stats()
-            
-            # Send any remaining pieces in batch
-            if batch:
-                sent = self.send_batch(batch)
-                self.pieces_sent += sent
-            
-            self.print_stats()
-            print("\n\n" + "=" * 70)
-            print("✅ Simulation complete!")
-            print(f"   Pieces sent: {self.pieces_sent:,}")
-            print(f"   Total time: {time.time() - self.start_time:.1f}s")
-            print(f"   Avg rate: {self.pieces_sent / (time.time() - self.start_time):.1f} pieces/sec")
-            print("=" * 70)
-            
+                    loop_piece_count += sent
+                
+                # Print loop completion summary
+                loop_elapsed = time.time() - loop_start_time
+                print(f"\n✅ Loop #{loop_count} complete: {loop_piece_count:,} pieces in {loop_elapsed:.1f}s")
+                print(f"   Total pieces sent: {self.pieces_sent:,} | Restarting from beginning...")
+                
         except KeyboardInterrupt:
             print("\n\n⚠️  Simulation interrupted by user")
-            print(f"   Pieces sent: {self.pieces_sent:,}")
+            print(f"   Loops completed: {loop_count - 1} full loops")
+            print(f"   Total pieces sent: {self.pieces_sent:,}")
             elapsed = time.time() - self.start_time
             print(f"   Total time: {elapsed:.1f}s")
             print(f"   Avg rate: {self.pieces_sent / elapsed:.1f} pieces/sec" if elapsed > 0 else "")

@@ -4,7 +4,6 @@ import {ColorModeContext, tokens} from "../../theme";
 import { useAuth } from "../../auth/AuthContext";
 import LightModeOutlinedIcon from "@mui/icons-material/LightModeOutlined";
 import DarkModeOutlinedIcon from "@mui/icons-material/DarkModeOutlined";
-import SettingsOutlinedIcon from "@mui/icons-material/SettingsOutlined";
 import NotificationsOutlinedIcon from "@mui/icons-material/NotificationsOutlined";
 import LogoutOutlinedIcon from "@mui/icons-material/LogoutOutlined";
 
@@ -55,9 +54,6 @@ const Topbar = () => {
           </IconButton>
           <IconButton sx={{ color: colors.primary[800] }}>
             <NotificationsOutlinedIcon />
-          </IconButton>
-          <IconButton sx={{ color: colors.primary[800] }}>
-            <SettingsOutlinedIcon />
           </IconButton>
           <IconButton 
             onClick={handleLogoutClick}

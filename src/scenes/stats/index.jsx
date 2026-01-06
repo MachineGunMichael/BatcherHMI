@@ -17,6 +17,8 @@ import { ResponsiveLine } from "@nivo/line";
 import { ResponsiveScatterPlot } from "@nivo/scatterplot";
 import { tokens } from "../../theme";
 import Header from "../../components/Header";
+import ServerOffline from "../../components/ServerOffline";
+import useMachineState from "../../hooks/useMachineState";
 
 const API_BASE = process.env.REACT_APP_API_BASE || "http://localhost:5001";
 
@@ -24,6 +26,7 @@ const Stats = () => {
   const theme = useTheme();
   const colors = tokens(theme.palette.mode);
   const isDarkMode = theme.palette.mode === 'dark';
+  const { isConnected } = useMachineState();
 
   const [programs, setPrograms] = useState([]);
   const [selectedProgramId, setSelectedProgramId] = useState(() => {
@@ -369,6 +372,11 @@ const Stats = () => {
     // Save to localStorage to persist across navigation
     localStorage.setItem('stats_selected_program_id', programId);
   };
+
+  // Show server offline screen if not connected
+  if (!isConnected) {
+    return <ServerOffline title="Stats" />;
+  }
 
   if (loading) {
     return <Box m="20px"><Typography>Loading...</Typography></Box>;

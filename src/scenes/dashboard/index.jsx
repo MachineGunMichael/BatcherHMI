@@ -6,6 +6,7 @@ import { ResponsivePie } from "@nivo/pie";
 import { ResponsiveScatterPlot } from "@nivo/scatterplot";
 import Header from "../../components/Header";
 import MachineControls from "../../components/MachineControls";
+import ServerOffline from "../../components/ServerOffline";
 import { tokens } from "../../theme";
 import { useAppContext } from "../../context/AppContext";
 import { useDashboardData } from "./dataProvider";
@@ -619,35 +620,20 @@ const Dashboard = () => {
 
   const toggleSeries = (name) => setDashboardVisibleSeries(prev => ({ ...(prev || {}), [name]: !prev?.[name] }));
 
-  // Show waiting screen if no configuration is set
+  // Show server offline screen if there's a connection error
+  if (mode === null && configError && configError !== 'waiting') {
+    return <ServerOffline title="Dashboard" />;
+  }
+
+  // Show waiting screen if no configuration is set (but server is reachable)
   if (mode === null) {
     return (
       <Box m="20px" display="flex" alignItems="center" justifyContent="center" height="calc(100vh - 200px)">
         <Box textAlign="center">
           <Header title="Dashboard" subtitle="Waiting for configuration..." />
           <Typography variant="h4" color={colors.grey[300]} mt={4}>
-            {configError === 'waiting' 
-              ? 'Run one of the following scripts to start:'
-              : 'Loading configuration...'}
+            Loading configuration...
           </Typography>
-          {configError === 'waiting' && (
-            <Box mt={3}>
-              <Typography variant="h5" color={colors.tealAccent[400]} fontFamily="monospace">
-                ./start_replay_mode.sh
-              </Typography>
-              <Typography variant="h6" color={colors.grey[400]} my={1}>
-                or
-              </Typography>
-              <Typography variant="h5" color={colors.tealAccent[400]} fontFamily="monospace">
-                ./start_live_mode_simple.sh
-              </Typography>
-            </Box>
-          )}
-          {configError && configError !== 'waiting' && (
-            <Typography variant="body1" color={colors.redAccent[400]} mt={2}>
-              Error: {configError}
-            </Typography>
-          )}
           <Typography variant="body2" color={colors.grey[500]} mt={4}>
             Checking for configuration every 2 seconds...
           </Typography>

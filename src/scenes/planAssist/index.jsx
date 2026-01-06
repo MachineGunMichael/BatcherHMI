@@ -8,6 +8,7 @@ import {
   useTheme,
 } from "@mui/material";
 import Header from "../../components/Header";
+import ServerOffline from "../../components/ServerOffline";
 import ChatHistory from "../../components/agent/ChatHistory";
 import ChatInput from "../../components/agent/ChatInput";
 import SimResultCard from "../../components/agent/SimResultCard";
@@ -16,12 +17,14 @@ import SuggestionChips from "../../components/agent/SuggestionChips";
 import { getAgentResponse, getSimulationResults } from "../../services/agentService";
 import { tokens } from "../../theme";
 import { useAppContext } from "../../context/AppContext";
+import useMachineState from "../../hooks/useMachineState";
 
 
 const PlanAssist = () => {
   const theme = useTheme();
   const colors = tokens(theme.palette.mode);
   const chatEndRef = useRef(null);
+  const { isConnected } = useMachineState();
   
   // Chat state
   const [messages, setMessages] = useState([
@@ -98,6 +101,11 @@ const PlanAssist = () => {
   const handleSuggestionClick = (suggestion) => {
     handleSendMessage(suggestion);
   };
+
+  // Show server offline screen if not connected
+  if (!isConnected) {
+    return <ServerOffline title="PlanAssist" />;
+  }
 
   return (
     <Box 

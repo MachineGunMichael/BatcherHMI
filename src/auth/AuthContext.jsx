@@ -1,7 +1,11 @@
-import { createContext, useContext, useState, useEffect } from 'react';
+import { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import authService from '../services/authService';
 import { useAppContext } from '../context/AppContext';
+import useIdleTimeout from '../hooks/useIdleTimeout';
+
+// Idle timeout configuration: 2 hours in milliseconds
+const IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 
 const AuthContext = createContext();
 
@@ -143,12 +147,23 @@ export const AuthProvider = ({ children }) => {
   };
 
   // Logout function
-  const logout = () => {
+  const logout = useCallback((reason = 'manual') => {
+    if (reason === 'idle') {
+      console.log('[Auth] Logging out due to inactivity (2 hours idle timeout)');
+    }
     setUser(null);
     setIsAuthenticated(false);
     localStorage.removeItem('token');
+    localStorage.removeItem('lastActivityTimestamp');
     navigate('/login');
-  };
+  }, [navigate]);
+
+  // Idle timeout - logs out user after 2 hours of inactivity
+  useIdleTimeout(
+    () => logout('idle'),
+    IDLE_TIMEOUT_MS,
+    isAuthenticated // Only active when user is logged in
+  );
 
   const value = { 
     user, 

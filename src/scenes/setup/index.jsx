@@ -29,6 +29,7 @@ import StarBorderIcon from "@mui/icons-material/StarBorder";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import Header from "../../components/Header";
 import MachineControls from "../../components/MachineControls";
+import ServerOffline from "../../components/ServerOffline";
 import { tokens } from "../../theme";
 import { useAppContext } from "../../context/AppContext";
 import api from "../../services/api";
@@ -648,19 +649,19 @@ const Setup = () => {
         const response = await api.post("/settings/recipes", {
           name: recipeName,
           display_name: manualDisplayName || null, // Optional custom name
-          piece_min_weight_g: params.pieceMinWeight,
-          piece_max_weight_g: params.pieceMaxWeight,
-          batch_min_weight_g: params.batchMinWeight,
-          batch_max_weight_g: params.batchMaxWeight,
-          min_pieces_per_batch:
-            params.countType === "min" || params.countType === "exact"
-              ? params.countValue
-              : null,
-          max_pieces_per_batch:
-            params.countType === "max" || params.countType === "exact"
-              ? params.countValue
-              : null,
-        });
+        piece_min_weight_g: params.pieceMinWeight,
+        piece_max_weight_g: params.pieceMaxWeight,
+        batch_min_weight_g: params.batchMinWeight,
+        batch_max_weight_g: params.batchMaxWeight,
+        min_pieces_per_batch:
+          params.countType === "min" || params.countType === "exact"
+            ? params.countValue
+            : null,
+        max_pieces_per_batch:
+          params.countType === "max" || params.countType === "exact"
+            ? params.countValue
+            : null,
+      });
 
         // Get the new recipe ID from response (API returns { recipe: {...} })
         recipeId = response.data?.recipe?.id || null;
@@ -1188,6 +1189,11 @@ const Setup = () => {
     (!manualBatchWeightEnabled || (manualBatchMin && manualBatchMax)) &&
     (!manualPieceCountEnabled || manualPieceCount);
 
+  // Show server offline screen if not connected
+  if (!machineConnected) {
+    return <ServerOffline title="Setup" />;
+  }
+
   return (
     <Box m="20px">
       <Header title="Setup" subtitle="Set up production" />
@@ -1336,9 +1342,9 @@ const Setup = () => {
                 </Typography>
               ) : allGatesUsed ? null : (
                 <>
-                  <Autocomplete
-                    options={recipes.filter(
-                      (recipe) =>
+              <Autocomplete
+                options={recipes.filter(
+                  (recipe) =>
                         !assignedRecipes.some((assigned) => assigned.recipeName === recipe.name) &&
                         !activeRecipes.some((active) => active.recipeName === recipe.name)
                     )}
@@ -1389,52 +1395,52 @@ const Setup = () => {
                         </li>
                       );
                     }}
-                    value={selectedRecipe}
-                    onChange={(event, newValue) => setSelectedRecipe(newValue)}
-                    loading={loadingRecipes}
-                    renderInput={(params) => (
-                      <TextField
-                        {...params}
-                        label="Select Recipe"
-                        color="secondary"
-                        placeholder="Type to search (e.g., R_15_)"
-                      />
-                    )}
-                    sx={{ width: "100%" }}
-                  />
-
-                  {selectedRecipe && (
-                    <>
-                      <Typography variant="h6" sx={{ mt: 1 }}>
-                        Assign to Gates:
-                      </Typography>
-                      <Box display="grid" gridTemplateColumns="repeat(4, 1fr)" gap={1}>
-                        {Array.from({ length: 8 }, (_, i) => i + 1).map((gate) => (
-                          <FormControlLabel
-                            key={gate}
-                            control={
-                              <Checkbox
-                                checked={presetGates.includes(gate)}
-                                onChange={() => togglePresetGate(gate)}
-                                disabled={usedGates.includes(gate)}
-                                color="secondary"
-                              />
-                            }
-                            label={`Gate ${gate}`}
-                          />
-                        ))}
-                      </Box>
-                    </>
-                  )}
-
-                  <Button
-                    variant="contained"
+                value={selectedRecipe}
+                onChange={(event, newValue) => setSelectedRecipe(newValue)}
+                loading={loadingRecipes}
+                renderInput={(params) => (
+                  <TextField
+                    {...params}
+                    label="Select Recipe"
                     color="secondary"
-                    onClick={handleAddPreset}
-                    disabled={!canAddPreset}
-                  >
-                    Add Recipe
-                  </Button>
+                    placeholder="Type to search (e.g., R_15_)"
+                  />
+                )}
+                sx={{ width: "100%" }}
+              />
+
+              {selectedRecipe && (
+                <>
+                  <Typography variant="h6" sx={{ mt: 1 }}>
+                    Assign to Gates:
+                  </Typography>
+                  <Box display="grid" gridTemplateColumns="repeat(4, 1fr)" gap={1}>
+                    {Array.from({ length: 8 }, (_, i) => i + 1).map((gate) => (
+                      <FormControlLabel
+                        key={gate}
+                        control={
+                          <Checkbox
+                            checked={presetGates.includes(gate)}
+                            onChange={() => togglePresetGate(gate)}
+                            disabled={usedGates.includes(gate)}
+                            color="secondary"
+                          />
+                        }
+                        label={`Gate ${gate}`}
+                      />
+                    ))}
+                  </Box>
+                </>
+              )}
+
+              <Button
+                variant="contained"
+                color="secondary"
+                onClick={handleAddPreset}
+                disabled={!canAddPreset}
+              >
+                Add Recipe
+              </Button>
                 </>
               )}
             </Box>
@@ -1459,132 +1465,132 @@ const Setup = () => {
                     placeholder=""
                   />
 
-                  {/* Piece Weight Bounds (Required) */}
-                  <Typography variant="h6" sx={{ mt: 1 }}>
-                    Piece Weight Bounds (required)
-                  </Typography>
-                  <Box display="flex" gap={2}>
-                    <TextField
-                      label="Piece Min Weight (g)"
-                      type="number"
-                      color="secondary"
-                      fullWidth
-                      value={manualPieceMin}
-                      onChange={(e) => setManualPieceMin(e.target.value)}
-                      inputProps={{ step: 1 }}
-                    />
-                    <TextField
-                      label="Piece Max Weight (g)"
-                      type="number"
-                      color="secondary"
-                      fullWidth
-                      value={manualPieceMax}
-                      onChange={(e) => setManualPieceMax(e.target.value)}
-                      inputProps={{ step: 1 }}
-                    />
-                  </Box>
+              {/* Piece Weight Bounds (Required) */}
+              <Typography variant="h6" sx={{ mt: 1 }}>
+                Piece Weight Bounds (required)
+              </Typography>
+              <Box display="flex" gap={2}>
+                <TextField
+                  label="Piece Min Weight (g)"
+                  type="number"
+                  color="secondary"
+                  fullWidth
+                  value={manualPieceMin}
+                  onChange={(e) => setManualPieceMin(e.target.value)}
+                  inputProps={{ step: 1 }}
+                />
+                <TextField
+                  label="Piece Max Weight (g)"
+                  type="number"
+                  color="secondary"
+                  fullWidth
+                  value={manualPieceMax}
+                  onChange={(e) => setManualPieceMax(e.target.value)}
+                  inputProps={{ step: 1 }}
+                />
+              </Box>
 
-                  {/* Batch Weight Constraints (Optional) */}
-                  <FormControlLabel
-                    control={
-                      <Checkbox
-                        checked={manualBatchWeightEnabled}
-                        onChange={(e) => setManualBatchWeightEnabled(e.target.checked)}
-                        color="secondary"
-                      />
-                    }
-                    label="Apply Batch Weight Constraints"
-                  />
-                  {manualBatchWeightEnabled && (
-                    <Box display="flex" gap={2}>
-                      <TextField
-                        label="Batch Min Weight (g)"
-                        type="number"
-                        color="secondary"
-                        fullWidth
-                        value={manualBatchMin}
-                        onChange={(e) => setManualBatchMin(e.target.value)}
-                        inputProps={{ step: 1 }}
-                      />
-                      <TextField
-                        label="Batch Max Weight (g)"
-                        type="number"
-                        color="secondary"
-                        fullWidth
-                        value={manualBatchMax}
-                        onChange={(e) => setManualBatchMax(e.target.value)}
-                        inputProps={{ step: 1 }}
-                      />
-                    </Box>
-                  )}
-
-                  {/* Piece Count Constraints (Optional) */}
-                  <FormControlLabel
-                    control={
-                      <Checkbox
-                        checked={manualPieceCountEnabled}
-                        onChange={(e) => setManualPieceCountEnabled(e.target.checked)}
-                        color="secondary"
-                      />
-                    }
-                    label="Apply Piece Count Constraints"
-                  />
-                  {manualPieceCountEnabled && (
-                    <Box display="flex" gap={2}>
-                      <FormControl fullWidth>
-                        <InputLabel color="secondary">Count Type</InputLabel>
-                        <Select
-                          value={manualPieceCountType}
-                          label="Count Type"
-                          onChange={(e) => setManualPieceCountType(e.target.value)}
-                          color="secondary"
-                        >
-                          <MenuItem value="min">Min</MenuItem>
-                          <MenuItem value="max">Max</MenuItem>
-                          <MenuItem value="exact">Exact</MenuItem>
-                        </Select>
-                      </FormControl>
-                      <TextField
-                        label="Count"
-                        type="number"
-                        color="secondary"
-                        fullWidth
-                        value={manualPieceCount}
-                        onChange={(e) => setManualPieceCount(e.target.value)}
-                        inputProps={{ step: 1 }}
-                      />
-                    </Box>
-                  )}
-
-                  {/* Gate Assignment */}
-                  <Typography variant="h6" sx={{ mt: 1 }}>
-                    Assign to Gates:
-                  </Typography>
-                  <Box display="grid" gridTemplateColumns="repeat(4, 1fr)" gap={1}>
-                    {Array.from({ length: 8 }, (_, i) => i + 1).map((gate) => (
-                      <FormControlLabel
-                        key={gate}
-                        control={
-                          <Checkbox
-                            checked={manualGates.includes(gate)}
-                            onChange={() => toggleManualGate(gate)}
-                            disabled={usedGates.includes(gate)}
-                            color="secondary"
-                          />
-                        }
-                        label={`Gate ${gate}`}
-                      />
-                    ))}
-                  </Box>
-
-                  <Button
-                    variant="contained"
+              {/* Batch Weight Constraints (Optional) */}
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={manualBatchWeightEnabled}
+                    onChange={(e) => setManualBatchWeightEnabled(e.target.checked)}
                     color="secondary"
-                    onClick={handleAddManual}
-                    disabled={!canAddManual}
-                  >
+                  />
+                }
+                label="Apply Batch Weight Constraints"
+              />
+              {manualBatchWeightEnabled && (
+                <Box display="flex" gap={2}>
+                  <TextField
+                    label="Batch Min Weight (g)"
+                    type="number"
+                    color="secondary"
+                    fullWidth
+                    value={manualBatchMin}
+                    onChange={(e) => setManualBatchMin(e.target.value)}
+                    inputProps={{ step: 1 }}
+                  />
+                  <TextField
+                    label="Batch Max Weight (g)"
+                    type="number"
+                    color="secondary"
+                    fullWidth
+                    value={manualBatchMax}
+                    onChange={(e) => setManualBatchMax(e.target.value)}
+                    inputProps={{ step: 1 }}
+                  />
+                </Box>
+              )}
+
+              {/* Piece Count Constraints (Optional) */}
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={manualPieceCountEnabled}
+                    onChange={(e) => setManualPieceCountEnabled(e.target.checked)}
+                    color="secondary"
+                  />
+                }
+                label="Apply Piece Count Constraints"
+              />
+              {manualPieceCountEnabled && (
+                <Box display="flex" gap={2}>
+                  <FormControl fullWidth>
+                    <InputLabel color="secondary">Count Type</InputLabel>
+                    <Select
+                      value={manualPieceCountType}
+                      label="Count Type"
+                      onChange={(e) => setManualPieceCountType(e.target.value)}
+                      color="secondary"
+                    >
+                      <MenuItem value="min">Min</MenuItem>
+                      <MenuItem value="max">Max</MenuItem>
+                      <MenuItem value="exact">Exact</MenuItem>
+                    </Select>
+                  </FormControl>
+                  <TextField
+                    label="Count"
+                    type="number"
+                    color="secondary"
+                    fullWidth
+                    value={manualPieceCount}
+                    onChange={(e) => setManualPieceCount(e.target.value)}
+                    inputProps={{ step: 1 }}
+                  />
+                </Box>
+              )}
+
+              {/* Gate Assignment */}
+              <Typography variant="h6" sx={{ mt: 1 }}>
+                Assign to Gates:
+              </Typography>
+              <Box display="grid" gridTemplateColumns="repeat(4, 1fr)" gap={1}>
+                {Array.from({ length: 8 }, (_, i) => i + 1).map((gate) => (
+                  <FormControlLabel
+                    key={gate}
+                    control={
+                      <Checkbox
+                        checked={manualGates.includes(gate)}
+                        onChange={() => toggleManualGate(gate)}
+                        disabled={usedGates.includes(gate)}
+                        color="secondary"
+                      />
+                    }
+                    label={`Gate ${gate}`}
+                  />
+                ))}
+              </Box>
+
+              <Button
+                variant="contained"
+                color="secondary"
+                onClick={handleAddManual}
+                disabled={!canAddManual}
+              >
                     Save and Add Recipe
-                  </Button>
+              </Button>
 
                   {addError && (
                     <Typography variant="body2" sx={{ color: colors.redAccent[500] }}>
@@ -1660,14 +1666,14 @@ const Setup = () => {
                         ))}
                       </Box>
 
-                      <Button
+                    <Button
                         variant="outlined"
-                        color="secondary"
+                      color="secondary"
                         onClick={handleAddRecipeToProgram}
                         disabled={programGates.length === 0}
-                      >
+                    >
                         Add Recipe to Program
-                      </Button>
+                    </Button>
                     </>
                   )}
 
@@ -1699,7 +1705,7 @@ const Setup = () => {
                               {[1, 2, 3, 4, 5, 6, 7, 8].map(gate => (
                                 <Box 
                                   key={`${i}-${gate}`} 
-                                  sx={{
+                      sx={{ 
                                     backgroundColor: recipe.gates.includes(gate) ? recipeColor : undefined,
                                     width: '20px',
                                     height: '20px',
@@ -1715,12 +1721,12 @@ const Setup = () => {
                                   sx={{ minWidth: 'auto', p: 0.5, fontSize: '0.7rem' }}
                                 >
                                   REMOVE
-                                </Button>
-                              </Box>
+                    </Button>
+                  </Box>
                             </React.Fragment>
                           );
                         })}
-                      </Box>
+                </Box>
                     </Paper>
                   )}
 
@@ -1749,9 +1755,9 @@ const Setup = () => {
                   )}
 
                   {programError && (
-                    <Typography variant="body2" sx={{ color: colors.redAccent[500] }}>
+                <Typography variant="body2" sx={{ color: colors.redAccent[500] }}>
                       {programError}
-                    </Typography>
+                </Typography>
                   )}
                 </>
               )}
