@@ -32,6 +32,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dotenv import load_dotenv
 import requests
 from machine_client import MachineStateClient
+from logger import get_logger, ENABLE_CONSOLE
+
+# Initialize logger
+log = get_logger('worker')
 
 # Load environment
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -47,7 +51,7 @@ PLC_SHARED_SECRET = os.getenv("PLC_SHARED_SECRET", "dev-plc-secret")
 try:
     from influxdb_client_3 import InfluxDBClient3
 except ImportError:
-    print("❌ influxdb_client_3 not installed. Run: pip install influxdb3-python")
+    print("[ERROR] influxdb_client_3 not installed. Run: pip install influxdb3-python")
     sys.exit(1)
 
 # Configuration
@@ -70,10 +74,7 @@ def notify_gate_reset(gate: int, ts_iso: str | None = None) -> None:
         ts_iso = datetime.now(timezone.utc).isoformat()
 
     payload = {"gate": int(gate), "timestamp": ts_iso}
-    print(f"\n🔄 [RESET] Calling reset endpoint for Gate {gate}...")
-    print(f"   URL: {BATCHER_RESET_URL}")
-    print(f"   Secret: {'***' + PLC_SHARED_SECRET[-4:] if len(PLC_SHARED_SECRET) > 4 else '***'}")
-    print(f"   Payload: {payload}")
+    log.debug(f"Resetting gate {gate}", category='operations', action='gate_reset')
     
     try:
         r = requests.post(
@@ -86,13 +87,13 @@ def notify_gate_reset(gate: int, ts_iso: str | None = None) -> None:
             timeout=2.0,
         )
         r.raise_for_status()
-        print(f"✅ [RESET] Gate {gate} → {r.status_code} {r.reason}")
+        log.info(f"Gate {gate} reset successful", category='operations', action='gate_reset')
     except requests.exceptions.HTTPError as e:
-        print(f"❌ [RESET] HTTP Error for Gate {gate}: {e.response.status_code} {e.response.text}")
+        log.error(f"HTTP error resetting gate {gate}: {e.response.status_code}", exc=e)
     except requests.exceptions.ConnectionError as e:
-        print(f"❌ [RESET] Connection Error for Gate {gate}: {e}")
+        log.error(f"Connection error resetting gate {gate}", exc=e)
     except Exception as e:
-        print(f"❌ [RESET] Failed for Gate {gate}: {e}")
+        log.error(f"Failed to reset gate {gate}", exc=e)
 
 # InfluxDB Line Protocol Helpers (exact copy from Node.js import-csv-to-influx.js)
 def escape_tag(s):
@@ -375,10 +376,10 @@ class LiveWorker:
         
     def connect(self):
         """Connect to databases"""
-        print("📡 Connecting to databases...")
+        log.info("Connecting to databases")
         
         if not INFLUX_TOKEN:
-            print("❌ INFLUXDB3_AUTH_TOKEN not set")
+            log.error("INFLUXDB3_AUTH_TOKEN not set")
             sys.exit(1)
         
         self.influx_client = InfluxDBClient3(
@@ -386,20 +387,18 @@ class LiveWorker:
             token=INFLUX_TOKEN,
             database=INFLUX_DB
         )
-        print(f"   ✓ InfluxDB: {INFLUX_HOST}")
+        log.item("InfluxDB", INFLUX_HOST)
         
         self.sqlite_conn = sqlite3.connect(SQLITE_DB)
         self.sqlite_conn.row_factory = sqlite3.Row
-        print(f"   ✓ SQLite: {SQLITE_DB}")
+        log.item("SQLite", SQLITE_DB)
     
     def recover_incomplete_programs(self):
         """
         Recover programs that were interrupted by worker crash/restart.
         Finds programs with no end_ts and completes their stats calculation.
         """
-        print("\n" + "="*70)
-        print("🔍 CHECKING FOR INCOMPLETE PROGRAMS")
-        print("="*70)
+        log.section("Checking for Incomplete Programs")
         
         try:
             # Find programs with no end_ts (incomplete)
@@ -411,18 +410,14 @@ class LiveWorker:
             """).fetchall()
             
             if not incomplete:
-                print("✅ No incomplete programs found")
+                log.info("No incomplete programs found")
                 return
             
-            print(f"⚠️  Found {len(incomplete)} incomplete program(s)")
+            log.warning(f"Found {len(incomplete)} incomplete program(s)")
             
             for prog in incomplete:
                 program_id = prog[0]
                 start_ts = prog[1]
-                
-                print(f"\n{'─'*70}")
-                print(f"Recovering Program ID: {program_id}")
-                print(f"Start time: {start_ts}")
                 
                 # Get program name
                 prog_info = self.sqlite_conn.execute("""
@@ -430,11 +425,11 @@ class LiveWorker:
                 """, (program_id,)).fetchone()
                 
                 if not prog_info:
-                    print(f"   ⚠️  Program {program_id} not found in programs table, skipping")
+                    log.warning(f"Program {program_id} not found in programs table, skipping")
                     continue
                 
                 program_name = prog_info[0]
-                print(f"Program name: {program_name}")
+                log.info(f"Recovering program {program_id} ({program_name})")
                 
                 # Find last batch completion time for this program
                 last_batch = self.sqlite_conn.execute("""
@@ -446,16 +441,12 @@ class LiveWorker:
                 batch_count = last_batch[1] if last_batch else 0
                 
                 if batch_count == 0:
-                    print(f"   ℹ️  No batches found - marking as ended without processing")
-                    # Just set end_ts to start_ts (empty program)
+                    log.info(f"  No batches found - marking as ended")
                     end_ts = start_ts
                 else:
                     last_batch_time = last_batch[0]
-                    print(f"   ✓ Found {batch_count} batches, last at {last_batch_time}")
+                    log.info(f"  Found {batch_count} batches, calculating totals")
                     end_ts = last_batch_time
-                
-                # Now calculate and write stats using existing function
-                print(f"   📊 Calculating program totals...")
                 
                 try:
                     self.calculate_and_write_program_totals(
@@ -463,12 +454,10 @@ class LiveWorker:
                         start_ts=start_ts,
                         end_ts=end_ts
                     )
-                    print(f"   ✅ Successfully recovered program {program_id}")
+                    log.success(f"Recovered program {program_id}")
                     
                 except Exception as e:
-                    print(f"   ❌ Error recovering program {program_id}: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    log.error(f"Error recovering program {program_id}: {e}", exc=e)
                     
                     # Still set end_ts even if calculation failed
                     self.sqlite_conn.execute("""
@@ -477,16 +466,12 @@ class LiveWorker:
                         WHERE program_id = ?
                     """, (end_ts, program_id))
                     self.sqlite_conn.commit()
-                    print(f"   ⚠️  Marked program as ended despite calculation error")
+                    log.warning(f"Marked program {program_id} as ended despite error")
             
-            print("\n" + "="*70)
-            print("✅ RECOVERY COMPLETE")
-            print("="*70 + "\n")
+            log.info("Recovery complete")
             
         except Exception as e:
-            print(f"❌ Error in recover_incomplete_programs: {e}")
-            import traceback
-            traceback.print_exc()
+            log.error(f"Error in recover_incomplete_programs: {e}", exc=e)
         
     def disconnect(self):
         if self.influx_client:
@@ -508,7 +493,7 @@ class LiveWorker:
         
         # Detect state changes
         if new_state != self.machine_state:
-            print(f"\n🔄 [MachineState] {self.machine_state} → {new_state}")
+            log.info(f"[MachineState] {self.machine_state} → {new_state}")
             self.handle_state_change(self.machine_state, new_state, state)
             self.machine_state = new_state
     
@@ -519,7 +504,7 @@ class LiveWorker:
                 # Starting new program
                 program_id = state_data.get('currentProgramId')
                 active_recipes = state_data.get('activeRecipes', [])
-                print(f"   ▶️  Starting new program {program_id} with {len(active_recipes)} recipes")
+                log.info(f"Starting new program {program_id} with {len(active_recipes)} recipes")
                 self.start_program(program_id, active_recipes)
                 self.paused = False
                 
@@ -530,23 +515,23 @@ class LiveWorker:
                 
                 if new_program_id and new_program_id != self.program_id:
                     # Program changed while paused - start fresh with new program
-                    print(f"   ▶️  Recipes changed while paused - starting new program {new_program_id}")
+                    log.info(f"Recipes changed while paused - starting new program {new_program_id}")
                     self.start_program(new_program_id, active_recipes)
                 else:
                     # Same program - check if recipes changed (merged transition)
-                    print(f"   ▶️  Resuming program {self.program_id}")
+                    log.info(f"Resuming program {self.program_id}")
                     # Reload gate_to_recipe mapping to pick up any recipe changes
                     self.reload_gate_to_recipe(active_recipes)
                 self.paused = False
         
         elif new_state == 'paused':
             # Pausing simulation
-            print(f"   ⏸️  Pausing program {self.program_id}")
+            log.info(f"Pausing program {self.program_id}")
             self.paused = True
         
         elif new_state == 'transitioning':
             # Transition to stop or recipe change
-            print(f"   🔄 Transitioning program {self.program_id}")
+            log.info(f"Transitioning program {self.program_id}")
             self.was_paused_before_transition = self.paused  # Track if we were paused
             self.transitioning = True
             self.paused = False  # Clear paused flag so we can process transition
@@ -554,17 +539,17 @@ class LiveWorker:
         
         elif new_state == 'idle':
             # Stopped/reset - flush any pending KPIs and clear state
-            print(f"   ⏹️  Machine stopped - flushing KPIs and clearing state")
+            log.info("  Machine stopped - flushing KPIs and clearing state")
             
             # Flush any pending KPIs before clearing state
             if self.minute_accumulator and self.minute_accumulator.has_data():
-                print(f"   💾 Flushing pending KPIs before stop...")
+                log.info("  Flushing pending KPIs before stop...")
                 self.process_minute_kpis()
             
             # Reset reject counters
             self.total_rejects_count = 0
             self.total_rejects_weight = 0.0
-            print(f"   🔄 Reset reject counters")
+            log.info("  Reset reject counters")
             
             # Clear state
             self.gate_to_recipe.clear()
@@ -593,9 +578,9 @@ class LiveWorker:
                 # Ensure gate is integer for consistent lookup
                 self.gate_to_recipe[int(gate)] = recipe_id
             else:
-                print(f"   ⚠️  Recipe not found in database: {recipe_name}")
+                log.warning(f"Recipe not found in database: {recipe_name}")
         
-        print(f"   📋 Gate assignments: {self.gate_to_recipe}")
+        log.info(f"Gate assignments: {self.gate_to_recipe}")
         
         # Reset gate states
         for gate in self.gate_to_recipe.keys():
@@ -617,7 +602,7 @@ class LiveWorker:
         # Reset reject counters for new program
         self.total_rejects_count = 0
         self.total_rejects_weight = 0.0
-        print(f"   🔄 Reset reject counters for program {program_id}")
+        log.info(f"Reset reject counters for program {program_id}")
         
         # Reset piece deduplication set for new program
         self.processed_piece_ids.clear()
@@ -629,7 +614,7 @@ class LiveWorker:
         """Reload gate_to_recipe mapping without resetting other state
         Used during merged transitions when recipes change but program stays the same
         """
-        print(f"   🔄 Reloading gate_to_recipe for merged transition...")
+        log.info("  Reloading gate_to_recipe for merged transition...")
         
         # Reload recipes from database to pick up any newly created ones
         self.load_recipes()
@@ -653,16 +638,16 @@ class LiveWorker:
                 self.gate_to_recipe[int_gate] = recipe_id
                 new_gates.add(int_gate)
             else:
-                print(f"   ⚠️  Recipe not found in database: {recipe_name}")
+                log.warning(f"Recipe not found in database: {recipe_name}")
         
         # Log changes
         added = new_gates - old_gates
         removed = old_gates - new_gates
         if added:
-            print(f"   ➕ Added gates: {sorted(added)}")
+            log.info(f"Added gates: {sorted(added)}")
         if removed:
-            print(f"   ➖ Removed gates: {sorted(removed)}")
-        print(f"   📋 Updated gate assignments: {self.gate_to_recipe}")
+            log.info(f"Removed gates: {sorted(removed)}")
+        log.info(f"Updated gate assignments: {self.gate_to_recipe}")
         
         # Update gate states for new gates
         for gate in new_gates:
@@ -680,8 +665,8 @@ class LiveWorker:
         # Gates that changed or were removed need to finish their batches
         self.gates_to_finish = set(comparison['gates_changed'] + comparison['gates_removed'])
         
-        print(f"   🎯 Gates to finish batches: {self.gates_to_finish}")
-        print(f"   🆕 Gates to add: {comparison['gates_added']}")
+        log.info(f"Gates to finish batches: {self.gates_to_finish}")
+        log.info(f"Gates to add: {comparison['gates_added']}")
     
     def check_transition_complete(self):
         """Check if all gates have finished their batches during transition"""
@@ -691,7 +676,7 @@ class LiveWorker:
         # If we were previously paused, partial batches won't complete (no new pieces)
         # In this case, we discard partial batches and proceed immediately
         if self.was_paused_before_transition:
-            print(f"\n✅ [Transition] Transition from paused - discarding any partial batches")
+            log.info("[Transition] Transition from paused - discarding any partial batches")
             # Clear partial batches from affected gates
             for gate in self.gates_to_finish:
                 if gate in self.gate_states:
@@ -708,20 +693,20 @@ class LiveWorker:
                     return False
         
         # All gates finished - transition complete
-        print(f"\n✅ [Transition] All batches completed on gates {self.gates_to_finish}")
+        log.info(f"[Transition] All batches completed on gates {self.gates_to_finish}")
         return True
     
     def finalize_transition(self):
         """Finalize program and notify backend"""
         import time as _time
         transition_start = _time.time()
-        print(f"\n🏁 [Transition] Finalizing program {self.program_id}")
+        log.info(f"[Transition] Finalizing program {self.program_id}")
         
         # Write final KPIs
         kpi_start = _time.time()
         if self.minute_accumulator and self.minute_accumulator.has_data():
             self.process_minute_kpis()
-        print(f"   ⏱️ KPI write took {(_time.time() - kpi_start) * 1000:.0f}ms")
+        log.debug(f"  KPI write took {(_time.time() - kpi_start) * 1000:.0f}ms")
         
         # Get backend state to determine action
         state = self.machine_client.get_state()
@@ -735,16 +720,16 @@ class LiveWorker:
         # Notify backend (this is where stats calculation happens)
         backend_start = _time.time()
         result = self.machine_client.notify_transition_complete(self.program_id, action)
-        print(f"   ⏱️ Backend notify took {(_time.time() - backend_start) * 1000:.0f}ms")
+        log.debug(f"  Backend notify took {(_time.time() - backend_start) * 1000:.0f}ms")
         
         if result:
-            print(f"   ✅ Backend notified, action: {action}")
+            log.info(f"  Backend notified, action: {action}")
             
             if action == 'recipe_change':
                 # Backend created new program - get the new program ID and restart
                 new_program_id = result.get('programId')
                 if new_program_id:
-                    print(f"   🆕 Starting new program {new_program_id} with updated recipes")
+                    log.info(f"  Starting new program {new_program_id} with updated recipes")
                     
                     # Get current active recipes from backend state
                     new_state = self.machine_client.get_state()
@@ -761,13 +746,13 @@ class LiveWorker:
                     
                     # FLUSH pending KPIs for the OLD program before resetting
                     if self.minute_accumulator and self.minute_accumulator.has_data():
-                        print(f"   💾 Flushing pending KPIs for old program before transition...")
+                        log.info("  Flushing pending KPIs for old program before transition...")
                         self.process_minute_kpis()
                     
                     # Reset reject counters for new program
                     self.total_rejects_count = 0
                     self.total_rejects_weight = 0.0
-                    print(f"   🔄 Reset reject counters for new program")
+                    log.info("  Reset reject counters for new program")
                     
                     # Reset minute accumulator for new program
                     self.current_minute = datetime.now(timezone.utc).replace(second=0, microsecond=0)
@@ -776,10 +761,10 @@ class LiveWorker:
                     # Start the new program
                     self.start_program(new_program_id, new_recipes)
                     self.machine_state = 'running'
-                    print(f"   ✅ New program {new_program_id} started successfully")
-                    print(f"   ⏱️ Total transition took {(_time.time() - transition_start) * 1000:.0f}ms")
+                    log.info(f"  New program {new_program_id} started successfully")
+                    log.debug(f"  Total transition took {(_time.time() - transition_start) * 1000:.0f}ms")
                 else:
-                    print(f"   ⚠️ No new program ID in response")
+                    log.warning("  No new program ID in response")
                     
             elif action == 'stop':
                 # Reset to idle
@@ -789,8 +774,8 @@ class LiveWorker:
                 # Reset reject counters for next program
                 self.total_rejects_count = 0
                 self.total_rejects_weight = 0.0
-                print(f"   🔄 Reset reject counters")
-                print(f"   ⏱️ Total stop transition took {(_time.time() - transition_start) * 1000:.0f}ms")
+                log.info("  Reset reject counters")
+                log.debug(f"  Total stop transition took {(_time.time() - transition_start) * 1000:.0f}ms")
         
         # Reset transition state
         self.transitioning = False
@@ -810,7 +795,7 @@ class LiveWorker:
     
     def load_recipes(self):
         """Load recipe specs from SQLite (clears and reloads all recipes)"""
-        print("📋 Loading recipe specifications...")
+        log.info("Loading recipe specifications...")
         
         # Clear existing recipes to pick up newly created ones
         self.recipes.clear()
@@ -823,21 +808,21 @@ class LiveWorker:
             spec = RecipeSpec.from_db_row(row)
             self.recipes[spec.recipe_id] = spec
         
-        print(f"   ✓ Loaded {len(self.recipes)} recipes")
+        log.info(f"  Loaded {len(self.recipes)} recipes")
     
     def load_program_assignments_from_json(self):
         """Load program assignments from simulator JSON file with real duration calculation"""
         json_path = os.path.join(BASE_DIR, "..", "simulator", "data", "program_assignments.json")
         
         if not os.path.exists(json_path):
-            print("   ⚠️  No program_assignments.json found - using static assignment")
+            log.warning("  No program_assignments.json found - using static assignment")
             return False
         
         with open(json_path, 'r') as f:
             data = json.load(f)
             self.program_assignments = data.get('assignments', [])
         
-        print(f"   ✓ Loaded {len(self.program_assignments)} program configurations")
+        log.info(f"  Loaded {len(self.program_assignments)} program configurations")
         
         # Calculate real durations from timestamps
         if self.program_assignments:
@@ -854,14 +839,20 @@ class LiveWorker:
                 # Only one program, run indefinitely
                 self.next_program_switch_delay = float('inf')
             
-            print("\n" + "="*70)
-            print(f"🔄 PROGRAM MANAGER INITIALIZED (REAL DURATIONS)")
-            print(f"   Starting with program index {self.current_program_index}")
-            if self.next_program_switch_delay != float('inf'):
-                print(f"   ⏰ Real duration: {self.next_program_switch_delay:.1f} minutes")
-            else:
-                print(f"   ⏰ Single program mode (runs indefinitely)")
-            print("="*70 + "\n")
+            log.info(f"Program manager initialized with {len(self.program_assignments)} programs",
+                category='operations', action='program_manager_init',
+                program_index=self.current_program_index,
+                duration_min=self.next_program_switch_delay if self.next_program_switch_delay != float('inf') else None)
+            
+            if ENABLE_CONSOLE:
+                print("\n" + "="*70)
+                print("PROGRAM MANAGER INITIALIZED")
+                print(f"   Starting with program index {self.current_program_index}")
+                if self.next_program_switch_delay != float('inf'):
+                    print(f"   Real duration: {self.next_program_switch_delay:.1f} minutes")
+                else:
+                    print("   Single program mode (runs indefinitely)")
+                print("="*70 + "\n")
             return True
         
         return False
@@ -884,12 +875,12 @@ class LiveWorker:
                 return existing[0]
             
             # Recipe doesn't exist, create it
-            print(f"   ✨ Creating new recipe: {recipe_name}")
+            log.info(f"  Creating new recipe: {recipe_name}")
             
             # Parse recipe name: R_pieceMin_pieceMax_batchMin_batchMax_countType_countVal
             parts = recipe_name.split('_')
             if parts[0] != 'R' or len(parts) < 7:
-                print(f"   ⚠️  Invalid recipe format: {recipe_name}")
+                log.warning(f"  Invalid recipe format: {recipe_name}")
                 return None
             
             piece_min = int(parts[1]) if parts[1] != 'NA' else 0
@@ -911,11 +902,11 @@ class LiveWorker:
             self.sqlite_conn.commit()
             recipe_id = cur.lastrowid
             
-            print(f"   ✅ Created recipe {recipe_name} (ID: {recipe_id})")
+            log.info(f"  Created recipe {recipe_name} (ID: {recipe_id})")
             return recipe_id
             
         except Exception as e:
-            print(f"   ⚠️  Error getting/creating recipe {recipe_name}: {e}")
+            log.warning(f"  Error getting/creating recipe {recipe_name}: {e}")
             import traceback
             traceback.print_exc()
             return None
@@ -947,7 +938,7 @@ class LiveWorker:
             
             if existing_program:
                 program_id = existing_program[0]
-                print(f"   ℹ️  Using existing program: {program_name} (ID: {program_id})")
+                log.info(f"  Using existing program: {program_name} (ID: {program_id})")
             else:
                 # Create new program with timestamp-based name
                 cur = self.sqlite_conn.execute("""
@@ -956,7 +947,7 @@ class LiveWorker:
                 """, (program_name, 8))
                 program_id = cur.lastrowid
                 self.sqlite_conn.commit()
-                print(f"   ✨ Created new program: {program_name} (ID: {program_id})")
+                log.info(f"  Created new program: {program_name} (ID: {program_id})")
             
             # Create a new config in SQLite
             config_name = f"Live_{program_name}"
@@ -983,9 +974,9 @@ class LiveWorker:
                     
                     # Update local mapping
                     self.gate_to_recipe[gate] = recipe_id
-                    print(f"   ✓ Assigned gate {gate} to recipe {recipe_name} (SQLite ID: {recipe_id})")
+                    log.info(f"  Assigned gate {gate} to recipe {recipe_name} (SQLite ID: {recipe_id})")
                 else:
-                    print(f"   ⚠️  Failed to parse or create recipe {recipe_name}")
+                    log.warning(f"  Failed to parse or create recipe {recipe_name}")
             
             # Add to settings history
             self.sqlite_conn.execute("""
@@ -1001,7 +992,7 @@ class LiveWorker:
             
             if existing_stats:
                 # Program exists, start a new run period (update start_ts, clear end_ts)
-                print(f"   🔄 Starting new run for program {program_id}")
+                log.info(f"  Starting new run for program {program_id}")
                 self.sqlite_conn.execute("""
                     UPDATE program_stats
                     SET start_ts = ?, end_ts = NULL, updated_at = CURRENT_TIMESTAMP
@@ -1009,7 +1000,7 @@ class LiveWorker:
                 """, (now.isoformat(), program_id))
             else:
                 # Program stats don't exist, create new entry
-                print(f"   ✨ Creating new program_stats for program {program_id}")
+                log.info(f"  Creating new program_stats for program {program_id}")
                 self.sqlite_conn.execute("""
                     INSERT INTO program_stats (
                         program_id, total_batches, total_batched_weight_g, 
@@ -1028,28 +1019,28 @@ class LiveWorker:
             # Reset reject counters for new program
             self.total_rejects_count = 0
             self.total_rejects_weight = 0.0
-            print(f"   🔄 Reset reject counters for new program")
+            log.info("  Reset reject counters for new program")
             
             # Reset gate dwell time tracking for new program
             self.last_batch_time = {}
             self.last_batch_id_processed = 0  # Reset batch polling cursor
-            print(f"   🔄 Reset gate dwell time tracking for new program")
+            log.info("  Reset gate dwell time tracking for new program")
             
-            print(f"   ✅ Applied program {program_id} with {len(gate_assignments)} gate assignments")
+            log.info(f"  Applied program {program_id} with {len(gate_assignments)} gate assignments")
             
             # Notify backend to reload recipe assignments
             try:
                 reload_url = f"{BACKEND_URL}/api/ingest/reload-assignments"
                 resp = requests.post(reload_url, headers=self.headers, timeout=2)
                 if resp.status_code == 200:
-                    print(f"   ✅ Backend reloaded assignments")
+                    log.info("  Backend reloaded assignments")
                 else:
-                    print(f"   ⚠️  Backend reload failed: {resp.status_code}")
+                    log.warning(f"  Backend reload failed: {resp.status_code}")
             except Exception as e:
-                print(f"   ⚠️  Failed to notify backend: {e}")
+                log.warning(f"  Failed to notify backend: {e}")
             
         except Exception as e:
-            print(f"   ⚠️  Error applying program assignment: {e}")
+            log.warning(f"  Error applying program assignment: {e}")
     
     def calculate_and_write_program_totals(self, program_id: int, start_ts: str, end_ts: str):
         """
@@ -1060,7 +1051,7 @@ class LiveWorker:
         then calculates filled batch equivalents and giveaway per recipe.
         """
         try:
-            print(f"\n📊 Calculating totals for Program {program_id} ({start_ts} to {end_ts})")
+            log.info(f"Calculating totals for Program {program_id} ({start_ts} to {end_ts})")
             
             # Get all batches for this program from batch_completions table
             batches_query = """
@@ -1072,10 +1063,16 @@ class LiveWorker:
             batches = self.sqlite_conn.execute(batches_query, (start_ts, end_ts)).fetchall()
             
             if not batches:
-                print(f"   ℹ️  No batches found for program {program_id}")
+                # IMPORTANT: Still set end_ts to mark program as complete!
+                self.sqlite_conn.execute("""
+                    UPDATE program_stats
+                    SET end_ts = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE program_id = ?
+                """, (end_ts, program_id))
+                self.sqlite_conn.commit()
                 return
             
-            print(f"   📦 Processing {len(batches)} batches")
+            log.info(f"  Processing {len(batches)} batches")
             
             # Build a mapping of gates to recipes for this program
             # Try method 1: Get from run_configs directly for this program
@@ -1088,11 +1085,11 @@ class LiveWorker:
             
             if config_row:
                 config_id = config_row[0]
-                print(f"   ✓ Found run_config {config_id} for program {program_id}")
+                log.info(f"  Found run_config {config_id} for program {program_id}")
             else:
                 # Method 2: For live programs without run_configs (crash before config creation),
                 # try to reconstruct assignments from batch_completions.recipe_id
-                print(f"   ⚠️  No run_config found for program {program_id}, attempting reconstruction...")
+                log.warning(f"  No run_config found for program {program_id}, attempting reconstruction...")
                 
                 # Get unique recipe_id and gate combinations from batch_completions
                 recon_query = """
@@ -1104,8 +1101,8 @@ class LiveWorker:
                 recon_rows = self.sqlite_conn.execute(recon_query, (program_id,)).fetchall()
                 
                 if not recon_rows:
-                    print(f"   ❌ Cannot reconstruct - no batch completions with recipe_id found")
-                    print(f"   ⚠️  Marking program {program_id} as ended without stats")
+                    log.error("  Cannot reconstruct - no batch completions with recipe_id found")
+                    log.warning(f"  Marking program {program_id} as ended without stats")
                     # Just set end_ts and return
                     self.sqlite_conn.execute("""
                         UPDATE program_stats
@@ -1116,7 +1113,7 @@ class LiveWorker:
                     return
                 
                 # Create temporary config from reconstructed data
-                print(f"   ℹ️  Reconstructed {len(recon_rows)} gate assignments from batches:")
+                log.info(f"  Reconstructed {len(recon_rows)} gate assignments from batches:")
                 config_id = None  # Will use reconstructed mapping directly
                 
                 # Build mappings from reconstructed data
@@ -1132,7 +1129,7 @@ class LiveWorker:
                     gate_to_recipe_id[gate_num] = recipe_id
                     gate_to_recipe_name[gate_num] = recipe_name
                     recipe_id_to_gates[recipe_id].append(gate_num)
-                    print(f"      Gate {gate_num} → {recipe_name} (ID: {recipe_id}) [reconstructed]")
+                    log.info(f"      Gate {gate_num} → {recipe_name} (ID: {recipe_id}) [reconstructed]")
             
             # Get gate assignments from config (if config_id exists)
             if config_id is not None:
@@ -1148,15 +1145,15 @@ class LiveWorker:
                 gate_to_recipe_name = {}
                 recipe_id_to_gates = defaultdict(list)
                 
-                print(f"   🔍 Found {len(assignments_rows)} gate assignments at {start_ts}")
+                log.info(f"  Found {len(assignments_rows)} gate assignments at {start_ts}")
                 for gate_num, recipe_id, recipe_name in assignments_rows:
                     gate_to_recipe_id[gate_num] = recipe_id
                     gate_to_recipe_name[gate_num] = recipe_name
                     recipe_id_to_gates[recipe_id].append(gate_num)
-                    print(f"      Gate {gate_num} → {recipe_name} (ID: {recipe_id})")
+                    log.info(f"      Gate {gate_num} → {recipe_name} (ID: {recipe_id})")
             
             if not gate_to_recipe_id:
-                print(f"   ⚠️  No recipe assignments found for program {program_id}")
+                log.warning(f"  No recipe assignments found for program {program_id}")
                 return
             
             # Show which gates are assigned
@@ -1165,7 +1162,7 @@ class LiveWorker:
             unassigned_gates = batch_gates - assigned_gates
             if unassigned_gates:
                 unassigned_count = sum(1 for b in batches if b[1] in unassigned_gates)
-                print(f"   ℹ️  Skipping {unassigned_count} batches from unassigned gates: {sorted(unassigned_gates)}")
+                log.info(f"  Skipping {unassigned_count} batches from unassigned gates: {sorted(unassigned_gates)}")
             
             # Calculate per-recipe totals using filled batch equivalent logic
             per_recipe_totals = {}
@@ -1256,10 +1253,10 @@ class LiveWorker:
                                     w_rej += weight
                                     i_rej += 1
                     
-                    print(f"      Rejects: {i_rej} pieces, {w_rej:.1f}g (eligible but not assigned to gates {sorted(gates)})")
+                    log.info(f"      Rejects: {i_rej} pieces, {w_rej:.1f}g (eligible but not assigned to gates {sorted(gates)})")
                 
                 except Exception as e:
-                    print(f"      ⚠️  Could not query reject data for recipe {recipe_id}: {e}")
+                    log.info(f"      ⚠️  Could not query reject data for recipe {recipe_id}: {e}")
                     import traceback
                     traceback.print_exc()
                     w_rej = 0.0
@@ -1284,7 +1281,7 @@ class LiveWorker:
                 total_w_batched += w_target_sum
                 total_w_give += w_give
                 
-                print(f"   ✅ {recipe_name}: {filled_equiv:.1f} batches, {int(w_target_sum):,}g batched, {int(round(w_give)):,}g giveaway")
+                log.info(f"  {recipe_name}: {filled_equiv:.1f} batches, {int(w_target_sum):,}g batched, {int(round(w_give)):,}g giveaway")
             
             # Calculate program totals
             # Query reject totals from SQLite (M3 combined) or InfluxDB
@@ -1303,7 +1300,7 @@ class LiveWorker:
                 if reject_query and reject_query[0]:
                     reject_count = int(reject_query[0])
                     reject_weight = float(reject_query[1])
-                    print(f"   ✓ Found reject data from SQLite: {reject_count} pieces, {reject_weight:.1f}g")
+                    log.info(f"  Found reject data from SQLite: {reject_count} pieces, {reject_weight:.1f}g")
                 else:
                     # Fallback: Query InfluxDB for gate 0 pieces
                     try:
@@ -1322,14 +1319,14 @@ class LiveWorker:
                                 if data_dict and 'count' in data_dict and 'weight' in data_dict:
                                     reject_count = int(data_dict['count'][0]) if data_dict['count'][0] else 0
                                     reject_weight = float(data_dict['weight'][0]) if data_dict['weight'][0] else 0.0
-                                    print(f"   ✓ Found reject data from InfluxDB: {reject_count} pieces, {reject_weight:.1f}g")
+                                    log.info(f"  Found reject data from InfluxDB: {reject_count} pieces, {reject_weight:.1f}g")
                                     break
                     except Exception as e:
-                        print(f"   ⚠️  Could not query InfluxDB for rejects: {e}")
+                        log.warning(f"  Could not query InfluxDB for rejects: {e}")
                         import traceback
                         traceback.print_exc()
             except Exception as e:
-                print(f"   ⚠️  Error querying reject data: {e}")
+                log.warning(f"  Error querying reject data: {e}")
             
             program_totals = {
                 "total_batches": float(total_filled),
@@ -1396,23 +1393,20 @@ class LiveWorker:
             
             self.sqlite_conn.commit()
             
-            print(f"   ✅ Program totals: {program_totals['total_batches']:.1f} batches, " +
+            log.info(f"Program totals: {program_totals['total_batches']:.1f} batches, " +
                   f"{program_totals['total_batched_weight_g']:,}g batched, " +
                   f"{program_totals['total_giveaway_weight_g']:,}g giveaway, " +
                   f"{program_totals['total_items_rejected']} rejects")
-            print(f"   ✅ Written stats for {len(per_recipe_totals)} recipes")
+            log.info(f"  Written stats for {len(per_recipe_totals)} recipes")
             
         except Exception as e:
-            print(f"\n" + "="*70)
-            print(f"❌ ERROR in calculate_and_write_program_totals")
-            print(f"   Program ID: {program_id}")
-            print(f"   Start: {start_ts}")
-            print(f"   End: {end_ts}")
-            print(f"   Error: {e}")
-            print("="*70)
-            import traceback
-            traceback.print_exc()
-            print("="*70 + "\n")
+            log.error(f"Error calculating program totals: {e}", exc=e,
+                category='error', action='calculate_program_totals',
+                program_id=program_id, start_ts=start_ts, end_ts=end_ts)
+            
+            if ENABLE_CONSOLE:
+                import traceback
+                traceback.print_exc()
     
     def check_and_switch_program(self):
         """Check if it's time to switch to next program, and do so if needed"""
@@ -1438,19 +1432,16 @@ class LiveWorker:
                         # Calculate filled batch equivalents and write stats
                         self.calculate_and_write_program_totals(self.program_id, start_ts, end_ts)
                         
-                        print(f"   ⏹  Ended program {self.program_id}")
+                        log.info(f"  Ended program {self.program_id}")
                     else:
-                        print(f"   ⚠️  No active program_stats found for program {self.program_id}")
+                        log.warning(f"  No active program_stats found for program {self.program_id}")
                 except Exception as e:
-                    print(f"   ⚠️  Error ending program {self.program_id}: {e}")
+                    log.warning(f"  Error ending program {self.program_id}: {e}")
             
             # Switch to next program
             self.current_program_index = (self.current_program_index + 1) % len(self.program_assignments)
             assignment = self.program_assignments[self.current_program_index]
             
-            print("\n" + "="*70)
-            print(f"🔄 PROGRAM SWITCH")
-            print(f"   New program: {assignment['program_id']} (config {self.current_program_index + 1}/{len(self.program_assignments)})")
             self.apply_program_assignment(assignment)
             
             # Calculate next duration from program timestamps
@@ -1462,23 +1453,23 @@ class LiveWorker:
                 next_ts = datetime.fromisoformat(self.program_assignments[next_index]['timestamp'])
                 duration_seconds = (next_ts - current_ts).total_seconds()
                 self.next_program_switch_delay = duration_seconds / 60.0
-                print(f"   ⏰ Real duration: {self.next_program_switch_delay:.1f} minutes")
             else:
-                # Looping back - use duration from last to first
-                current_ts = datetime.fromisoformat(self.program_assignments[self.current_program_index]['timestamp'])
-                first_ts = datetime.fromisoformat(self.program_assignments[0]['timestamp'])
-                # This would be negative, so just use a reasonable default
+                # Looping back - use a reasonable default
                 self.next_program_switch_delay = 180.0  # 3 hours
-                print(f"   ⏰ Looping back - using default: {self.next_program_switch_delay:.1f} minutes")
             
-            print("="*70 + "\n")
+            log.info(f"Program switch to {assignment['program_id']}",
+                category='operations', action='program_switch',
+                program_id=assignment['program_id'],
+                config_index=self.current_program_index + 1,
+                total_configs=len(self.program_assignments),
+                next_duration_min=self.next_program_switch_delay)
     
     def load_current_assignments(self):
         """
         Load current gate-to-recipe assignments.
         TODO: In production, this should listen for changes from the UI
         """
-        print("🔧 Loading gate assignments...")
+        log.info("Loading gate assignments...")
         
         # Get most recent assignment from settings_history
         cur = self.sqlite_conn.execute("""
@@ -1491,7 +1482,7 @@ class LiveWorker:
         
         row = cur.fetchone()
         if not row:
-            print("   ⚠️  No active configuration found")
+            log.warning("  No active configuration found")
             return
         
         config_id = row['active_config_id']
@@ -1509,10 +1500,10 @@ class LiveWorker:
             if recipe_id:
                 self.gate_to_recipe[gate] = recipe_id
         
-        print(f"   ✓ Loaded assignments for {len(self.gate_to_recipe)} gates")
+        log.info(f"  Loaded assignments for {len(self.gate_to_recipe)} gates")
         for gate, recipe_id in sorted(self.gate_to_recipe.items()):
             recipe_name = self.recipes[recipe_id].recipe_name if recipe_id in self.recipes else "unknown"
-            print(f"      Gate {gate} → {recipe_name}")
+            log.info(f"      Gate {gate} → {recipe_name}")
     
     
     def poll_completed_batches(self) -> List[Dict]:
@@ -1547,11 +1538,11 @@ class LiveWorker:
             
             # Batch polling logging disabled for cleaner output
             # if batches:
-            #     print(f"   📦 Found {len(batches)} completed batches from backend (IDs {batches[0]['id']}-{batches[-1]['id']})")
+            #     log.info(f"  Found {len(batches)} completed batches from backend (IDs {batches[0]['id']}-{batches[-1]['id']})")
             
             return batches
         except Exception as e:
-            print(f"   ❌ Error polling completed batches: {e}")
+            log.error(f"  Error polling completed batches: {e}")
             return []
     
     def poll_new_pieces(self) -> List[PieceData]:
@@ -1627,7 +1618,7 @@ class LiveWorker:
             
         except Exception as e:
             import traceback
-            print(f"⚠️  Error polling pieces: {e}")
+            log.warning(f"Error polling pieces: {e}")
             traceback.print_exc()
             return []
     
@@ -1656,11 +1647,11 @@ class LiveWorker:
             # Check if piece weight is within allowed range
             # Piece weight validation logging disabled for cleaner output
             # if recipe.piece_min > 0 and weight < recipe.piece_min:
-            #     print(f"   ⚠️  Gate {gate}: Piece weight {weight}g below minimum {recipe.piece_min}g (recipe: {recipe.recipe_name})")
+            #     log.warning(f"  Gate {gate}: Piece weight {weight}g below minimum {recipe.piece_min}g (recipe: {recipe.recipe_name})")
             # elif recipe.piece_max > 0 and weight > recipe.piece_max:
-            #     print(f"   ⚠️  Gate {gate}: Piece weight {weight}g above maximum {recipe.piece_max}g (recipe: {recipe.recipe_name})")
+            #     log.warning(f"  Gate {gate}: Piece weight {weight}g above maximum {recipe.piece_max}g (recipe: {recipe.recipe_name})")
             # else:
-            #     print(f"   ✅ Gate {gate}: Piece weight {weight}g within range {recipe.piece_min}-{recipe.piece_max}g (recipe: {recipe.recipe_name})")
+            #     log.info(f"  Gate {gate}: Piece weight {weight}g within range {recipe.piece_min}-{recipe.piece_max}g (recipe: {recipe.recipe_name})")
             pass
         
         # Accumulate piece for M3/M4 calculations
@@ -1710,7 +1701,7 @@ class LiveWorker:
                     updated_at = CURRENT_TIMESTAMP
             """, (self.program_id, gate, n, mean, m2, min_sec, max_sec))
         except Exception as e:
-            print(f"   ⚠️  Error updating gate dwell accumulator: {e}")
+            log.warning(f"  Error updating gate dwell accumulator: {e}")
     
     def process_completed_batch(self, batch: Dict):
         """Process a completed batch from backend for M3/M4 calculations"""
@@ -1738,7 +1729,7 @@ class LiveWorker:
                         
                         self.sqlite_conn.commit()
                     except Exception as e:
-                        print(f"   ⚠️  Error writing gate dwell time: {e}")
+                        log.warning(f"  Error writing gate dwell time: {e}")
                 
                 # Update last batch time for this gate
                 self.last_batch_time[gate] = batch_time
@@ -1760,7 +1751,7 @@ class LiveWorker:
                 # Minute rolled over - PROCESS the old accumulator BEFORE creating new one
                 # This prevents data loss when batches arrive in a new minute
                 if self.minute_accumulator and self.minute_accumulator.has_data():
-                    print(f"   🔄 Minute rollover in batch processing ({self.current_minute.strftime('%H:%M')} → {minute_bucket.strftime('%H:%M')})")
+                    log.info(f"  Minute rollover in batch processing ({self.current_minute.strftime('%H:%M')} → {minute_bucket.strftime('%H:%M')})")
                     self.process_minute_kpis()
                 self.current_minute = minute_bucket
                 self.minute_accumulator = MinuteAccumulator(minute_start=minute_bucket)
@@ -1770,9 +1761,9 @@ class LiveWorker:
             
             self.batches_detected += 1
             # Batch logging disabled for cleaner output
-            # print(f"   📦 Batch #{batch['id']}: Gate {batch['gate']}, {batch['pieces']} pieces, {batch['weight_g']:.1f}g → minute {minute_bucket.strftime('%H:%M')}")
+            # log.info(f"  Batch #{batch['id']}: Gate {batch['gate']}, {batch['pieces']} pieces, {batch['weight_g']:.1f}g → minute {minute_bucket.strftime('%H:%M')}")
         except Exception as e:
-            print(f"   ❌ Error processing completed batch: {e}")
+            log.error(f"  Error processing completed batch: {e}")
             import traceback
             traceback.print_exc()
     
@@ -1813,10 +1804,10 @@ class LiveWorker:
         # Check if this minute was already processed (prevents duplicate writes)
         minute_key = minute_time.isoformat()
         if hasattr(self, 'processed_minutes') and minute_key in self.processed_minutes:
-            print(f"   ⏭️  Minute {minute_time.strftime('%H:%M')} already processed, skipping")
+            log.debug(f"  Minute {minute_time.strftime('%H:%M')} already processed, skipping")
             return
         
-        print(f"📊 Processing KPIs for {minute_time.strftime('%H:%M')}")
+        log.info(f"Processing KPIs for {minute_time.strftime('%H:%M')}")
         
         try:
             # Process M3 per-minute KPIs
@@ -1826,7 +1817,7 @@ class LiveWorker:
             self.process_m4_totals(minute_time)
             
         except Exception as e:
-            print(f"⚠️  Error processing KPIs: {e}")
+            log.warning(f"Error processing KPIs: {e}")
             import traceback
             traceback.print_exc()
         
@@ -1936,9 +1927,9 @@ class LiveWorker:
                         0,   # total_rejects_count (per-recipe, always 0)
                         0.0  # total_rejects_weight_g (per-recipe, always 0)
                     )
-                    print(f"   ✅ M3 per-recipe: {recipe_name} → {pieces_count}pcs, {weight_sum:.0f}g, {batch_count}batches, {giveaway_pct:.2f}%")
+                    log.info(f"  M3 per-recipe: {recipe_name} → {pieces_count}pcs, {weight_sum:.0f}g, {batch_count}batches, {giveaway_pct:.2f}%")
                 except Exception as e:
-                    print(f"   ⚠️  Error writing M3 for {recipe_name}: {e}")
+                    log.warning(f"  Error writing M3 for {recipe_name}: {e}")
             
             # Calculate combined M3 (sum across all recipes)
             total_pieces = sum(len(p) for g, p in acc.pieces_by_gate.items() if g != 0)
@@ -1978,7 +1969,7 @@ class LiveWorker:
                 )
                 self.kpis_written += 1
             except Exception as e:
-                print(f"   ⚠️  Error writing combined M3: {e}")
+                log.warning(f"  Error writing combined M3: {e}")
             
             # Track M3 write performance (for monitoring)
             m3_duration = (time.time() - m3_start) * 1000  # Convert to milliseconds
@@ -1987,7 +1978,7 @@ class LiveWorker:
                 self.m3_write_times = self.m3_write_times[-100:]  # Keep only last 100
             
         except Exception as e:
-            print(f"⚠️  Error processing M3: {e}")
+            log.warning(f"Error processing M3: {e}")
             import traceback
             traceback.print_exc()
     
@@ -2043,7 +2034,7 @@ class LiveWorker:
                                 giveaway_pct_avg
                             )
                         except Exception as e:
-                            print(f"   ⚠️  Error writing M4 for {recipe_name} (no new batches): {e}")
+                            log.warning(f"  Error writing M4 for {recipe_name} (no new batches): {e}")
                     continue
                 
                 # Calculate filled batch equivalents and target weight for this minute's batches
@@ -2115,54 +2106,62 @@ class LiveWorker:
                         giveaway_g_per_batch,
                         giveaway_pct_avg
                     )
-                    print(f"   ✅ M4 cumulative: {recipe_name} → {int(cum_filled)} batches, {giveaway_pct_avg:.2f}% avg")
+                    log.info(f"  M4 cumulative: {recipe_name} → {int(cum_filled)} batches, {giveaway_pct_avg:.2f}% avg")
                 except Exception as e:
-                    print(f"   ⚠️  Error writing M4 for {recipe_name}: {e}")
+                    log.warning(f"  Error writing M4 for {recipe_name}: {e}")
                     
         except Exception as e:
-            print(f"⚠️  Error processing M4 totals: {e}")
+            log.warning(f"Error processing M4 totals: {e}")
             import traceback
             traceback.print_exc()
     
     def log_performance(self):
-        """Log performance metrics every minute"""
+        """Log performance metrics every minute (console output only in dev)"""
         now = datetime.now(timezone.utc)
         
         if self.last_performance_log is None or (now - self.last_performance_log).total_seconds() >= 60:
-            print("\n" + "="*60)
-            print("📊 PERFORMANCE METRICS (last 60 seconds)")
-            print("="*60)
-            
-            # M1 metrics (pieces written)
-            if self.m1_write_times:
-                avg_m1 = sum(self.m1_write_times) / len(self.m1_write_times)
-                max_m1 = max(self.m1_write_times)
-                print(f"M1 (Pieces):  Avg: {avg_m1:.2f}ms  Max: {max_m1:.2f}ms  Count: {len(self.m1_write_times)}")
-            
-            # M2 metrics (gate state - per piece)
-            if self.m2_write_times:
-                avg_m2 = sum(self.m2_write_times) / len(self.m2_write_times)
-                max_m2 = max(self.m2_write_times)
-                print(f"M2 (Gates):   Avg: {avg_m2:.2f}ms  Max: {max_m2:.2f}ms  Count: {len(self.m2_write_times)}")
-            
-            # M3 metrics (KPIs - per minute)
-            if self.m3_write_times:
-                avg_m3 = sum(self.m3_write_times) / len(self.m3_write_times)
-                max_m3 = max(self.m3_write_times)
-                print(f"M3 (KPIs):    Avg: {avg_m3:.2f}ms  Max: {max_m3:.2f}ms  Count: {len(self.m3_write_times)}")
-            
-            # Error rate
+            # Collect metrics
+            m1_avg = sum(self.m1_write_times) / len(self.m1_write_times) if self.m1_write_times else 0
+            m2_avg = sum(self.m2_write_times) / len(self.m2_write_times) if self.m2_write_times else 0
+            m3_avg = sum(self.m3_write_times) / len(self.m3_write_times) if self.m3_write_times else 0
             total_writes = len(self.m1_write_times) + len(self.m2_write_times) + len(self.m3_write_times)
             error_rate = (self.influx_errors / max(1, total_writes)) * 100
-            print(f"\nInfluxDB Errors: {self.influx_errors} ({error_rate:.2f}%)")
             
-            # Processing rate
-            if self.start_time:
-                elapsed = time.time() - self.start_time
-                pieces_per_sec = self.pieces_processed / max(1, elapsed)
-                print(f"Processing Rate: {pieces_per_sec:.2f} pieces/sec")
+            # Log to file (structured JSON)
+            log.info("Performance metrics", 
+                category='system', action='performance',
+                m1_avg_ms=round(m1_avg, 2),
+                m2_avg_ms=round(m2_avg, 2),
+                m3_avg_ms=round(m3_avg, 2),
+                influx_errors=self.influx_errors,
+                error_rate_pct=round(error_rate, 2))
             
-            print("="*60 + "\n")
+            # Console output only in development
+            if ENABLE_CONSOLE:
+                print("\n" + "="*60)
+                print("PERFORMANCE METRICS (last 60 seconds)")
+                print("="*60)
+                
+                if self.m1_write_times:
+                    max_m1 = max(self.m1_write_times)
+                    print(f"M1 (Pieces):  Avg: {m1_avg:.2f}ms  Max: {max_m1:.2f}ms  Count: {len(self.m1_write_times)}")
+                
+                if self.m2_write_times:
+                    max_m2 = max(self.m2_write_times)
+                    print(f"M2 (Gates):   Avg: {m2_avg:.2f}ms  Max: {max_m2:.2f}ms  Count: {len(self.m2_write_times)}")
+                
+                if self.m3_write_times:
+                    max_m3 = max(self.m3_write_times)
+                    print(f"M3 (KPIs):    Avg: {m3_avg:.2f}ms  Max: {max_m3:.2f}ms  Count: {len(self.m3_write_times)}")
+                
+                print(f"\nInfluxDB Errors: {self.influx_errors} ({error_rate:.2f}%)")
+                
+                if self.start_time:
+                    elapsed = time.time() - self.start_time
+                    pieces_per_sec = self.pieces_processed / max(1, elapsed)
+                    print(f"Processing Rate: {pieces_per_sec:.2f} pieces/sec")
+                
+                print("="*60 + "\n")
             
             # Reset counters for next interval
             self.m1_write_times = []
@@ -2172,8 +2171,8 @@ class LiveWorker:
             self.last_performance_log = now
     
     def print_stats(self):
-        """Print statistics"""
-        if not self.start_time:
+        """Print statistics (silent in production)"""
+        if not ENABLE_CONSOLE or not self.start_time:
             return
         
         elapsed = time.time() - self.start_time
@@ -2183,11 +2182,11 @@ class LiveWorker:
         if self.last_program_switch and self.next_program_switch_delay:
             elapsed_since_switch = (datetime.now(timezone.utc) - self.last_program_switch).total_seconds() / 60.0
             time_until_switch = self.next_program_switch_delay - elapsed_since_switch
-            switch_info = f" | ⏰ Switch in: {max(0, time_until_switch):.1f}m"
+            switch_info = f" | Switch in: {max(0, time_until_switch):.1f}m"
         else:
             switch_info = ""
         
-        print(f"\r📈 Pieces: {self.pieces_processed:,} | "
+        print(f"\r  Pieces: {self.pieces_processed:,} | "
               f"Batches: {self.batches_detected} | "
               f"KPIs: {self.kpis_written} | "
               f"Rate: {rate:.1f}/s | "
@@ -2195,35 +2194,36 @@ class LiveWorker:
     
     def run(self):
         """Main loop - polls for new pieces and processes KPIs every minute"""
-        print("\n" + "=" * 70)
-        print("🚀 Live Mode Worker v4 (Machine State Integration)")
-        print("=" * 70 + "\n")
+        log.startup_banner("Live Mode Worker", "4.0", {
+            "Backend": BACKEND_URL,
+            "InfluxDB": INFLUX_HOST,
+        })
         
         self.connect()
         self.load_recipes()
         
-        # ✨ Recover any incomplete programs from previous crashes
+        # Recover any incomplete programs from previous crashes
         self.recover_incomplete_programs()
         
         # Poll initial machine state from backend
-        print("🔧 Polling machine state from backend...")
+        log.info("Polling machine state from backend")
         initial_state = self.machine_client.get_state()
         if initial_state:
             self.machine_state = initial_state['state']
-            print(f"   Initial state: {self.machine_state}")
+            log.item("Initial state", self.machine_state)
             
             # If machine is already running, sync with it
             if self.machine_state == 'running':
                 program_id = initial_state.get('currentProgramId')
                 active_recipes = initial_state.get('activeRecipes', [])
-                print(f"   Syncing with running program {program_id}")
+                log.info(f"Syncing with running program {program_id}")
                 self.start_program(program_id, active_recipes)
         else:
-            print("   ⚠️  Could not connect to backend, using legacy mode")
+            log.warning("Could not connect to backend, using legacy mode")
             # Fallback to legacy program loading
             if self.load_program_assignments_from_json():
                 first_assignment = self.program_assignments[0]
-                print(f"   Applying initial program {first_assignment['program_id']}...")
+                log.info(f"Applying initial program {first_assignment['program_id']}")
                 self.apply_program_assignment(first_assignment)
             else:
                 self.load_current_assignments()
@@ -2234,9 +2234,9 @@ class LiveWorker:
         last_minute_check = None
         last_state_poll = time.time()
         
-        print("\n⏳ Polling machine state and processing KPIs...")
-        print("   (M1/M2 and batch detection handled by backend JavaScript)")
-        print("=" * 70 + "\n")
+        log.section("Worker Active")
+        log.info("Polling machine state and processing KPIs")
+        log.item("M1/M2 batch detection", "handled by backend")
         
         try:
             while self.running:
@@ -2298,7 +2298,7 @@ class LiveWorker:
                     # (accumulate_for_minute may have already processed and created new accumulator)
                     if self.minute_accumulator and self.minute_accumulator.minute_start < current_minute_bucket:
                         if self.minute_accumulator.has_data():
-                            print(f"   🔄 Minute rollover detected in main loop ({self.minute_accumulator.minute_start.strftime('%H:%M')} < {current_minute_bucket.strftime('%H:%M')})")
+                            log.info(f"  Minute rollover detected in main loop ({self.minute_accumulator.minute_start.strftime('%H:%M')} < {current_minute_bucket.strftime('%H:%M')})")
                             self.process_minute_kpis()
                     last_minute_check = current_minute_bucket
                 
@@ -2307,7 +2307,7 @@ class LiveWorker:
                 #     self.check_and_switch_program()
                 # except Exception as e:
                 #     print(f"\n{'='*70}")
-                #     print(f"❌ ERROR in check_and_switch_program")
+                #     log.error("ERROR in check_and_switch_program")
                 #     print(f"   Error: {e}")
                 #     print(f"{'='*70}")
                 #     import traceback
@@ -2324,13 +2324,13 @@ class LiveWorker:
                 time.sleep(0.2)  # 200ms - allows state changes to be detected quickly
                 
         except KeyboardInterrupt:
-            print("\n\n⚠️  Interrupted by user")
+            log.info("Interrupted by user")
         finally:
             if self.minute_accumulator:
                 self.process_minute_kpis()
             
             self.print_stats()
-            print("\n\n✅ Worker stopped")
+            log.info("Worker stopped")
             self.disconnect()
 
 def main():

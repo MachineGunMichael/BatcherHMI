@@ -19,6 +19,7 @@ import { tokens } from "../../theme";
 import Header from "../../components/Header";
 import ServerOffline from "../../components/ServerOffline";
 import useMachineState from "../../hooks/useMachineState";
+import log from "../../services/logService";
 
 const API_BASE = process.env.REACT_APP_API_BASE || "http://localhost:5001";
 
@@ -114,6 +115,7 @@ const Stats = () => {
   useEffect(() => {
     fetchPrograms();
     fetchAllRecipes();
+    log.pageViewed('/stats');
   }, []);
 
   // Fetch all recipes for display name lookup
@@ -371,6 +373,12 @@ const Stats = () => {
     setSelectedProgramId(programId);
     // Save to localStorage to persist across navigation
     localStorage.setItem('stats_selected_program_id', programId);
+    
+    // Log program selection
+    const program = programs.find(p => String(p.id) === String(programId));
+    if (program) {
+      log.statsProgramSelected(programId, program.name);
+    }
   };
 
   // Show server offline screen if not connected
@@ -872,10 +880,12 @@ const Stats = () => {
                         alignItems="center" 
                         gap="8px"
                         onClick={() => {
+                          const newVisible = !visibleRecipes[recipe.recipe_name];
                           setVisibleRecipes(prev => ({
                             ...prev,
-                            [recipe.recipe_name]: !prev[recipe.recipe_name]
+                            [recipe.recipe_name]: newVisible
                           }));
+                          log.statsRecipeToggled(recipe.recipe_id, recipe.recipe_name, newVisible);
                         }}
                         sx={{ 
                           cursor: 'pointer',

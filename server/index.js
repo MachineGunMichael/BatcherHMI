@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 
+const log = require('./lib/logger');
 const influx = require('./services/influx');
 const db = require('./db/sqlite');
 
@@ -18,30 +19,30 @@ function runMigrations() {
     const hasCompletedTransitionGates = columns.some(c => c.name === 'completed_transition_gates');
     
     if (!hasTransitioningGates) {
-      console.log('[Migration] Adding transitioning_gates column to machine_state...');
+      log.system('migration', 'Adding column transitioning_gates', { column: 'transitioning_gates' });
       db.prepare(`ALTER TABLE machine_state ADD COLUMN transitioning_gates TEXT DEFAULT '[]'`).run();
-      console.log('[Migration] ✅ Added transitioning_gates column');
+      log.system('migration', 'Column transitioning_gates added', { column: 'transitioning_gates' });
     }
     
     if (!hasTransitionStartRecipes) {
-      console.log('[Migration] Adding transition_start_recipes column to machine_state...');
+      log.system('migration', 'Adding column transition_start_recipes', { column: 'transition_start_recipes' });
       db.prepare(`ALTER TABLE machine_state ADD COLUMN transition_start_recipes TEXT DEFAULT '{}'`).run();
-      console.log('[Migration] ✅ Added transition_start_recipes column');
+      log.system('migration', 'Column transition_start_recipes added', { column: 'transition_start_recipes' });
     }
     
     if (!hasTransitionOldProgramId) {
-      console.log('[Migration] Adding transition_old_program_id column to machine_state...');
+      log.system('migration', 'Adding column transition_old_program_id', { column: 'transition_old_program_id' });
       db.prepare(`ALTER TABLE machine_state ADD COLUMN transition_old_program_id INTEGER DEFAULT NULL`).run();
-      console.log('[Migration] ✅ Added transition_old_program_id column');
+      log.system('migration', 'Column transition_old_program_id added', { column: 'transition_old_program_id' });
     }
     
     if (!hasCompletedTransitionGates) {
-      console.log('[Migration] Adding completed_transition_gates column to machine_state...');
+      log.system('migration', 'Adding column completed_transition_gates', { column: 'completed_transition_gates' });
       db.prepare(`ALTER TABLE machine_state ADD COLUMN completed_transition_gates TEXT DEFAULT '[]'`).run();
-      console.log('[Migration] ✅ Added completed_transition_gates column');
+      log.system('migration', 'Column completed_transition_gates added', { column: 'completed_transition_gates' });
     }
   } catch (err) {
-    console.error('[Migration] Error running migrations:', err);
+    log.error('system', 'migration_error', err);
   }
 }
 
@@ -51,7 +52,7 @@ runMigrations();
 // Clear stale transition state on startup (ensures clean start)
 function clearStaleTransitionState() {
   try {
-    console.log('[Startup] Clearing stale transition state...');
+    log.system('clearing_transition_state', 'Clearing stale transition state');
     db.prepare(`
       UPDATE machine_state 
       SET transitioning_gates = '[]',
@@ -60,9 +61,9 @@ function clearStaleTransitionState() {
           transition_old_program_id = NULL
       WHERE id = 1
     `).run();
-    console.log('[Startup] ✅ Transition state cleared');
+    log.system('transition_state_cleared', 'Transition state cleared successfully');
   } catch (err) {
-    console.error('[Startup] Error clearing transition state:', err);
+    log.error('system', 'startup_error', err);
   }
 }
 
@@ -81,6 +82,7 @@ const historyRoutes = require('./routes/history');
 const importRoutes = require('./routes/import');
 const configRoutes = require('./routes/config');
 const machineRoutes = require('./routes/machine');
+const logsRoutes = require('./routes/logs');
 
 const outbox = require('./workers/outboxDispatcher');
 
@@ -111,11 +113,12 @@ app.use('/api/ingest', ingest);
 app.use('/api/ts', tsRoutes);
 app.use('/api/kpi', kpiRoutes);
 app.use('/api/stats', statsRoutes);
-app.use('/api/assignments', assignmentsRoutes); // M5 moved from InfluxDB to SQLite
+app.use('/api/assignments', assignmentsRoutes);
 app.use('/api/history', historyRoutes);
-app.use('/api/import', importRoutes); // One-time data imports
-app.use('/api/config', configRoutes); // Runtime configuration
-app.use('/api/machine', machineRoutes); // Machine control and state management
+app.use('/api/import', importRoutes);
+app.use('/api/config', configRoutes);
+app.use('/api/machine', machineRoutes);
+app.use('/api/logs', logsRoutes);
 
 // (optional) keep your earlier debug TS endpoints for convenience:
 app.get('/api/ts/health', async (_req, res) => {
@@ -133,7 +136,7 @@ app.post('/api/ts/write', verifyToken, async (req, res) => {
     await influx.writePoint({ measurement, tags, fields, timestamp });
     res.json({ ok: true });
   } catch (e) {
-    console.error('Influx write error:', e);
+    log.error('system', 'influx_write_error', e);
     res.status(500).json({ message: 'Influx write failed' });
   }
 });
@@ -147,7 +150,7 @@ app.get('/api/ts/query', verifyToken, async (req, res) => {
     const rows = await influx.query(sql);
     res.json({ rows });
   } catch (e) {
-    console.error('Influx query error:', e);
+    log.error('system', 'influx_query_error', e);
     res.status(500).json({ message: 'Influx query failed' });
   }
 });
@@ -162,13 +165,13 @@ function initializeOnStartup() {
   try {
     // Reset all gate states to 0
     gates.resetAll();
-    console.log('🔄 Reset all gates to 0 on startup');
+    log.system('gates_reset', 'All gate states reset to 0');
     
     // Reset machine state to idle (clears active recipes)
     machineState.reset();
-    console.log('🔄 Reset machine state to idle on startup');
+    log.system('machine_state_reset', 'Machine state reset to idle');
   } catch (e) {
-    console.error('⚠️  Failed to initialize on startup:', e);
+    log.error('system', 'startup_initialization_error', e);
   }
 }
 
@@ -177,18 +180,18 @@ function initializeOnStartup() {
 setInterval(() => {
   const heapMB = process.memoryUsage().heapUsed / 1024 / 1024;
   if (heapMB > 1500) {
-    console.warn(`⚠️  Memory: ${heapMB.toFixed(0)} MB heap used`);
+    log.warn('system', 'high_memory', `Heap: ${heapMB.toFixed(0)} MB`, { heapMB: Math.round(heapMB) });
   }
 }, 60 * 1000); // Check every minute
 
 // ---------- start server ----------
 app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT} (SQLite + InfluxDB3)`);
+  log.serverStarted(PORT);
   
   // Initialize clean state on startup
   initializeOnStartup();
   
   if (outbox && typeof outbox.start === 'function') {
-    outbox.start();     // begin polling outbox & broadcasting
+    outbox.start();
   }
 });

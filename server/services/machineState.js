@@ -3,10 +3,10 @@
 
 const db = require('../db/sqlite');
 const eventBus = require('../lib/eventBus');
+const log = require('../lib/logger');
 
 /**
  * Get current machine state
- * @returns {Object} { state, currentProgramId, activeRecipes, programStartRecipes, transitioningGates, transitionStartRecipes, completedTransitionGates, transitionOldProgramId, registeredTransitioningGates, lastUpdated }
  */
 function getState() {
   const row = db.prepare(`
@@ -29,7 +29,7 @@ function getState() {
     throw new Error('Machine state not initialized');
   }
   
-  const state = {
+  return {
     ...row,
     activeRecipes: JSON.parse(row.activeRecipes || '[]'),
     programStartRecipes: JSON.parse(row.programStartRecipes || '[]'),
@@ -38,15 +38,10 @@ function getState() {
     completedTransitionGates: JSON.parse(row.completedTransitionGates || '[]'),
     registeredTransitioningGates: JSON.parse(row.registeredTransitioningGates || '[]'),
   };
-  
-  // Removed verbose logging - getState is called frequently
-  
-  return state;
 }
 
 /**
  * Update machine state
- * @param {Object} updates - Partial state updates
  */
 function updateState(updates) {
   const allowed = ['state', 'currentProgramId', 'activeRecipes', 'programStartRecipes', 'transitioningGates', 'transitionStartRecipes', 'completedTransitionGates', 'registeredTransitioningGates'];
@@ -57,7 +52,6 @@ function updateState(updates) {
   Object.keys(updates).forEach(key => {
     if (allowed.includes(key)) {
       if (jsonFields.includes(key)) {
-        // Convert to JSON string for storage
         sets.push(`${key.replace(/([A-Z])/g, '_$1').toLowerCase()} = @${key}`);
         params[key] = JSON.stringify(updates[key]);
       } else {
@@ -74,18 +68,19 @@ function updateState(updates) {
   const sql = `UPDATE machine_state SET ${sets.join(', ')} WHERE id = @id`;
   db.prepare(sql).run(params);
   
-  // Log detailed update info
-  console.log(`[MachineState] Updated:`, JSON.stringify(updates, null, 2));
+  // Log state changes (compact)
+  log.debug('system', 'machine_state_updated', 'State updated', { 
+    updates: Object.keys(updates),
+    state: updates.state
+  });
   
   // Emit event for SSE
   const newState = getState();
   eventBus.broadcast('machine:state-changed', newState);
-  console.log(`[MachineState] Broadcasted state-changed event`);
 }
 
 /**
  * Get active recipes
- * @returns {Array} Array of recipe objects
  */
 function getActiveRecipes() {
   const state = getState();
@@ -94,7 +89,6 @@ function getActiveRecipes() {
 
 /**
  * Set active recipes
- * @param {Array} recipes - Array of recipe objects
  */
 function setActiveRecipes(recipes) {
   updateState({ activeRecipes: recipes });
@@ -102,15 +96,11 @@ function setActiveRecipes(recipes) {
 
 /**
  * Check if recipes have changed compared to program start snapshot
- * @param {Array} currentRecipes - Current active recipes
- * @returns {Boolean} True if recipes changed
  */
 function recipesChanged(currentRecipes = null) {
   const state = getState();
   const current = currentRecipes || state.activeRecipes;
   const snapshot = state.programStartRecipes;
-  
-  // Deep comparison of recipe arrays
   return JSON.stringify(current) !== JSON.stringify(snapshot);
 }
 
@@ -120,19 +110,13 @@ function recipesChanged(currentRecipes = null) {
 function snapshotRecipes() {
   const state = getState();
   updateState({ programStartRecipes: state.activeRecipes });
-  console.log('[MachineState] Snapshotted recipes for program');
 }
 
 /**
- * Clear all transitions AND snapshot recipes in a single atomic update
- * This ensures the frontend gets a consistent state in one SSE broadcast
+ * Clear all transitions AND snapshot recipes atomically
  */
 function finalizeTransitions() {
   const state = getState();
-  console.log('[MachineState] 🎯 FINALIZING TRANSITIONS');
-  console.log('[MachineState] Current activeRecipes:', JSON.stringify(state.activeRecipes?.map(r => r.recipeName)));
-  console.log('[MachineState] Current transitioningGates:', JSON.stringify(state.transitioningGates));
-  console.log('[MachineState] Current transitionStartRecipes keys:', Object.keys(state.transitionStartRecipes || {}));
   
   updateState({
     transitioningGates: [],
@@ -142,24 +126,17 @@ function finalizeTransitions() {
     programStartRecipes: state.activeRecipes,
   });
   
-  // Verify the update worked
-  const newState = getState();
-  console.log('[MachineState] ✅ After finalization:');
-  console.log('[MachineState] - transitioningGates:', JSON.stringify(newState.transitioningGates));
-  console.log('[MachineState] - transitionStartRecipes:', JSON.stringify(newState.transitionStartRecipes));
-  console.log('[MachineState] - programStartRecipes:', JSON.stringify(newState.programStartRecipes?.map(r => r.recipeName)));
+  // Log final recipe configuration with gate assignments (compact format)
+  log.transitionsFinalized(state.currentProgramId, state.activeRecipes);
 }
 
 /**
  * Clear all state (on stop)
  */
 function reset() {
-  // Reset all gate states to 0
   const gates = require('../state/gates');
   gates.resetAll();
-  console.log('[MachineState] Cleared all gate states');
   
-  // Clear the transition old program ID
   clearTransitionOldProgramId();
   
   updateState({
@@ -172,12 +149,12 @@ function reset() {
     completedTransitionGates: [],
     registeredTransitioningGates: [],
   });
+  
+  log.operations('machine_reset', 'Machine state reset to idle');
 }
 
 /**
  * Get the old program ID that's being transitioned from
- * Now persisted to database for reliability
- * @returns {Number|null}
  */
 function getTransitionOldProgramId() {
   const row = db.prepare(`SELECT transition_old_program_id FROM machine_state WHERE id = 1`).get();
@@ -186,12 +163,9 @@ function getTransitionOldProgramId() {
 
 /**
  * Set the old program ID when starting a transition
- * Now persisted to database for reliability
- * @param {Number} programId
  */
 function setTransitionOldProgramId(programId) {
   db.prepare(`UPDATE machine_state SET transition_old_program_id = ? WHERE id = 1`).run(programId);
-  console.log(`[MachineState] Set transition old program ID: ${programId} (persisted to DB)`);
 }
 
 /**
@@ -199,33 +173,24 @@ function setTransitionOldProgramId(programId) {
  */
 function clearTransitionOldProgramId() {
   db.prepare(`UPDATE machine_state SET transition_old_program_id = NULL WHERE id = 1`).run();
-  console.log(`[MachineState] Cleared transition old program ID`);
 }
 
 /**
  * Start per-gate transition
- * Called when user edits/removes recipes while paused
- * @param {Array} affectedGates - Gates that need to complete their current batch
- * @param {Object} originalRecipes - Map of gate -> recipe at transition start {gate: {recipeId, recipeName, ...}}
  */
 function startGateTransition(affectedGates, originalRecipes) {
   const state = getState();
   
-  // Merge with existing transitioning gates (if any)
   const existingGates = new Set(state.transitioningGates);
   const existingRecipes = { ...state.transitionStartRecipes };
   const completedGates = new Set(state.completedTransitionGates || []);
   
   affectedGates.forEach(gate => {
-    // IMPORTANT: Don't add gates that have already completed their transition
-    // These are LOCKED and cannot be re-transitioned until all transitions complete
     if (completedGates.has(gate)) {
-      console.log(`[MachineState] ⚠️ Gate ${gate} is LOCKED (already completed transition) - skipping`);
-      return;
+      return; // Skip locked gates
     }
     
     if (!existingGates.has(gate)) {
-      // Only add if not already transitioning
       existingGates.add(gate);
       existingRecipes[gate] = originalRecipes[gate];
     }
@@ -236,15 +201,11 @@ function startGateTransition(affectedGates, originalRecipes) {
     transitionStartRecipes: existingRecipes,
   });
   
-  console.log(`[MachineState] Started gate transition for gates: ${affectedGates.join(', ')}`);
+  log.operations('gate_transition_started', `Gate transition started for ${affectedGates.length} gates`, { gates: affectedGates });
 }
 
 /**
  * Complete transition for a specific gate
- * Called when a batch completes on a transitioning gate
- * Moves the gate to completedTransitionGates (locked until ALL transitions done)
- * @param {Number} gate - Gate number
- * @returns {Object|null} The original recipe for stats, or null if gate wasn't transitioning
  */
 function completeGateTransition(gate) {
   const state = getState();
@@ -255,15 +216,12 @@ function completeGateTransition(gate) {
   
   const originalRecipe = state.transitionStartRecipes[gate];
   
-  // Remove gate from transitioning list
   const newTransitioningGates = state.transitioningGates.filter(g => g !== gate);
   const newTransitionStartRecipes = { ...state.transitionStartRecipes };
   delete newTransitionStartRecipes[gate];
   
-  // Also remove from registeredTransitioningGates
   const newRegisteredTransitioningGates = (state.registeredTransitioningGates || []).filter(g => g !== gate);
   
-  // Add to completedTransitionGates (locked until all transitions done)
   const completedGates = new Set(state.completedTransitionGates || []);
   completedGates.add(gate);
   
@@ -274,14 +232,17 @@ function completeGateTransition(gate) {
     registeredTransitioningGates: newRegisteredTransitioningGates,
   });
   
-  console.log(`[MachineState] Completed transition for gate ${gate}, ${newTransitioningGates.length} gates still transitioning, ${completedGates.size} gates completed (locked)`);
+  log.operations('gate_transition_completed', `Gate ${gate} transition completed (${completedGates.size} done, ${newTransitioningGates.length} remaining)`, { 
+    gate, 
+    remaining: newTransitioningGates.length,
+    completed: completedGates.size
+  });
   
   return originalRecipe;
 }
 
 /**
  * Check if any gates are transitioning
- * @returns {Boolean}
  */
 function hasTransitioningGates() {
   const state = getState();
@@ -290,7 +251,6 @@ function hasTransitioningGates() {
 
 /**
  * Get transitioning gates
- * @returns {Array}
  */
 function getTransitioningGates() {
   const state = getState();
@@ -298,7 +258,7 @@ function getTransitioningGates() {
 }
 
 /**
- * Clear all transitions (on stop or when all transitions complete)
+ * Clear all transitions
  */
 function clearTransitions() {
   updateState({
@@ -306,12 +266,10 @@ function clearTransitions() {
     transitionStartRecipes: {},
     completedTransitionGates: [],
   });
-  console.log('[MachineState] Cleared all transitions (including completed gates)');
 }
 
 /**
- * Get gates that have completed their transition but are locked until ALL transitions done
- * @returns {Array}
+ * Get gates that have completed their transition
  */
 function getCompletedTransitionGates() {
   const state = getState();
@@ -320,8 +278,6 @@ function getCompletedTransitionGates() {
 
 /**
  * Check if we're in an active transition period
- * True if any gates are transitioning OR any gates have completed but period not over
- * @returns {Boolean}
  */
 function isInTransitionPeriod() {
   const state = getState();
@@ -330,9 +286,6 @@ function isInTransitionPeriod() {
 
 /**
  * Validate state transition
- * @param {String} fromState 
- * @param {String} toState 
- * @returns {Boolean}
  */
 function isValidTransition(fromState, toState) {
   const validTransitions = {
@@ -366,4 +319,3 @@ module.exports = {
   setTransitionOldProgramId,
   clearTransitionOldProgramId,
 };
-

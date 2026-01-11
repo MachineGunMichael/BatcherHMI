@@ -1,6 +1,7 @@
 const express = require('express');
 const { verifyToken, requireRole } = require('../utils/authMiddleware');
 const programRepo = require('../repositories/programRepo');
+const log = require('../lib/logger');
 
 const router = express.Router();
 
@@ -27,6 +28,10 @@ router.post('/', verifyToken, requireRole('admin', 'manager'), (req, res) => {
   if (!name) return res.status(400).json({ message: 'name required' });
 
   const created = programRepo.createProgram({ name, gates, mapping });
+  const user = req.user?.username || 'system';
+  // Convert mapping to recipe format for logging
+  const recipes = mapping.map(m => ({ recipeName: m.recipeName || m.name, gates: m.gates || [] }));
+  log.savedProgramCreated(created.id, name, recipes, user);
   res.status(201).json({ program: created });
 });
 

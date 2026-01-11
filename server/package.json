@@ -10,7 +10,10 @@
     "db:reset": "node -e \"const fs=require('fs');['db/sqlite/batching_app.sqlite','db/sqlite/batching_app.sqlite-wal','db/sqlite/batching_app.sqlite-shm'].forEach(f=>{try{fs.unlinkSync(f);}catch(e){}});\" && node scripts/sqlite-setup.js",
     "ts:seed": "node scripts/influx-seed-demo.js",
     "influx:cleanup": "node scripts/cleanup-influx-retention.js",
-    "influx:cleanup-manual": "node scripts/cleanup-influx-retention.js --manual"
+    "influx:cleanup-manual": "node scripts/cleanup-influx-retention.js --manual",
+    "logs:cleanup": "node scripts/cleanup-logs.js",
+    "logs:cleanup-dry": "node scripts/cleanup-logs.js --dry-run",
+    "logs:delete": "bash scripts/delete-logs.sh"
   },
   "dependencies": {
     "@influxdata/influxdb3-client": "^1.0.0",
@@ -21,7 +24,9 @@
     "csv-parser": "^3.2.0",
     "dotenv": "^16.4.5",
     "express": "^4.18.2",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^9.0.2",
+    "winston": "^3.19.0",
+    "winston-daily-rotate-file": "^5.0.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"

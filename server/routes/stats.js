@@ -4,6 +4,7 @@ const router = express.Router();
 const db = require('../db/sqlite');
 const { verifyToken } = require('../utils/authMiddleware');
 const { query: influxQuery } = require('../services/influx');
+const log = require('../lib/logger');
 
 /**
  * GET /api/stats/programs
@@ -26,7 +27,7 @@ router.get('/programs', verifyToken, (req, res) => {
 
     res.json(programs);
   } catch (error) {
-    console.error('Error fetching programs:', error);
+    log.error('system', 'fetch_programs_error', error);
     res.status(500).json({ message: 'Failed to fetch programs' });
   }
 });
@@ -54,7 +55,7 @@ router.get('/programs/:id', verifyToken, (req, res) => {
 
     res.json(stats);
   } catch (error) {
-    console.error('Error fetching program stats:', error);
+    log.error('system', 'fetch_program_stats_error', error);
     res.status(500).json({ message: 'Failed to fetch program stats' });
   }
 });
@@ -76,7 +77,7 @@ router.get('/programs/:id/recipes', verifyToken, (req, res) => {
 
     res.json(recipes);
   } catch (error) {
-    console.error('Error fetching recipe stats:', error);
+    log.error('system', 'fetch_recipe_stats_error', error);
     res.status(500).json({ message: 'Failed to fetch recipe stats' });
   }
 });
@@ -170,7 +171,7 @@ router.get('/programs/:id/assignments', verifyToken, (req, res) => {
 
     res.json({ assignments });
   } catch (error) {
-    console.error('Error fetching program assignments:', error);
+    log.error('system', 'fetch_program_assignments_error', error);
     res.status(500).json({ message: 'Failed to fetch program assignments' });
   }
 });
@@ -224,7 +225,7 @@ router.get('/programs/:id/pieces-histogram', verifyToken, async (req, res) => {
       endTime = lastBatchTime;
     }
     
-    console.log(`[Histogram] Program ${programId}: start=${stats.start_ts}, end=${endTime}, expectedPieces=${expectedPieces} (batched: ${totalBatched}, rejected: ${totalRejected})`);
+    log.debug('system', 'histogram_query', `Program ${programId}`, { start: stats.start_ts, end: endTime, expectedPieces });
 
     // Query InfluxDB for pieces from start to last batch completion
     const influx = require('../services/influx');
@@ -246,7 +247,6 @@ router.get('/programs/:id/pieces-histogram', verifyToken, async (req, res) => {
     // Limit to expected pieces from batch_completions to ensure consistency
     // This handles cases where pieces in gates at transition time shouldn't be counted
     if (expectedPieces > 0 && weights.length > expectedPieces) {
-      console.log(`[Histogram] Limiting ${weights.length} InfluxDB pieces to ${expectedPieces} (from batch_completions)`);
       weights = weights.slice(0, expectedPieces);
     }
     
@@ -255,7 +255,6 @@ router.get('/programs/:id/pieces-histogram', verifyToken, async (req, res) => {
     }
 
     const totalPieces = weights.length;
-    console.log(`[Histogram] Returning ${totalPieces} pieces for histogram`);
 
     // Calculate histogram bins with 5g bin size
     const minWeight = Math.min(...weights);
@@ -300,7 +299,7 @@ router.get('/programs/:id/pieces-histogram', verifyToken, async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Error fetching program pieces:', error);
+    log.error('system', 'fetch_program_pieces_error', error);
     res.status(500).json({ message: 'Failed to fetch program pieces', error: error.message });
   }
 });
@@ -411,7 +410,7 @@ router.get('/programs/:id/gate-dwell', verifyToken, (req, res) => {
     
     res.json(result);
   } catch (error) {
-    console.error('Error fetching gate dwell times:', error);
+    log.error('system', 'fetch_gate_dwell_error', error);
     res.status(500).json({ message: 'Failed to fetch gate dwell times', error: error.message });
   }
 });
@@ -431,7 +430,6 @@ router.get('/programs/:id/history', verifyToken, async (req, res) => {
     `).get(programId);
     
     const endTs = programInfo?.end_ts;
-    console.log(`[History] Program ${programId} end_ts: ${endTs}`);
     
     // Get batches, pieces, weight per minute from batch_completions
     // Filter by end_ts to exclude transition batches that completed after program ended
@@ -467,7 +465,6 @@ router.get('/programs/:id/history', verifyToken, async (req, res) => {
       `).all(programId);
     }
     
-    console.log(`[History] Found ${batchData.length} batch records from batch_completions for program ${programId}`);
     
     // Build all data from batch_completions (source of truth)
     const batchesPerRecipe = {};
@@ -504,7 +501,6 @@ router.get('/programs/:id/history', verifyToken, async (req, res) => {
       });
     });
     
-    console.log(`[History] Batches recipes: ${Object.keys(batchesPerRecipe).length}, Pieces recipes: ${Object.keys(piecesPerRecipe).length}, Weight recipes: ${Object.keys(weightPerRecipe).length}`);
     
     res.json({
       batches: batchesPerRecipe,
@@ -512,8 +508,7 @@ router.get('/programs/:id/history', verifyToken, async (req, res) => {
       weight: weightPerRecipe
     });
   } catch (error) {
-    console.error('Error fetching program history:', error);
-    console.error('Error stack:', error.stack);
+    log.error('system', 'fetch_program_history_error', error);
     res.status(500).json({ message: 'Failed to fetch program history', error: error.message });
   }
 });
@@ -546,7 +541,6 @@ router.get('/programs/:id/pieces', verifyToken, async (req, res) => {
     const endTime = batchInfo?.last_batch_time || programStats.end_ts;
     const expectedPieces = batchInfo?.total_batched_pieces || 0;
     
-    console.log(`[Pieces] Fetching piece weights for program ${programId} (${programStats.start_ts} to ${endTime}, expected: ${expectedPieces})`);
     
     // Query InfluxDB for all pieces in this time range
     const influx = require('../services/influx');
@@ -619,7 +613,6 @@ router.get('/programs/:id/pieces', verifyToken, async (req, res) => {
       }
     }
     
-    console.log(`[Pieces] Found ${pieceCount} pieces for program ${programId}`);
     
     if (pieceCount === 0 || minTime === Infinity) {
       return res.json({ scatterPoints: [], trendLine: [] });
@@ -670,8 +663,6 @@ router.get('/programs/:id/pieces', verifyToken, async (req, res) => {
       }
     }
     
-    console.log(`[Pieces] Calculated trend line with ${trendLine.length} points`);
-    console.log(`[Pieces] Scatter points: ${scatterPoints.length} points (min/mean/max per time bucket)`);
     
     res.json({ 
       scatterPoints: scatterPoints,
@@ -679,7 +670,7 @@ router.get('/programs/:id/pieces', verifyToken, async (req, res) => {
     });
     
   } catch (error) {
-    console.error(`[Pieces] Error fetching pieces for program ${programId}:`, error);
+    log.error('system', 'fetch_pieces_error', error, { programId });
     res.status(500).json({ error: 'Failed to fetch piece weights' });
   }
 });

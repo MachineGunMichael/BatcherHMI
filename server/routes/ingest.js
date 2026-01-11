@@ -8,13 +8,14 @@ const gates = require("../state/gates");
 const recipeManager = require("../lib/recipeManager");
 const machineState = require("../services/machineState");
 const db = require("../db/sqlite");
+const log = require("../lib/logger");
 
 // Simple shared-secret for PLCs (machines don't send JWTs)
 function verifyPlcSecret(req, res, next) {
   const expected = process.env.PLC_SHARED_SECRET || "";
   const got = req.headers["x-plc-secret"];
   if (!expected) {
-    console.warn("PLC_SHARED_SECRET not set; rejecting ingest.");
+    log.warn('system', 'plc_secret_not_set', 'PLC_SHARED_SECRET not configured');
     return res.status(500).json({ message: "Server not configured" });
   }
   if (!got || got !== expected) {
@@ -29,7 +30,7 @@ function getCurrentProgramId() {
     const state = machineState.getState();
     return state.currentProgramId || null;
   } catch (err) {
-    console.error('Failed to get current program ID:', err);
+    log.error('system', 'get_program_id_error', err);
     return null;
   }
 }
@@ -46,8 +47,6 @@ function normalizeTs(ts) {
 
 /**
  * POST /api/ingest/weight
- * Headers: x-plc-secret: <secret>
- * Body: { piece_id?: string, weight_g: number, ts?: number|ISO }
  */
 router.post("/weight", verifyPlcSecret, async (req, res) => {
   try {
@@ -64,20 +63,17 @@ router.post("/weight", verifyPlcSecret, async (req, res) => {
       ts: tIso,
     });
 
-    // Scatter update
     broadcast("piece", { piece_id: piece_id ?? null, weight_g: w, ts: tIso });
 
     res.json({ ok: true });
   } catch (e) {
-    console.error("ingest/weight error:", e);
+    log.error('system', 'ingest_weight_error', e);
     res.status(500).json({ message: "Ingest failed" });
   }
 });
 
 /**
  * POST /api/ingest/weight/batch
- * Headers: x-plc-secret
- * Body: [{ piece_id?, weight_g, ts? }, ...]
  */
 router.post("/weight/batch", verifyPlcSecret, async (req, res) => {
   try {
@@ -103,7 +99,7 @@ router.post("/weight/batch", verifyPlcSecret, async (req, res) => {
 
     res.json({ ok: true, count });
   } catch (e) {
-    console.error("ingest/weight/batch error:", e);
+    log.error('system', 'ingest_weight_batch_error', e);
     res.status(500).json({ message: "Batch ingest failed" });
   }
 });
@@ -114,19 +110,12 @@ let nextPieceId = 1;
 /**
  * POST /api/ingest/piece
  * For simulator/C# algorithm - receives pieces with gate assignment from simulator
- * Headers: x-plc-secret: <secret>
- * Body: { timestamp?: ISO/string/number, weight_g: number, gate: number (0-8) }
- * 
- * ✨ IMPORTANT: The backend RE-ASSIGNS pieces based on active recipes in machine_state.
- * This ensures pieces only go to gates with active recipes, regardless of what
- * the simulator sends.
  */
 router.post("/piece", verifyPlcSecret, async (req, res) => {
   try {
-    // ✨ CHECK MACHINE STATE - reject pieces if not running
+    // CHECK MACHINE STATE - reject pieces if not running
     const state = machineState.getState();
     if (state.state !== 'running') {
-      // Silently drop pieces when machine is not running (don't spam logs)
       return res.json({ ok: true, dropped: true, reason: `machine is ${state.state}` });
     }
     
@@ -137,23 +126,18 @@ router.post("/piece", verifyPlcSecret, async (req, res) => {
     const tsIso = normalizeTs(timestamp);
     const piece_id = String(nextPieceId++);
 
-    // ✨ RE-ASSIGN PIECE based on active recipes (ignore simulator's gate)
-    // Find all eligible gates where piece weight falls within recipe bounds
-    // Also consider transitioning gates that still need to complete their batch
+    // RE-ASSIGN PIECE based on active recipes
     const eligibleGates = [];
     const transitioningGates = machineState.getTransitioningGates();
     const currentMachineState = machineState.getState();
     
     for (let gate = gates.GATE_MIN; gate <= gates.GATE_MAX; gate++) {
-      // First check if gate has a current recipe
       const recipe = recipeManager.getRecipeForGate(gate);
       if (recipe && w >= recipe.pieceMin && w <= recipe.pieceMax) {
         eligibleGates.push(gate);
         continue;
       }
       
-      // If no current recipe, check if gate is transitioning with original recipe
-      // This ensures removed recipes can still complete their batches
       if (transitioningGates.includes(gate)) {
         const originalRecipe = currentMachineState.transitionStartRecipes?.[gate];
         if (originalRecipe?.params) {
@@ -166,7 +150,6 @@ router.post("/piece", verifyPlcSecret, async (req, res) => {
       }
     }
     
-    // Assign to random eligible gate, or gate 0 (reject) if none
     const g = eligibleGates.length > 0 
       ? eligibleGates[Math.floor(Math.random() * eligibleGates.length)]
       : 0;
@@ -176,46 +159,32 @@ router.post("/piece", verifyPlcSecret, async (req, res) => {
 
     // Write M1 to Influx (async)
     influx.writePiece({ piece_id, weight_g: w, gate: g, ts: tsIso }).catch(err =>
-      console.error("M1 write error:", err)
+      log.error('system', 'm1_write_error', err)
     );
 
-    // Update gate state (authoritative in-memory) + check for batch completion
+    // Update gate state + check for batch completion
     if (g >= gates.GATE_MIN && g <= gates.GATE_MAX) {
-      // ✨ ATOMIC BATCH DETECTION WITH PROMISE QUEUE ✨
-      // This ensures pieces are ALWAYS processed sequentially, never lost
       const result = await gates.processPieceAtomic(g, w, (pieces, grams) => {
-        // ✨ For transitioning gates, use ORIGINAL recipe from transitionStartRecipes
-        // This ensures removed recipes can still complete their batches
         const transitioningGates = machineState.getTransitioningGates();
         if (transitioningGates.includes(g)) {
           const state = machineState.getState();
           const originalRecipe = state.transitionStartRecipes?.[g];
           if (originalRecipe?.params) {
-            // Use original recipe parameters to check batch completion
             return recipeManager.isBatchCompleteWithParams(g, pieces, grams, originalRecipe.params);
           }
         }
-        // Normal case: use current recipe assignment
         return recipeManager.isBatchComplete(g, pieces, grams);
       });
       
       if (result.batchComplete) {
-        console.log(`🎉 [BATCH COMPLETE] Gate ${g}: ${result.pieces} pieces, ${result.grams.toFixed(1)}g → RESET`);
-        
-        // ✅ Check if this gate is transitioning
         const transitioningGates = machineState.getTransitioningGates();
         const isTransitioning = transitioningGates.includes(g);
-        
-        // ⚠️ IMPORTANT: Capture old program ID BEFORE any transition state changes
-        // This ensures the batch goes to the correct (old) program
         const oldProgramIdForBatch = machineState.getTransitionOldProgramId();
         
-        // Get the appropriate recipe for stats
         let recipeForStats = recipeManager.getRecipeForGate(g);
         let recipeIdForStats = recipeForStats?.id || null;
         let recipeName = recipeForStats?.name || 'unknown';
         
-        // For transitioning gates, also capture the original recipe info BEFORE clearing
         let originalRecipeInfo = null;
         if (isTransitioning) {
           const state = machineState.getState();
@@ -226,12 +195,11 @@ router.post("/piece", verifyPlcSecret, async (req, res) => {
           }
         }
         
-        // ✅ FIRST: Write batch completion to SQLite (before any state changes)
+        // Write batch completion to SQLite
         let programIdForBatch;
         try {
           if (isTransitioning && oldProgramIdForBatch) {
             programIdForBatch = oldProgramIdForBatch;
-            console.log(`   📝 Writing batch to OLD program ${programIdForBatch} (gate ${g} transitioning, recipe: ${recipeName})`);
           } else {
             programIdForBatch = getCurrentProgramId();
           }
@@ -241,78 +209,64 @@ router.post("/piece", verifyPlcSecret, async (req, res) => {
             VALUES (?, ?, ?, ?, ?, ?)
           `).run(g, tsIso, result.pieces, result.grams, recipeIdForStats, programIdForBatch);
           
-          console.log(`   📝 Batch completion written to SQLite (recipe: ${recipeName}, recipeId: ${recipeIdForStats}, program: ${programIdForBatch})`);
+          // Log batch completion
+          log.batchCompleted(g, recipeName, result.pieces, result.grams, programIdForBatch);
+          
         } catch (err) {
-          console.error(`   ❌ Failed to write batch completion to SQLite:`, err);
+          log.error('system', 'batch_write_error', err, { gate: g });
         }
         
-        // ✅ THEN: Complete the gate transition (this clears transition state for this gate)
+        // Complete gate transition if needed
         if (isTransitioning) {
-          console.log(`   🔄 [TRANSITION] Gate ${g} completed batch with original recipe: ${recipeName}`);
-          
-          // Complete this gate's transition (removes it from transitioning list)
           machineState.completeGateTransition(g);
-          
-          // Reload recipe manager to update this gate to new recipe
           recipeManager.loadGateAssignments();
           
-          // Check if ALL transitions are now complete
           if (!machineState.hasTransitioningGates()) {
-            console.log(`   ✅ [TRANSITION COMPLETE] All gates have finished their batches`);
+            log.transitionCompleted(machineState.getCompletedTransitionGates());
             
-            // Finalize the old program's stats
             const { handleAllTransitionsComplete } = require('./machine');
-            const finalizeResult = handleAllTransitionsComplete();
-            if (finalizeResult.success) {
-              console.log(`   ✅ Old program ${oldProgramIdForBatch} finalized with all batch data`);
-            } else {
-              console.error(`   ❌ Failed to finalize old program:`, finalizeResult.error);
-            }
+            handleAllTransitionsComplete();
             
             broadcast("transition_complete", { ts: tsIso });
           }
         }
         
-        // Broadcast reset (pieces=0, grams=0)
+        // Broadcast reset
         broadcast("gate", { gate: g, pieces: 0, grams: 0, ts: tsIso });
         
-        // Write M2 reset to InfluxDB (async)
+        // Write M2 reset to InfluxDB
         influx.writeGateState({
           gate: g,
           pieces_in_gate: 0,
           weight_sum_g: 0,
           ts: tsIso,
-        }).catch(err => console.error("M2 reset write failed:", err.message));
+        }).catch(err => log.error('system', 'm2_reset_write_error', err));
         
-        // Broadcast full snapshot for consistency
+        // Broadcast full snapshot
         const snapshot = gates.getSnapshot();
         broadcast("overlay", { ts: tsIso, overlay: snapshot });
       } else {
-        // Normal increment - broadcast updated count
+        // Normal increment
         broadcast("gate", { gate: g, pieces: result.pieces, grams: result.grams, ts: tsIso });
         
-        // Write M2 to Influx with rounded values (async)
         influx.writeGateState({
           gate: g,
-          pieces_in_gate: Math.floor(result.pieces), // Ensure integer
-          weight_sum_g: Math.round(result.grams * 10) / 10, // Round to 1 decimal
+          pieces_in_gate: Math.floor(result.pieces),
+          weight_sum_g: Math.round(result.grams * 10) / 10,
           ts: tsIso,
-        }).catch(err => console.error("M2 write failed:", err.message));
+        }).catch(err => log.error('system', 'm2_write_error', err));
       }
     }
 
     res.json({ ok: true, piece_id });
   } catch (e) {
-    console.error("ingest/piece error:", e);
+    log.error('system', 'ingest_piece_error', e);
     res.status(500).json({ message: "Ingest failed", error: e.message });
   }
 });
 
 /**
  * POST /api/ingest/gate/reset
- * Resets the given gate to zero on batch completion (called by live_worker_v2.py)
- * Headers: x-plc-secret: <secret>
- * Body: { gate: number (1-8), timestamp?: ISO/string/number }
  */
 router.post("/gate/reset", verifyPlcSecret, async (req, res) => {
   try {
@@ -323,53 +277,42 @@ router.post("/gate/reset", verifyPlcSecret, async (req, res) => {
     }
     const tsIso = normalizeTs(timestamp);
 
-    console.log(`🔄 [RESET REQUEST] Gate ${g} at ${tsIso}`);
+    log.operations('gate_reset', `Gate ${g} reset`, { gate: g });
     
-    // Reset authoritative state
     const after = gates.resetGate(g);
-    console.log(`✅ [RESET DONE] Gate ${g} → pieces: ${after.pieces}, grams: ${after.grams}`);
 
-    // Broadcast reset so UI shows the drop to 0 exactly once
     broadcast("gate", { gate: g, pieces: after.pieces, grams: after.grams, ts: tsIso });
-    console.log(`📡 [BROADCAST] gate event for Gate ${g} reset`);
 
-    // Persist reset in M2 as well
     influx.writeGateState({
       gate: g,
       pieces_in_gate: 0,
       weight_sum_g: 0,
       ts: tsIso,
-    }).catch(err => console.error("M2 reset write failed:", err.message));
+    }).catch(err => log.error('system', 'm2_reset_write_error', err));
     
-    // Also broadcast full snapshot to ensure UI consistency
     const snapshot = gates.getSnapshot();
     broadcast("overlay", { ts: tsIso, overlay: snapshot });
-    console.log(`📡 [BROADCAST] overlay snapshot after Gate ${g} reset`);
 
     res.json({ ok: true });
   } catch (e) {
-    console.error("ingest/gate/reset error:", e);
+    log.error('system', 'gate_reset_error', e);
     res.status(500).json({ message: "Reset failed", error: e.message });
   }
 });
 
 /**
  * POST /api/ingest/reload-assignments
- * Reload recipe assignments (called by live_worker after program change)
  */
 router.post("/reload-assignments", verifyPlcSecret, (req, res) => {
   try {
-    console.log('🔄 Reloading recipe assignments via API call...');
+    log.operations('assignments_reloaded', 'Recipe assignments reloaded');
     
-    // Emit event to trigger auto-reload in recipeManager
     broadcast('program:changed');
-    
-    // Also broadcast to SSE clients so dashboard refreshes
     broadcast('assignmentsReloaded', { timestamp: new Date().toISOString() });
     
     res.json({ ok: true });
   } catch (e) {
-    console.error("ingest/reload-assignments error:", e);
+    log.error('system', 'reload_assignments_error', e);
     res.status(500).json({ message: "Reload failed", error: e.message });
   }
 });

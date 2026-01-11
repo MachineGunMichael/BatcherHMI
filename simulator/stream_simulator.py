@@ -15,9 +15,13 @@ from typing import List, Dict, Optional
 import argparse
 import sys
 
-# Add parent directory to path to import assignment algorithm
+# Add parent directory to path to import assignment algorithm and logger
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python-worker"))
 from assignment_algorithm import AssignmentAlgorithm  # type: ignore
+from logger import get_logger, ENABLE_CONSOLE
+
+# Initialize logger
+log = get_logger('simulator')
 
 # Configuration
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -60,36 +64,36 @@ class DataStreamSimulator:
         
     def load_data(self):
         """Load pieces and assignments from JSON files"""
-        print(f"📂 Loading data from {DATA_DIR}...")
+        log.info(f"Loading data from {DATA_DIR}")
         
         # Load pieces
         with open(PIECES_JSON, 'r') as f:
             data = json.load(f)
             self.pieces = data['pieces']
-            print(f"   ✓ Loaded {len(self.pieces):,} pieces")
-            print(f"   ✓ Time range: {data['metadata']['start_time']} to {data['metadata']['end_time']}")
-            print(f"   ✓ Duration: {data['metadata']['duration_seconds'] / 3600:.1f} hours")
+            log.item("Pieces", f"{len(self.pieces):,}")
+            log.item("Time range", f"{data['metadata']['start_time']} to {data['metadata']['end_time']}")
+            log.item("Duration", f"{data['metadata']['duration_seconds'] / 3600:.1f} hours")
         
         # Load assignments
         with open(ASSIGNMENTS_JSON, 'r') as f:
             data = json.load(f)
             self.assignments = data['assignments']
-            print(f"   ✓ Loaded {len(self.assignments)} program configurations")
+            log.item("Programs", len(self.assignments))
             
             # Initialize with first program's assignments
             if self.assignments:
                 self._apply_program_assignment(0)
-                print(f"   ✓ Initialized with program {self.current_program_id}")
+                log.item("Initial program", self.current_program_id)
         
         # Apply start offset if specified
         if self.config.start_offset > 0:
             self.pieces = self.pieces[self.config.start_offset:]
-            print(f"   ✓ Starting from piece #{self.config.start_offset + 1}")
+            log.item("Start offset", self.config.start_offset)
         
         # Apply max pieces limit if specified
         if self.config.max_pieces:
             self.pieces = self.pieces[:self.config.max_pieces]
-            print(f"   ✓ Limited to {self.config.max_pieces:,} pieces")
+            log.item("Max pieces", self.config.max_pieces)
     
     def _apply_program_assignment(self, index: int):
         """Apply a program assignment to the algorithm"""
@@ -126,7 +130,7 @@ class DataStreamSimulator:
                     'batch_count_value': count_val
                 })
             except Exception as e:
-                print(f"⚠️  Failed to parse recipe {recipe_name}: {e}")
+                log.warning(f"Failed to parse recipe {recipe_name}: {e}")
                 continue
         
         self.assignment_algorithm.update_assignments(algorithm_assignments)
@@ -158,13 +162,13 @@ class DataStreamSimulator:
             )
             
             if response.status_code != 200:
-                print(f"⚠️  Server returned {response.status_code}: {response.text}")
+                log.warning(f"Server returned {response.status_code}: {response.text}")
                 return False
             
             return True
             
         except requests.exceptions.RequestException as e:
-            print(f"❌ Error sending piece: {e}")
+            log.error(f"Error sending piece: {e}")
             return False
     
     def send_batch(self, pieces: List[Dict]) -> int:
@@ -192,37 +196,39 @@ class DataStreamSimulator:
         if not self.start_time:
             return
         
+        if not ENABLE_CONSOLE:
+            return
+            
         elapsed = time.time() - self.start_time
         rate = self.pieces_sent / elapsed if elapsed > 0 else 0
         progress = (self.pieces_sent / len(self.pieces)) * 100 if self.pieces else 0
         
-        print(f"\r📊 Progress: {self.pieces_sent:,}/{len(self.pieces):,} pieces ({progress:.1f}%) | "
+        print(f"\r  Progress: {self.pieces_sent:,}/{len(self.pieces):,} pieces ({progress:.1f}%) | "
               f"Rate: {rate:.1f} pieces/sec | Elapsed: {elapsed:.1f}s", end='', flush=True)
     
     def run(self):
         """Run the simulator (loops infinitely)"""
-        print("\n" + "=" * 70)
-        print("🚀 Starting Real-Time Data Stream Simulator (Infinite Loop)")
-        print("=" * 70)
-        print(f"Server: {self.config.server_url}")
-        print(f"Frequency: {self.config.pieces_per_second} pieces/sec")
-        print(f"Interval: {1000/self.config.pieces_per_second:.1f}ms per piece")
-        print(f"Batch size: {self.config.batch_size}")
-        print("Press Ctrl+C to stop")
-        print("=" * 70 + "\n")
+        log.startup_banner("Data Stream Simulator", "1.0", {
+            "Server": self.config.server_url,
+            "Frequency": f"{self.config.pieces_per_second} pieces/sec",
+            "Interval": f"{1000/self.config.pieces_per_second:.1f}ms per piece",
+            "Batch size": self.config.batch_size,
+        })
+        if ENABLE_CONSOLE:
+            print("Press Ctrl+C to stop\n")
         
         if not self.pieces:
-            print("❌ No pieces to send. Did you run prepare_data.py first?")
+            log.error("No pieces to send. Did you run prepare_data.py first?")
             return
         
         # Test server connection
-        print("🔌 Testing server connection...")
+        log.info("Testing server connection")
         try:
             response = self.session.get(f"{self.config.server_url}/health", timeout=5)
-            print("   ✓ Server is reachable\n")
+            log.success("Server is reachable")
         except requests.exceptions.RequestException:
-            print(f"   ⚠️  Warning: Could not reach server at {self.config.server_url}")
-            print("   Continuing anyway...\n")
+            log.warning(f"Could not reach server at {self.config.server_url}")
+            log.info("Continuing anyway...")
         
         self.start_time = time.time()
         
@@ -239,7 +245,7 @@ class DataStreamSimulator:
                 loop_piece_count = 0
                 batch = []
                 
-                print(f"\n🔄 Starting loop #{loop_count} ({total_pieces_in_data:,} pieces)")
+                log.info(f"Starting loop #{loop_count} ({total_pieces_in_data:,} pieces)")
                 
                 for i, piece in enumerate(self.pieces):
                     # Sleep to maintain desired frequency (clock-based to handle laptop sleep)
@@ -252,8 +258,8 @@ class DataStreamSimulator:
                         if sleep_needed > 0:
                             time.sleep(sleep_needed)
                         elif sleep_needed < -5:  # More than 5 seconds behind (laptop was asleep)
-                            print(f"\n⚠️  Detected time jump ({-sleep_needed:.1f}s behind schedule)")
-                            print(f"   Laptop may have been asleep. Catching up...")
+                            log.warning(f"Detected time jump ({-sleep_needed:.1f}s behind schedule)")
+                            log.info("Laptop may have been asleep. Catching up...")
                             # Reset loop start time to catch up
                             loop_start_time = actual_time - (i * sleep_interval)
                     
@@ -278,16 +284,19 @@ class DataStreamSimulator:
                 
                 # Print loop completion summary
                 loop_elapsed = time.time() - loop_start_time
-                print(f"\n✅ Loop #{loop_count} complete: {loop_piece_count:,} pieces in {loop_elapsed:.1f}s")
-                print(f"   Total pieces sent: {self.pieces_sent:,} | Restarting from beginning...")
+                log.info(f"Loop #{loop_count} complete: {loop_piece_count:,} pieces in {loop_elapsed:.1f}s")
+                log.info(f"Total: {self.pieces_sent:,} pieces | Restarting...")
                 
         except KeyboardInterrupt:
-            print("\n\n⚠️  Simulation interrupted by user")
-            print(f"   Loops completed: {loop_count - 1} full loops")
-            print(f"   Total pieces sent: {self.pieces_sent:,}")
+            if ENABLE_CONSOLE:
+                print("\n")  # Clear progress line
+            log.info("Simulation interrupted by user")
             elapsed = time.time() - self.start_time
-            print(f"   Total time: {elapsed:.1f}s")
-            print(f"   Avg rate: {self.pieces_sent / elapsed:.1f} pieces/sec" if elapsed > 0 else "")
+            log.item("Loops completed", loop_count - 1)
+            log.item("Total pieces sent", f"{self.pieces_sent:,}")
+            log.item("Total time", f"{elapsed:.1f}s")
+            if elapsed > 0:
+                log.item("Avg rate", f"{self.pieces_sent / elapsed:.1f} pieces/sec")
 
 def main():
     parser = argparse.ArgumentParser(

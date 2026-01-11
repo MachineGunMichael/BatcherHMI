@@ -2266,10 +2266,11 @@ const Setup = () => {
                     // - Teal: New recipe waiting to activate (incoming, for additions)
                     const isOnTransitioningGate = recipe.gates.some(g => transitioningGates.includes(g));
                     const isOnCompletedGate = recipe.gates.some(g => completedTransitionGates.includes(g));
+                    const allGatesCompleted = recipe.gates.length > 0 && recipe.gates.every(g => completedTransitionGates.includes(g));
                     const isActivelyTransitioning = isOnTransitioningGate || isOnCompletedGate;
                     
-                    // Only show replacement styling if gates are still transitioning
-                    const showAsReplacement = recipe._isReplacementRecipe && isActivelyTransitioning;
+                    // Only show replacement styling if gates are still transitioning (not all completed/LOCKED)
+                    const showAsReplacement = recipe._isReplacementRecipe && isOnTransitioningGate;
                     
                     let recipeNameColor = undefined;
                     if (recipe.isRemovedTransitioning) {
@@ -2278,8 +2279,8 @@ const Setup = () => {
                     } else if (showAsReplacement) {
                       // This is a replacement recipe for an edit (gates still transitioning)
                       recipeNameColor = colors.tealAccent[500];
-                    } else if (isActivelyTransitioning) {
-                      // This is a new/addition recipe waiting to fully activate
+                    } else if (isActivelyTransitioning && !allGatesCompleted) {
+                      // This is a new/addition recipe waiting to fully activate (but not fully LOCKED)
                       recipeNameColor = colors.tealAccent[500];
                     }
 

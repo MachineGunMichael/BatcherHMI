@@ -12,58 +12,40 @@ const AuthContext = createContext();
 // Helper function to check server connectivity
 const checkServerConnectivity = async () => {
   const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:5001';
-  console.log("Checking server connectivity at:", API_URL);
   
   try {
-    // Use a more direct approach - just ping the base URL
-    // Most servers will respond to this even without specific endpoint handling
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5000);
     
     const response = await fetch(`${API_URL}`, {
       method: 'GET',
       signal: controller.signal,
-      // Skip content-type to avoid preflight CORS issues
       mode: 'cors',
       cache: 'no-cache'
     });
     
     clearTimeout(timeoutId);
-    console.log("Server connectivity success - status:", response.status);
     return true;
   } catch (error) {
-    console.error("Server connectivity failed:", error.name, error.message);
-    
-    // Try a second method if the first fails
+    // Try alternative method
     try {
-      console.log("Trying alternative connectivity check...");
-      // Use a very simple image request which often bypasses CORS
       const img = document.createElement('img');
       img.src = `${API_URL}/favicon.ico?_=${Date.now()}`;
       
       await new Promise((resolve, reject) => {
-        img.onload = () => {
-          console.log("Image load successful - server is running");
-          resolve();
-        };
-        img.onerror = () => {
-          // Even errors mean the server responded
-          console.log("Image errored but server responded");
-          resolve(); 
-        };
+        img.onload = resolve;
+        img.onerror = resolve; // Even errors mean server responded
         setTimeout(() => reject(new Error("Timeout")), 3000);
       });
       
       return true;
     } catch (secondError) {
-      console.error("All connectivity checks failed");
       return false;
     }
   }
 };
 
 export const AuthProvider = ({ children }) => {
-  // Initialize state
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -71,7 +53,7 @@ export const AuthProvider = ({ children }) => {
   const navigate = useNavigate();
   const { setCurrentRole } = useAppContext();
 
-  // Check if user is already logged in (token exists)
+  // Check if user is already logged in
   useEffect(() => {
     const checkLoggedIn = async () => {
       const token = localStorage.getItem('token');
@@ -79,7 +61,6 @@ export const AuthProvider = ({ children }) => {
         try {
           setLoading(true);
           
-          // First verify server is available
           const isServerAvailable = await checkServerConnectivity();
           if (!isServerAvailable) {
             throw new Error("Authentication server is not available");
@@ -89,9 +70,7 @@ export const AuthProvider = ({ children }) => {
           setUser(userData);
           setCurrentRole(userData.role);
           setIsAuthenticated(true);
-          console.log("User restored from token:", userData);
         } catch (error) {
-          console.error("Token validation failed:", error);
           localStorage.removeItem('token');
           setIsAuthenticated(false);
           setUser(null);
@@ -114,7 +93,6 @@ export const AuthProvider = ({ children }) => {
     setError('');
     
     try {
-      // First check server connectivity
       const isServerAvailable = await checkServerConnectivity();
       if (!isServerAvailable) {
         throw new Error("Authentication server is not available. Please check if the server is running.");
@@ -122,7 +100,6 @@ export const AuthProvider = ({ children }) => {
       
       const data = await authService.login(username, password, role);
       
-      // Verify we got a valid token from the server
       if (!data || !data.token) {
         throw new Error("Invalid authentication response");
       }
@@ -137,7 +114,6 @@ export const AuthProvider = ({ children }) => {
       return { success: true, user: data.user };
     } catch (error) {
       const errorMessage = error.message || "Authentication failed";
-      console.error("Login error:", errorMessage);
       setError(errorMessage);
       setIsAuthenticated(false);
       return { success: false, error: errorMessage };
@@ -148,9 +124,6 @@ export const AuthProvider = ({ children }) => {
 
   // Logout function
   const logout = useCallback((reason = 'manual') => {
-    if (reason === 'idle') {
-      console.log('[Auth] Logging out due to inactivity (2 hours idle timeout)');
-    }
     setUser(null);
     setIsAuthenticated(false);
     localStorage.removeItem('token');
@@ -162,7 +135,7 @@ export const AuthProvider = ({ children }) => {
   useIdleTimeout(
     () => logout('idle'),
     IDLE_TIMEOUT_MS,
-    isAuthenticated // Only active when user is logged in
+    isAuthenticated
   );
 
   const value = { 
@@ -171,7 +144,7 @@ export const AuthProvider = ({ children }) => {
     logout, 
     loading, 
     error,
-    isAuthenticated, // Use the explicit state variable
+    isAuthenticated,
     clearError: () => setError(null)
   };
 

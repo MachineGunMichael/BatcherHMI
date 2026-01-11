@@ -27,12 +27,10 @@ export function useMachineState() {
   // Fetch initial state
   const fetchState = async () => {
     try {
-      // Note: api already has /api as baseURL, so don't duplicate it
       const response = await api.get('/machine/state');
       setMachineState(response.data);
       setError(null);
     } catch (err) {
-      console.error('[useMachineState] Error fetching state:', err);
       setError(err.message);
     }
   };
@@ -41,19 +39,14 @@ export function useMachineState() {
   useEffect(() => {
     const connectSSE = () => {
       try {
-        // SSE endpoint is at http://localhost:5001/api/machine/stream
-        // REACT_APP_API_URL might include /api suffix, so we need to handle both cases
         let baseURL = process.env.REACT_APP_API_URL || 'http://localhost:5001/api';
-        // Remove trailing /api if present, then add the full path
         baseURL = baseURL.replace(/\/api\/?$/, '');
         const url = `${baseURL}/api/machine/stream`;
         
-        console.log('[useMachineState] Connecting to SSE:', url);
         const eventSource = new EventSource(url);
         eventSourceRef.current = eventSource;
 
         eventSource.onopen = () => {
-          console.log('[useMachineState] SSE connected');
           setIsConnected(true);
           setError(null);
         };
@@ -61,26 +54,22 @@ export function useMachineState() {
         eventSource.onmessage = (event) => {
           try {
             const data = JSON.parse(event.data);
-            console.log('[useMachineState] State update:', data);
             setMachineState(data);
           } catch (err) {
-            console.error('[useMachineState] Error parsing SSE data:', err);
+            // Silent fail for parse errors
           }
         };
 
         eventSource.onerror = (err) => {
-          console.error('[useMachineState] SSE error:', err);
           setIsConnected(false);
           eventSource.close();
           
           // Attempt to reconnect after 5 seconds
           reconnectTimeoutRef.current = setTimeout(() => {
-            console.log('[useMachineState] Attempting to reconnect...');
             connectSSE();
           }, 5000);
         };
       } catch (err) {
-        console.error('[useMachineState] Error creating EventSource:', err);
         setError(err.message);
       }
     };
@@ -121,4 +110,3 @@ export function useMachineState() {
 }
 
 export default useMachineState;
-

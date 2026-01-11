@@ -26,182 +26,122 @@ export function AppContextProvider({ children }) {
   
   // Assigned Recipes (shared between Setup and MachineControls)
   const [assignedRecipes, setAssignedRecipesState] = useState([]);
-  
-  // DEBUG - Log state changes
-  useEffect(() => {
-    console.log("Context state changed:", {
-      currentRole,
-      dashboardVisibleSeries,
-      selectedSimulation,
-      sliderValue,
-      settingsMode,
-      assignedPrograms,
-      assignedRecipes
-    });
-  }, [currentRole, dashboardVisibleSeries, selectedSimulation, sliderValue, settingsMode, assignedPrograms, assignedRecipes]);
 
   // Load persisted data on mount
   useEffect(() => {
-    console.log("Loading persisted data");
-    
     try {
       const dashboardData = localStorage.getItem('dashboard_visibleSeries');
       if (dashboardData) {
-        const parsed = JSON.parse(dashboardData);
-        console.log("Loaded dashboard data:", parsed);
-        setDashboardVisibleSeriesState(parsed);
+        setDashboardVisibleSeriesState(JSON.parse(dashboardData));
       }
-    } catch (error) {
-      console.error("Error loading dashboard data:", error);
-    }
+    } catch (error) { /* ignore */ }
     
     try {
       const simulationData = localStorage.getItem('simulation_selectedSimulation');
       if (simulationData) {
-        console.log("Loaded simulation selection:", simulationData);
         setSelectedSimulationState(simulationData);
       }
-    } catch (error) {
-      console.error("Error loading simulation selection:", error);
-    }
+    } catch (error) { /* ignore */ }
     
     try {
       const sliderData = localStorage.getItem('simulation_sliderValue');
       if (sliderData) {
-        console.log("Loaded slider value:", sliderData);
         setSliderValueState(Number(sliderData));
       }
-    } catch (error) {
-      console.error("Error loading slider value:", error);
-    }
+    } catch (error) { /* ignore */ }
     
     try {
       const settingsModeData = localStorage.getItem('settings_mode');
       if (settingsModeData) {
-        console.log("Loaded settings mode:", settingsModeData);
         setSettingsModeState(settingsModeData);
       }
-    } catch (error) {
-      console.error("Error loading settings mode:", error);
-    }
+    } catch (error) { /* ignore */ }
     
     try {
       const assignedProgramsData = localStorage.getItem('settings_assignedPrograms');
       if (assignedProgramsData) {
-        const parsed = JSON.parse(assignedProgramsData);
-        console.log("Loaded assigned programs:", parsed);
-        setAssignedProgramsState(parsed);
+        setAssignedProgramsState(JSON.parse(assignedProgramsData));
       }
-    } catch (error) {
-      console.error("Error loading assigned programs:", error);
-    }
+    } catch (error) { /* ignore */ }
     
     try {
       const assignedRecipesData = localStorage.getItem('assignedRecipes');
       if (assignedRecipesData) {
-        const parsed = JSON.parse(assignedRecipesData);
-        console.log("Loaded assigned recipes:", parsed);
-        setAssignedRecipesState(parsed);
+        setAssignedRecipesState(JSON.parse(assignedRecipesData));
       }
-    } catch (error) {
-      console.error("Error loading assigned recipes:", error);
-    }
+    } catch (error) { /* ignore */ }
   }, []);
 
   // Update function with localStorage persistence
   const setDashboardVisibleSeries = (value) => {
-    console.log("Setting dashboard visible series:", value);
     if (typeof value === 'function') {
       setDashboardVisibleSeriesState(prev => {
         const updated = value(prev);
         try {
           localStorage.setItem('dashboard_visibleSeries', JSON.stringify(updated));
-        } catch (error) {
-          console.error("Error saving dashboard data:", error);
-        }
+        } catch (error) { /* ignore */ }
         return updated;
       });
     } else {
       setDashboardVisibleSeriesState(value);
       try {
         localStorage.setItem('dashboard_visibleSeries', JSON.stringify(value));
-      } catch (error) {
-        console.error("Error saving dashboard data:", error);
-      }
+      } catch (error) { /* ignore */ }
     }
   };
   
   const setSelectedSimulation = (value) => {
-    console.log("Setting selected simulation:", value);
     setSelectedSimulationState(value);
     try {
       localStorage.setItem('simulation_selectedSimulation', value);
-    } catch (error) {
-      console.error("Error saving simulation selection:", error);
-    }
+    } catch (error) { /* ignore */ }
   };
   
   const setSliderValue = (value) => {
-    console.log("Setting slider value:", value);
     setSliderValueState(value);
     try {
       localStorage.setItem('simulation_sliderValue', String(value));
-    } catch (error) {
-      console.error("Error saving slider value:", error);
-    }
+    } catch (error) { /* ignore */ }
   };
   
   const setSettingsMode = (value) => {
-    console.log("Setting settings mode:", value);
     setSettingsModeState(value);
     try {
       localStorage.setItem('settings_mode', value);
-    } catch (error) {
-      console.error("Error saving settings mode:", error);
-    }
+    } catch (error) { /* ignore */ }
   };
   
   const setAssignedPrograms = (value) => {
-    console.log("Setting assigned programs:", value);
     if (typeof value === 'function') {
       setAssignedProgramsState(prev => {
         const updated = value(prev);
         try {
           localStorage.setItem('settings_assignedPrograms', JSON.stringify(updated));
-        } catch (error) {
-          console.error("Error saving assigned programs:", error);
-        }
+        } catch (error) { /* ignore */ }
         return updated;
       });
     } else {
       setAssignedProgramsState(value);
       try {
         localStorage.setItem('settings_assignedPrograms', JSON.stringify(value));
-      } catch (error) {
-        console.error("Error saving assigned programs:", error);
-      }
+      } catch (error) { /* ignore */ }
     }
   };
   
   const setAssignedRecipes = (value) => {
-    console.log("Setting assigned recipes:", value);
     if (typeof value === 'function') {
       setAssignedRecipesState(prev => {
         const updated = value(prev);
         try {
           localStorage.setItem('assignedRecipes', JSON.stringify(updated));
-        } catch (error) {
-          console.error("Error saving assigned recipes:", error);
-        }
+        } catch (error) { /* ignore */ }
         return updated;
       });
     } else {
       setAssignedRecipesState(value);
       try {
         localStorage.setItem('assignedRecipes', JSON.stringify(value));
-      } catch (error) {
-        console.error("Error saving assigned recipes:", error);
-      }
+      } catch (error) { /* ignore */ }
     }
   };
 
@@ -242,7 +182,6 @@ export function AppContextProvider({ children }) {
 export function useAppContext() {
   const context = useContext(AppContext);
   if (context === null || context === undefined) {
-    console.error("useAppContext must be used within an AppContextProvider");
     // Return default values instead of throwing - more resilient
     return {
       currentRole: 'admin',

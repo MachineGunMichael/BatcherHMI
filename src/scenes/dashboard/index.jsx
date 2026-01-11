@@ -12,6 +12,7 @@ import { useAppContext } from "../../context/AppContext";
 import { useDashboardData } from "./dataProvider";
 import useMachineState from "../../hooks/useMachineState";
 import { getSyncedAnimationStyle } from "../../utils/animationSync";
+import log from "../../services/logService";
 
 /* ---------- Recipe name formatter ---------- */
 const formatRecipeName = (name) => {
@@ -618,7 +619,11 @@ const Dashboard = () => {
     ? Number((pieGivePct.reduce((s, d) => s + (Number(d.value) || 0), 0) / pieGivePct.length).toFixed(1))
     : 0;
 
-  const toggleSeries = (name) => setDashboardVisibleSeries(prev => ({ ...(prev || {}), [name]: !prev?.[name] }));
+  const toggleSeries = (name) => {
+    const newVisible = !(dashboardVisibleSeries?.[name] ?? true);
+    setDashboardVisibleSeries(prev => ({ ...(prev || {}), [name]: newVisible }));
+    log.legendToggled(name, newVisible);
+  };
 
   // Show server offline screen if there's a connection error
   if (mode === null && configError && configError !== 'waiting') {

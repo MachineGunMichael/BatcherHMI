@@ -2,9 +2,10 @@ const express = require('express');
 const { verifyToken, requireRole } = require('../utils/authMiddleware');
 const settingsRepo = require('../repositories/settingsRepo');
 const programRepo = require('../repositories/programRepo');
-const stream = require('./stream'); // to broadcast SSE updates
+const stream = require('./stream');
 const Database = require('better-sqlite3');
 const path = require('path');
+const log = require('../lib/logger');
 
 const router = express.Router();
 
@@ -57,7 +58,7 @@ router.get('/recipes', verifyToken, (req, res) => {
 
     res.json({ recipes });
   } catch (error) {
-    console.error('Failed to fetch recipes:', error);
+    log.error('system', 'fetch_recipes_error', error);
     res.status(500).json({ message: 'Failed to fetch recipes' });
   }
 });
@@ -66,8 +67,7 @@ router.get('/recipes', verifyToken, (req, res) => {
 // NOTE: Requires 'admin' or 'manager' role (operators cannot create recipes)
 router.post('/recipes', verifyToken, requireRole('admin', 'manager', 'operator'), (req, res) => {
   try {
-    console.log('[Settings API] Creating new recipe:', req.body.name);
-    
+    const user = req.user?.username || 'system';
     const {
       name,
       display_name,
@@ -81,7 +81,6 @@ router.post('/recipes', verifyToken, requireRole('admin', 'manager', 'operator')
 
     // Validate required fields
     if (!name || !piece_min_weight_g || !piece_max_weight_g) {
-      console.log('[Settings API] Recipe creation failed: missing required fields');
       return res.status(400).json({ message: 'name, piece_min_weight_g, and piece_max_weight_g are required' });
     }
 
@@ -115,11 +114,11 @@ router.post('/recipes', verifyToken, requireRole('admin', 'manager', 'operator')
     );
 
     const newRecipe = db.prepare('SELECT * FROM recipes WHERE id = ?').get(result.lastInsertRowid);
-    console.log(`[Settings API] ✅ Recipe created successfully: ${name} (ID: ${newRecipe.id})`);
+    log.recipeCreated(name, { recipeId: newRecipe.id }, user);
 
     res.status(201).json({ recipe: newRecipe });
   } catch (error) {
-    console.error('[Settings API] Failed to create recipe:', error);
+    log.error('system', 'create_recipe_error', error);
     res.status(500).json({ message: 'Failed to create recipe' });
   }
 });
@@ -135,12 +134,13 @@ router.delete('/recipes/:id', verifyToken, requireRole('admin', 'manager'), (req
     }
 
     db.prepare('DELETE FROM recipes WHERE id = ?').run(id);
-
-    console.log(`[Settings API] ✅ Recipe deleted: ${recipe.name} (ID: ${id})`);
+    
+    const user = req.user?.username || 'system';
+    log.recipeRemoved(recipe.name, user);
 
     res.json({ message: 'Recipe deleted successfully' });
   } catch (error) {
-    console.error('Failed to delete recipe:', error);
+    log.error('system', 'delete_recipe_error', error);
     res.status(500).json({ message: 'Failed to delete recipe' });
   }
 });
@@ -160,11 +160,13 @@ router.patch('/recipes/:id/favorite', verifyToken, requireRole('admin', 'manager
     db.prepare('UPDATE recipes SET is_favorite = ? WHERE id = ?').run(newFavorite, id);
 
     const updatedRecipe = db.prepare('SELECT * FROM recipes WHERE id = ?').get(id);
-    console.log(`[Settings API] ✅ Recipe favorite toggled: ${recipe.name} (ID: ${id}) -> ${newFavorite}`);
+    
+    const user = req.user?.username || 'system';
+    log.audit('recipe_favorite_toggled', newFavorite ? 'Recipe favorited' : 'Recipe unfavorited', { recipe: recipe.name }, user);
 
     res.json({ recipe: updatedRecipe });
   } catch (error) {
-    console.error('Failed to toggle recipe favorite:', error);
+    log.error('system', 'toggle_recipe_favorite_error', error);
     res.status(500).json({ message: 'Failed to toggle recipe favorite' });
   }
 });
@@ -200,7 +202,7 @@ router.get('/saved-programs', verifyToken, (req, res) => {
 
     res.json({ programs: programsWithRecipes });
   } catch (error) {
-    console.error('Failed to fetch saved programs:', error);
+    log.error('system', 'fetch_saved_programs_error', error);
     res.status(500).json({ message: 'Failed to fetch saved programs' });
   }
 });
@@ -260,7 +262,8 @@ router.post('/saved-programs', verifyToken, requireRole('admin', 'manager', 'ope
       FROM saved_program_recipes WHERE saved_program_id = ?
     `).all(programId);
 
-    console.log(`[Settings API] ✅ Saved program created: ${name} (ID: ${programId}) with ${recipes.length} recipes`);
+    const user = req.user?.username || 'system';
+    log.savedProgramCreated(programId, display_name || name, recipes, user);
 
     res.status(201).json({
       program: {
@@ -273,7 +276,7 @@ router.post('/saved-programs', verifyToken, requireRole('admin', 'manager', 'ope
       },
     });
   } catch (error) {
-    console.error('Failed to create saved program:', error);
+    log.error('system', 'create_saved_program_error', error);
     res.status(500).json({ message: 'Failed to create saved program' });
   }
 });
@@ -291,11 +294,12 @@ router.delete('/saved-programs/:id', verifyToken, requireRole('admin', 'manager'
     // Delete program (cascade will delete recipes)
     db.prepare('DELETE FROM saved_programs WHERE id = ?').run(id);
 
-    console.log(`[Settings API] ✅ Saved program deleted: ${program.name} (ID: ${id})`);
+    const user = req.user?.username || 'system';
+    log.audit('saved_program_deleted', 'Saved program deleted', { programId: id, program: program.name }, user);
 
     res.json({ message: 'Program deleted successfully' });
   } catch (error) {
-    console.error('Failed to delete saved program:', error);
+    log.error('system', 'delete_saved_program_error', error);
     res.status(500).json({ message: 'Failed to delete saved program' });
   }
 });
@@ -315,11 +319,13 @@ router.patch('/saved-programs/:id/favorite', verifyToken, requireRole('admin', '
     db.prepare('UPDATE saved_programs SET is_favorite = ? WHERE id = ?').run(newFavorite, id);
 
     const updatedProgram = db.prepare('SELECT * FROM saved_programs WHERE id = ?').get(id);
-    console.log(`[Settings API] ✅ Saved program favorite toggled: ${program.name} (ID: ${id}) -> ${newFavorite}`);
+    
+    const user = req.user?.username || 'system';
+    log.audit('program_favorite_toggled', newFavorite ? 'Program favorited' : 'Program unfavorited', { program: program.name }, user);
 
     res.json({ program: updatedProgram });
   } catch (error) {
-    console.error('Failed to toggle saved program favorite:', error);
+    log.error('system', 'toggle_saved_program_favorite_error', error);
     res.status(500).json({ message: 'Failed to toggle saved program favorite' });
   }
 });
