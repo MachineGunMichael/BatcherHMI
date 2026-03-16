@@ -8,6 +8,7 @@ const eventBus = require('../lib/eventBus');
 const db = require('../db/sqlite');
 const log = require('../lib/logger');
 const { verifyToken } = require('../utils/authMiddleware');
+const orderRepo = require('../repositories/orderRepo');
 
 /**
  * GET /api/machine/state
@@ -56,6 +57,53 @@ router.post('/control', verifyToken, async (req, res) => {
 });
 
 /**
+ * Update order statuses to "in-production" when they become active
+ */
+function updateOrdersToInProduction(recipes) {
+  for (const recipe of recipes) {
+    if (recipe.orderId) {
+      try {
+        const order = orderRepo.getOrderById(recipe.orderId);
+        if (order && order.status === orderRepo.ORDER_STATUS.ASSIGNED) {
+          orderRepo.updateOrderStatus(recipe.orderId, orderRepo.ORDER_STATUS.IN_PRODUCTION);
+          orderRepo.updateOrderGates(recipe.orderId, recipe.gates);
+          log.operations('order_production_started', `Order ${recipe.orderId} started production`, {
+            orderId: recipe.orderId,
+            gates: recipe.gates,
+            customerId: recipe.customerId,
+          });
+        }
+      } catch (e) {
+        log.error('system', 'update_order_status_error', e, { orderId: recipe.orderId });
+      }
+    }
+  }
+}
+
+/**
+ * Update order statuses to "halted" when they are removed from production
+ */
+function updateOrdersToHalted(recipes) {
+  for (const recipe of recipes) {
+    if (recipe.orderId) {
+      try {
+        const order = orderRepo.getOrderById(recipe.orderId);
+        if (order && (order.status === orderRepo.ORDER_STATUS.IN_PRODUCTION || order.status === orderRepo.ORDER_STATUS.ASSIGNED)) {
+          orderRepo.updateOrderStatus(recipe.orderId, orderRepo.ORDER_STATUS.HALTED);
+          orderRepo.updateOrderGates(recipe.orderId, []);
+          log.operations('order_production_halted', `Order ${recipe.orderId} halted, gates cleared`, {
+            orderId: recipe.orderId,
+            completedBatches: order.completed_batches,
+          });
+        }
+      } catch (e) {
+        log.error('system', 'update_order_halted_error', e, { orderId: recipe.orderId });
+      }
+    }
+  }
+}
+
+/**
  * Handle START action
  */
 function handleStart(currentState, res, user) {
@@ -87,18 +135,22 @@ function handleStart(currentState, res, user) {
     const activeRecipes = currentState.activeRecipes;
     for (const recipe of activeRecipes) {
       const gatesAssigned = (recipe.gates || []).join(',');
+      const orderId = recipe.orderId || null; // Include order_id for composite key
       try {
         db.prepare(`
           INSERT INTO recipe_stats (
-            program_id, recipe_id, gates_assigned,
+            program_id, recipe_id, order_id, gates_assigned,
             total_batches, total_batched_weight_g, total_reject_weight_g, total_giveaway_weight_g,
             total_items_batched, total_items_rejected
-          ) VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0)
-        `).run(programId, recipe.recipeId, gatesAssigned);
+          ) VALUES (?, ?, ?, ?, 0, 0, 0, 0, 0, 0)
+        `).run(programId, recipe.recipeId, orderId, gatesAssigned);
       } catch (e) {
-        log.error('system', 'create_recipe_stats_error', e, { programId, recipeId: recipe.recipeId });
+        log.error('system', 'create_recipe_stats_error', e, { programId, recipeId: recipe.recipeId, orderId });
       }
     }
+    
+    // Update order statuses to "in-production" for any orders in active recipes
+    updateOrdersToInProduction(activeRecipes);
     
     // Update state to running and snapshot recipes
     machineState.updateState({
@@ -132,6 +184,51 @@ function handleStart(currentState, res, user) {
     const existingTransitionOldProgramId = machineState.getTransitionOldProgramId();
     const isInTransitionPeriod = machineState.isInTransitionPeriod();
     
+    // BATCH LIMIT TRANSITION RESUME: If recipes changed only due to batch limit transitions
+    // (not manual edits), just resume running - the batch limit system manages its own lifecycle
+    const hasBatchLimitTransitions = currentState.activeRecipes.some(r => 
+      r.batchLimitTransitioning || r.isFinishing || r._isIncomingFromQueue
+    );
+    
+    if (hasBatchLimitTransitions && !existingTransitionOldProgramId) {
+      // Check if there are ALSO manual recipe changes (non-batch-limit transitions)
+      // Manual transitions would be in transitioningGates but NOT belonging to batch limit recipes
+      const batchLimitGateSet = new Set();
+      currentState.activeRecipes.forEach(r => {
+        if (r.batchLimitTransitioning || r.isFinishing || r._isIncomingFromQueue) {
+          (r.gates || []).forEach(g => batchLimitGateSet.add(g));
+        }
+      });
+      const manualTransitionGates = (currentState.transitioningGates || []).filter(g => !batchLimitGateSet.has(g));
+      const hasManualChanges = manualTransitionGates.length > 0;
+      
+      if (!hasManualChanges) {
+        // Pure batch limit transition - just resume
+        log.operations('batch_limit_resume', `Resuming from pause during batch limit transition`, {
+          programId: currentState.currentProgramId,
+          batchLimitRecipes: currentState.activeRecipes
+            .filter(r => r.batchLimitTransitioning || r.isFinishing)
+            .map(r => r.recipeName),
+          transitioningGates: currentState.transitioningGates,
+        });
+        
+        const transitioningGates = machineState.getTransitioningGates();
+        const currentRegisteredGates = currentState.registeredTransitioningGates || [];
+        const newRegisteredGates = [...new Set([...currentRegisteredGates, ...transitioningGates])];
+        
+        machineState.updateState({ 
+          state: 'running',
+          registeredTransitioningGates: newRegisteredGates,
+        });
+        
+        return res.json({
+          success: true,
+          action: 'resume_batch_limit_transition',
+          state: machineState.getState(),
+        });
+      }
+    }
+    
     if (changed || alreadyTransitioning) {
       
       // MERGED TRANSITIONS: If we're already in a transition period, DON'T create a new program
@@ -149,13 +246,14 @@ function handleStart(currentState, res, user) {
         const activeRecipes = machineState.getActiveRecipes();
         for (const recipe of activeRecipes) {
           const gatesAssigned = (recipe.gates || []).join(',');
+          const orderId = recipe.orderId || null;
           db.prepare(`
             INSERT INTO recipe_stats (
-              program_id, recipe_id, gates_assigned,
+              program_id, recipe_id, order_id, gates_assigned,
               total_batches, total_batched_weight_g, total_reject_weight_g, total_giveaway_weight_g,
               total_items_batched, total_items_rejected
-            ) VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0)
-          `).run(currentProgramId, recipe.recipeId, gatesAssigned);
+            ) VALUES (?, ?, ?, ?, 0, 0, 0, 0, 0, 0)
+          `).run(currentProgramId, recipe.recipeId, orderId, gatesAssigned);
         }
         
         const transitioningGates = machineState.getTransitioningGates();
@@ -211,13 +309,14 @@ function handleStart(currentState, res, user) {
       const activeRecipes = machineState.getActiveRecipes();
       for (const recipe of activeRecipes) {
         const gatesAssigned = (recipe.gates || []).join(',');
+        const orderId = recipe.orderId || null;
         db.prepare(`
           INSERT INTO recipe_stats (
-            program_id, recipe_id, gates_assigned,
+            program_id, recipe_id, order_id, gates_assigned,
             total_batches, total_batched_weight_g, total_reject_weight_g, total_giveaway_weight_g,
             total_items_batched, total_items_rejected
-          ) VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0)
-        `).run(newProgramId, recipe.recipeId, gatesAssigned);
+          ) VALUES (?, ?, ?, ?, 0, 0, 0, 0, 0, 0)
+        `).run(newProgramId, recipe.recipeId, orderId, gatesAssigned);
       }
       
       const transitioningGates = machineState.getTransitioningGates();
@@ -306,15 +405,18 @@ function calculateAndWriteProgramStats(programId) {
       SELECT start_ts, end_ts FROM program_stats WHERE program_id = ?
     `).get(programId);
     
+    // Group by both recipe_id and order_id to support composite keys
+    // (same recipe can run as order vs regular recipe simultaneously)
     const batchStats = db.prepare(`
       SELECT 
         recipe_id,
+        order_id,
         COUNT(*) as total_batches,
         SUM(pieces) as total_items_batched,
         SUM(weight_g) as total_batched_weight_g
       FROM batch_completions
       WHERE program_id = ?
-      GROUP BY recipe_id
+      GROUP BY recipe_id, order_id
     `).all(programId);
     
     for (const stats of batchStats) {
@@ -326,7 +428,8 @@ function calculateAndWriteProgramStats(programId) {
         giveawayWeightG = Math.max(0, stats.total_batched_weight_g - targetWeight);
       }
       
-      db.prepare(`
+      // UPSERT: try UPDATE first, INSERT if row doesn't exist
+      const updateResult = db.prepare(`
         UPDATE recipe_stats 
         SET 
           total_batches = ?,
@@ -334,15 +437,46 @@ function calculateAndWriteProgramStats(programId) {
           total_batched_weight_g = ?,
           total_giveaway_weight_g = ?,
           updated_at = CURRENT_TIMESTAMP
-        WHERE program_id = ? AND recipe_id = ?
+        WHERE program_id = ? AND recipe_id = ? AND COALESCE(order_id, 0) = COALESCE(?, 0)
       `).run(
         stats.total_batches,
         stats.total_items_batched,
         stats.total_batched_weight_g,
         giveawayWeightG,
         programId,
-        stats.recipe_id
+        stats.recipe_id,
+        stats.order_id
       );
+
+      if (updateResult.changes === 0) {
+        // Row didn't exist (initial INSERT failed or was never created) - create it now
+        const gatesStr = db.prepare(`
+          SELECT GROUP_CONCAT(DISTINCT gate) as gates
+          FROM batch_completions
+          WHERE program_id = ? AND recipe_id = ? AND gate > 0
+        `).get(programId, stats.recipe_id);
+
+        try {
+          db.prepare(`
+            INSERT INTO recipe_stats (
+              program_id, recipe_id, order_id, gates_assigned,
+              total_batches, total_batched_weight_g, total_reject_weight_g, total_giveaway_weight_g,
+              total_items_batched, total_items_rejected
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, 0)
+          `).run(
+            programId,
+            stats.recipe_id,
+            stats.order_id || null,
+            gatesStr?.gates || '',
+            stats.total_batches,
+            stats.total_batched_weight_g,
+            giveawayWeightG,
+            stats.total_items_batched
+          );
+        } catch (insertErr) {
+          log.error('system', 'recipe_stats_upsert_error', insertErr, { programId, recipeId: stats.recipe_id });
+        }
+      }
     }
     
     // Get reject totals
@@ -461,9 +595,30 @@ async function handleStop(currentState, res, user) {
     });
   }
   
+  // Before resetting, sync batch counts from active recipes to queue items
+  // This ensures batch progress is preserved even if the frontend doesn't handle it
+  const currentQueue = machineState.getOrderQueue();
+  const activeRecipesForSync = currentState.activeRecipes || [];
+  if (currentQueue.length > 0 && activeRecipesForSync.length > 0) {
+    const updatedQueue = currentQueue.map(q => {
+      const matchingActive = activeRecipesForSync.find(r => {
+        if (q.orderId) return r.orderId === q.orderId;
+        return r.recipeName === q.recipeName && !r.orderId && !q.orderId;
+      });
+      if (matchingActive && (matchingActive.completedBatches || 0) > (q.completedBatches || 0)) {
+        return { ...q, completedBatches: matchingActive.completedBatches };
+      }
+      return q;
+    });
+    machineState.setOrderQueue(updatedQueue);
+  }
+  
+  // Recipes stay in activeRecipes for operator to finish/skip individually
+  // Don't clear gate assignments or order statuses yet
+  
   const gates = require('../state/gates');
   gates.resetAll();
-  machineState.reset();
+  machineState.reset(true); // keepRecipes=true so operator can finish/skip each one
   
   // Give Python worker time to detect state change and flush KPIs
   await new Promise(resolve => setTimeout(resolve, 500));
@@ -475,6 +630,9 @@ async function handleStop(currentState, res, user) {
     
     try {
       calculateAndWriteProgramStats(programId);
+
+      // Manual stop: all recipes are completed (program terminated)
+      db.prepare(`UPDATE recipe_stats SET completed = 1 WHERE program_id = ?`).run(programId);
       
       const updateResult = db.prepare(`
         UPDATE program_stats 
@@ -521,6 +679,7 @@ router.post('/transition-complete', async (req, res) => {
     
     if (action === 'stop') {
       calculateAndWriteProgramStats(programId);
+      db.prepare(`UPDATE recipe_stats SET completed = 1 WHERE program_id = ?`).run(programId);
       
       const endTime = new Date().toISOString();
       db.prepare(`
@@ -581,13 +740,36 @@ router.get('/recipes', (req, res) => {
  */
 router.post('/recipes', verifyToken, (req, res) => {
   try {
-    const { recipes } = req.body;
+    const { recipes, autoAssign, immediateRemoval } = req.body;
     const currentState = machineState.getState();
     const user = req.user?.username || 'system';
     
     if (currentState.state === 'running') {
-      return res.status(400).json({ 
-        error: 'Cannot update recipes while machine is running. Please pause first.' 
+      // Allow auto-assign (adding to empty gates) while running
+      // Block manual recipe modifications while running
+      if (!autoAssign) {
+        return res.status(400).json({ 
+          error: 'Cannot update recipes while machine is running. Please pause first.' 
+        });
+      }
+      
+      // For auto-assign, verify we're only ADDING to empty gates, not modifying existing
+      const currentRecipes = currentState.activeRecipes || [];
+      const currentGatesUsed = currentRecipes.flatMap(r => r.gates || []);
+      const newGatesUsed = recipes.flatMap(r => r.gates || []);
+      
+      // Check if any current gates are being modified (removed or reassigned)
+      for (const gate of currentGatesUsed) {
+        if (!newGatesUsed.includes(gate)) {
+          return res.status(400).json({ 
+            error: 'Cannot remove recipes from gates while machine is running. Use pause first.' 
+          });
+        }
+      }
+      
+      log.operations('auto_assign_while_running', 'Auto-assigning recipes to empty gates during run', {
+        user,
+        addedGates: newGatesUsed.filter(g => !currentGatesUsed.includes(g)),
       });
     }
     
@@ -656,12 +838,20 @@ router.post('/recipes', verifyToken, (req, res) => {
     // Track transitioning gates if paused
     const isTransitioning = currentState.state === 'paused' && currentState.currentProgramId;
     
-    if (isTransitioning) {
+    // Immediate removal: skip transition tracking and clear batch limit transition state.
+    // Used when a finishing recipe with empty gates is removed directly to queue.
+    if (immediateRemoval && isTransitioning) {
+      log.operations('immediate_removal', 'Immediate removal of finishing recipe - clearing batch limit transition state', { user });
+      machineState.clearBatchLimitTransitions();
+    }
+    
+    if (isTransitioning && !immediateRemoval) {
       const affectedGates = [];
       const originalRecipes = {};
       const recipeChanges = []; // For logging
       
       const oldGateToRecipe = {};
+      // First, map from programStartRecipes (original recipes at program start)
       for (const recipe of currentState.programStartRecipes) {
         for (const gate of recipe.gates || []) {
           oldGateToRecipe[gate] = {
@@ -669,7 +859,34 @@ router.post('/recipes', verifyToken, (req, res) => {
             recipeName: recipe.recipeName,
             displayName: recipe.displayName || recipe.display_name || null,
             params: recipe.params,
+            gates: recipe.gates || [],
+            orderId: recipe.orderId || null,
+            completedBatches: recipe.completedBatches || 0,
+            requestedBatches: recipe.requestedBatches || 0,
           };
+        }
+      }
+      // Also include dynamically-added recipes (e.g., auto-assigned from queue after program start)
+      // These are in activeRecipes but NOT in programStartRecipes.
+      // Use activeRecipes as override source for completedBatches (more up-to-date).
+      for (const recipe of (currentState.activeRecipes || [])) {
+        for (const gate of recipe.gates || []) {
+          if (!oldGateToRecipe[gate]) {
+            oldGateToRecipe[gate] = {
+              recipeId: recipe.recipeId,
+              recipeName: recipe.recipeName,
+              displayName: recipe.displayName || recipe.display_name || null,
+              params: recipe.params,
+              gates: recipe.gates || [],
+              orderId: recipe.orderId || null,
+              completedBatches: recipe.completedBatches || 0,
+              requestedBatches: recipe.requestedBatches || 0,
+            };
+          } else {
+            // Update batch counts from active recipes (they have the latest values)
+            oldGateToRecipe[gate].completedBatches = recipe.completedBatches || oldGateToRecipe[gate].completedBatches || 0;
+            oldGateToRecipe[gate].requestedBatches = recipe.requestedBatches || oldGateToRecipe[gate].requestedBatches || 0;
+          }
         }
       }
       
@@ -726,12 +943,62 @@ router.post('/recipes', verifyToken, (req, res) => {
       if (affectedGates.length > 0) {
         machineState.startGateTransition(affectedGates, originalRecipes);
       }
+      
+      // Check for orders that are being removed and mark them as halted
+      const currentOrderIds = new Set(currentState.activeRecipes.filter(r => r.orderId).map(r => r.orderId));
+      const newOrderIds = new Set(recipes.filter(r => r.orderId).map(r => r.orderId));
+      const removedOrders = currentState.activeRecipes.filter(r => r.orderId && !newOrderIds.has(r.orderId));
+      if (removedOrders.length > 0) {
+        updateOrdersToHalted(removedOrders);
+      }
     } else {
       // Not transitioning - just log recipe configuration normally
       log.recipesConfigured(recipes, currentState.currentProgramId);
+      
+      // Sync order statuses/gates with what's in active recipes
+      const currentOrderIds = new Set((currentState.activeRecipes || []).filter(r => r.orderId).map(r => r.orderId));
+      const newOrderIds = new Set(recipes.filter(r => r.orderId).map(r => r.orderId));
+      
+      // Orders being removed from active -> halted
+      const removedOrders = (currentState.activeRecipes || []).filter(r => r.orderId && !newOrderIds.has(r.orderId));
+      if (removedOrders.length > 0) {
+        updateOrdersToHalted(removedOrders);
+      }
+      
+      // All orders now in active recipes -> in-production with current gates
+      for (const recipe of recipes) {
+        if (!recipe.orderId) continue;
+        try {
+          const order = orderRepo.getOrderById(recipe.orderId);
+          if (order && order.status !== orderRepo.ORDER_STATUS.IN_PRODUCTION) {
+            orderRepo.updateOrderStatus(recipe.orderId, orderRepo.ORDER_STATUS.IN_PRODUCTION);
+          }
+          if (order) {
+            orderRepo.updateOrderGates(recipe.orderId, recipe.gates || []);
+          }
+        } catch (e) {
+          log.error('system', 'update_order_in_production_error', e, { orderId: recipe.orderId });
+        }
+      }
     }
     
     machineState.setActiveRecipes(recipes);
+    
+    // After updating active recipes, check if any recipe should start batch limit transitioning.
+    // This handles the case where a recipe is activated from queue while paused and already
+    // at or past the batch limit threshold (e.g., 9/10 completed with 2 gates).
+    const updatedRecipes = machineState.getActiveRecipes();
+    for (const r of updatedRecipes) {
+      if (!r.batchLimitTransitioning && machineState.shouldStartBatchLimitTransition(r)) {
+        log.queue('recipes_update_triggered_transition', `Recipe ${r.recipeName} at batch limit threshold after recipes update - starting transition`, {
+          recipeName: r.recipeName,
+          completedBatches: r.completedBatches,
+          requestedBatches: r.requestedBatches,
+          gates: r.gates,
+        });
+        machineState.startBatchLimitTransition(r);
+      }
+    }
     
     return res.json({
       success: true,
@@ -757,17 +1024,59 @@ router.get('/stream', (req, res) => {
   const initialState = machineState.getState();
   res.write(`data: ${JSON.stringify(initialState)}\n\n`);
   
-  const listener = (state) => {
+  const stateListener = (state) => {
     res.write(`data: ${JSON.stringify(state)}\n\n`);
   };
   
-  eventBus.bus.on('machine:state-changed', listener);
+  // Listen for order batch updates
+  const orderBatchListener = (data) => {
+    res.write(`data: ${JSON.stringify({ type: 'order_batch_update', ...data })}\n\n`);
+  };
+  
+  // Listen for order completion
+  const orderCompletedListener = (data) => {
+    res.write(`data: ${JSON.stringify({ type: 'order_completed', ...data })}\n\n`);
+  };
+
+  // Listen for recipe batch updates (per-recipe batch counts)
+  const recipeBatchListener = (data) => {
+    res.write(`data: ${JSON.stringify({ type: 'recipe_batch_update', ...data })}\n\n`);
+  };
+
+  // Listen for recipe completion
+  const recipeCompletedListener = (data) => {
+    res.write(`data: ${JSON.stringify({ type: 'recipe_completed', ...data })}\n\n`);
+  };
+
+  // Listen for batch limit transition start
+  const batchLimitTransitionListener = (data) => {
+    res.write(`data: ${JSON.stringify({ type: 'batch_limit_transition_started', ...data })}\n\n`);
+  };
+
+  // Listen for gate handoffs (gate freed → assigned to next queue item)
+  const gateHandoffListener = (data) => {
+    res.write(`data: ${JSON.stringify({ type: 'gate_handoff', ...data })}\n\n`);
+  };
+  
+  eventBus.bus.on('machine:state-changed', stateListener);
+  eventBus.bus.on('order_batch_update', orderBatchListener);
+  eventBus.bus.on('order_completed', orderCompletedListener);
+  eventBus.bus.on('recipe_batch_update', recipeBatchListener);
+  eventBus.bus.on('recipe_completed', recipeCompletedListener);
+  eventBus.bus.on('batch_limit_transition_started', batchLimitTransitionListener);
+  eventBus.bus.on('gate_handoff', gateHandoffListener);
   
   const clientId = Math.random().toString(36).substring(7);
   log.sseClientConnected(clientId);
   
   req.on('close', () => {
-    eventBus.bus.off('machine:state-changed', listener);
+    eventBus.bus.off('machine:state-changed', stateListener);
+    eventBus.bus.off('order_batch_update', orderBatchListener);
+    eventBus.bus.off('order_completed', orderCompletedListener);
+    eventBus.bus.off('recipe_batch_update', recipeBatchListener);
+    eventBus.bus.off('recipe_completed', recipeCompletedListener);
+    eventBus.bus.off('batch_limit_transition_started', batchLimitTransitionListener);
+    eventBus.bus.off('gate_handoff', gateHandoffListener);
     log.sseClientDisconnected(clientId);
   });
 });
@@ -790,8 +1099,8 @@ router.post('/skip-transition', async (req, res) => {
       return res.status(400).json({ error: `Gate ${gate} is not transitioning` });
     }
     
-    const gates = require('../state/gates');
-    const snapshot = gates.getSnapshot();
+    const gatesModule = require('../state/gates');
+    const snapshot = gatesModule.getSnapshot();
     const gateState = snapshot.find(g => g.gate === gate);
     const pieces = gateState?.pieces || 0;
     const grams = gateState?.grams || 0;
@@ -831,7 +1140,8 @@ router.post('/skip-transition', async (req, res) => {
       log.error('system', 'skip_batch_write_error', err, { gate });
     }
     
-    gates.resetGate(gate);
+    // Reset gate counters (pieces/grams)
+    gatesModule.resetGate(gate);
     
     eventBus.bus.emit('broadcast', { type: 'gate', data: { gate, pieces: 0, grams: 0, ts: tsIso } });
     
@@ -843,7 +1153,100 @@ router.post('/skip-transition', async (req, res) => {
       ts: tsIso,
     }).catch(err => log.error('system', 'm2_reset_write_error', err));
     
-    machineState.completeGateTransition(gate);
+    // Check if this gate belongs to a batch-limit-transitioning recipe
+    // If so, use handleBatchLimitGateComplete which handles gate handoff to incoming recipe
+    const activeRecipes = machineState.getActiveRecipes();
+    const batchLimitRecipe = activeRecipes.find(r => 
+      (r.batchLimitTransitioning || r.isFinishing) && (r.gates || []).includes(gate)
+    );
+    
+    if (batchLimitRecipe) {
+      // BATCH LIMIT TRANSITION: use the full handoff logic
+      // handleBatchLimitGateComplete internally calls completeGateTransition(gate)
+      log.operations('skip_batch_limit_gate', `Skip: Gate ${gate} batch limit handoff for ${batchLimitRecipe.recipeName}`, {
+        gate,
+        recipeName: batchLimitRecipe.recipeName,
+        remainingGates: (batchLimitRecipe.gates || []).filter(g => g !== gate),
+      });
+      
+      const handoffResult = machineState.handleBatchLimitGateComplete(gate, batchLimitRecipe);
+      
+      if (handoffResult) {
+        eventBus.broadcast("gate_handoff", {
+          gate,
+          fromRecipe: batchLimitRecipe.recipeName,
+          fromRecipeKey: batchLimitRecipe.orderId 
+            ? `order_${batchLimitRecipe.orderId}` 
+            : `recipe_${(batchLimitRecipe.gates || []).sort().join('_')}`,
+          toRecipe: handoffResult.recipe?.recipeName || null,
+          handoffType: handoffResult.type,
+          assigned: handoffResult.assigned,
+          needed: handoffResult.needed,
+          ts: tsIso,
+        });
+      }
+      
+      // Check if the finishing recipe is now fully done (no gates left)
+      const currentRecipes = machineState.getActiveRecipes();
+      const stillExists = currentRecipes.some(r => {
+        if (batchLimitRecipe.orderId) {
+          return r.orderId === batchLimitRecipe.orderId && r.batchLimitTransitioning;
+        }
+        return r.recipeName === batchLimitRecipe.recipeName && r.batchLimitTransitioning && (r.gates || []).length > 0;
+      });
+      
+      if (!stillExists) {
+        // Recipe fully completed - all gates freed
+        log.operations('recipe_completed', `Recipe ${batchLimitRecipe.recipeName} completed (skipped) - all gates freed`, {
+          recipeName: batchLimitRecipe.recipeName,
+          completedBatches: batchLimitRecipe.requestedBatches,
+          requestedBatches: batchLimitRecipe.requestedBatches,
+          orderId: batchLimitRecipe.orderId || null,
+        });
+        
+        // Remove from order queue
+        const currentQueue = machineState.getOrderQueue();
+        const updatedQueue = currentQueue.filter(qItem => {
+          if (batchLimitRecipe.orderId) {
+            return qItem.orderId !== batchLimitRecipe.orderId;
+          }
+          return qItem.recipeName !== batchLimitRecipe.recipeName;
+        });
+        
+        if (updatedQueue.length < currentQueue.length) {
+          machineState.setOrderQueue(updatedQueue);
+          log.queue('queue_item_removed_on_skip_completion', `Removed skipped recipe from queue: ${batchLimitRecipe.recipeName}`, {
+            recipeName: batchLimitRecipe.recipeName,
+          });
+        }
+        
+        // Update order status if it's an order
+        if (batchLimitRecipe.orderId) {
+          try {
+            db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('completed', batchLimitRecipe.orderId);
+          } catch (orderErr) {
+            log.error('system', 'order_status_update_error', orderErr, { orderId: batchLimitRecipe.orderId });
+          }
+        }
+        
+        // Broadcast recipe completion
+        eventBus.broadcast("recipe_completed", {
+          recipeKey: batchLimitRecipe.orderId 
+            ? `order_${batchLimitRecipe.orderId}` 
+            : `recipe_${batchLimitRecipe.recipeName}`,
+          recipeName: batchLimitRecipe.recipeName,
+          completedBatches: batchLimitRecipe.requestedBatches,
+          requestedBatches: batchLimitRecipe.requestedBatches,
+          orderId: batchLimitRecipe.orderId || null,
+          gate,
+          gates: [],
+          ts: tsIso,
+        });
+      }
+    } else {
+      // REGULAR TRANSITION: just complete the gate transition
+      machineState.completeGateTransition(gate);
+    }
     
     const recipeManager = require('../lib/recipeManager');
     recipeManager.loadGateAssignments();
@@ -853,7 +1256,7 @@ router.post('/skip-transition', async (req, res) => {
       eventBus.bus.emit('broadcast', { type: 'transition_complete', data: { ts: tsIso } });
     }
     
-    const fullSnapshot = gates.getSnapshot();
+    const fullSnapshot = gatesModule.getSnapshot();
     eventBus.bus.emit('broadcast', { type: 'overlay', data: { ts: tsIso, overlay: fullSnapshot } });
     
     res.json({ 
@@ -869,6 +1272,217 @@ router.post('/skip-transition', async (req, res) => {
   }
 });
 
+/**
+ * GET /api/machine/queue
+ * Get current order queue
+ */
+router.get('/queue', (req, res) => {
+  try {
+    const queue = machineState.getOrderQueue();
+    log.queueLoaded(queue.length, queue);
+    res.json({ queue });
+  } catch (error) {
+    log.error('system', 'get_order_queue_error', error);
+    res.status(500).json({ error: 'Failed to get order queue' });
+  }
+});
+
+/**
+ * POST /api/machine/pause-recipe
+ * Pause or resume a specific recipe/order
+ * Body: { recipeName, orderId, paused: boolean }
+ */
+router.post('/pause-recipe', verifyToken, (req, res) => {
+  try {
+    const { recipeName, orderId, paused } = req.body;
+    const updated = machineState.toggleRecipePause(recipeName, orderId || null, paused);
+    res.json({ success: true, paused, activeRecipes: updated });
+  } catch (error) {
+    log.error('system', 'pause_recipe_error', error);
+    res.status(500).json({ error: 'Failed to pause recipe' });
+  }
+});
+
+/**
+ * POST /api/machine/pause-gate
+ * Pause or resume a specific gate
+ * Body: { gate: number, paused: boolean }
+ */
+router.post('/pause-gate', verifyToken, (req, res) => {
+  try {
+    const { gate, paused } = req.body;
+    const pausedGates = machineState.toggleGatePause(gate, paused);
+    res.json({ success: true, gate, paused, pausedGates });
+  } catch (error) {
+    log.error('system', 'pause_gate_error', error);
+    res.status(500).json({ error: 'Failed to pause gate' });
+  }
+});
+
+/**
+ * POST /api/machine/queue
+ * Update order queue
+ * Body: { queue: [...], source: string }
+ */
+router.post('/queue', verifyToken, (req, res) => {
+  try {
+    const { queue, source = 'unknown' } = req.body;
+    const user = req.user?.username || 'system';
+    
+    if (!Array.isArray(queue)) {
+      return res.status(400).json({ error: 'Queue must be an array' });
+    }
+    
+    // Get current queue to check for emptying
+    const currentQueue = machineState.getOrderQueue();
+    const previousLength = currentQueue.length;
+    
+    // Log if queue is being emptied (critical for debugging)
+    if (queue.length === 0 && previousLength > 0) {
+      log.queueEmptied(previousLength, source, new Error().stack);
+    }
+    
+    machineState.setOrderQueue(queue);
+    log.queueSaved(queue.length, queue, source);
+
+    // Sync order statuses: queued orders → 'assigned', halted orders → 'halted'
+    for (const item of queue) {
+      if (!item.orderId) continue;
+      try {
+        const order = orderRepo.getOrderById(item.orderId);
+        if (!order) continue;
+        const isHalted = item.status === 'halted';
+        const targetStatus = isHalted ? orderRepo.ORDER_STATUS.HALTED : orderRepo.ORDER_STATUS.ASSIGNED;
+        if (order.status !== targetStatus && order.status !== orderRepo.ORDER_STATUS.IN_PRODUCTION) {
+          orderRepo.updateOrderStatus(item.orderId, targetStatus);
+        }
+      } catch (e) {
+        log.error('system', 'queue_sync_order_status_error', e, { orderId: item.orderId });
+      }
+    }
+    
+    // Also log to audit for tracking user actions
+    log.audit('queue_updated', `Order queue updated: ${previousLength} → ${queue.length} items`, {
+      previousLength,
+      newLength: queue.length,
+      source,
+    }, user);
+    
+    res.json({ success: true, queue: machineState.getOrderQueue() });
+  } catch (error) {
+    log.error('system', 'update_order_queue_error', error);
+    res.status(500).json({ error: 'Failed to update order queue' });
+  }
+});
+
+/**
+ * POST /api/machine/recover-orders
+ * Recover orphaned orders (status assigned/in-production but not in active/queue)
+ * This is called automatically on page load and can be triggered manually
+ */
+router.post('/recover-orders', (req, res) => {
+  try {
+    const recoveredCount = machineState.recoverOrphanedOrders();
+    res.json({ success: true, recoveredCount });
+  } catch (error) {
+    log.error('system', 'recover_orders_error', error);
+    res.status(500).json({ error: 'Failed to recover orders' });
+  }
+});
+
+/**
+ * Handle automatic program transition when a recipe is swapped via batch limit.
+ * Ends the current program (saves stats, sets end_ts) and creates a new one
+ * so that each distinct recipe configuration is captured in its own program.
+ */
+function handleBatchLimitProgramTransition(completedRecipeName) {
+  try {
+    const currentState = machineState.getState();
+    const oldProgramId = currentState.currentProgramId;
+
+    if (!oldProgramId) {
+      log.warn('system', 'batch_limit_program_transition_no_program', 'No current program to transition');
+      return null;
+    }
+
+    const transitionTime = new Date().toISOString();
+
+    // 1. Calculate and save stats for the ending program
+    calculateAndWriteProgramStats(oldProgramId);
+
+    // 2. Mark the completed recipe and set others as not completed in the old program
+    // The completed recipe is the one that triggered this transition
+    db.prepare(`UPDATE recipe_stats SET completed = 0 WHERE program_id = ?`).run(oldProgramId);
+    const completedRecipe = db.prepare(`
+      SELECT r.id FROM recipes r WHERE r.name = ?
+    `).get(completedRecipeName);
+    if (completedRecipe) {
+      db.prepare(`UPDATE recipe_stats SET completed = 1 WHERE program_id = ? AND recipe_id = ?`)
+        .run(oldProgramId, completedRecipe.id);
+    }
+
+    // 3. End the old program
+    db.prepare(`UPDATE program_stats SET end_ts = ? WHERE program_id = ?`).run(transitionTime, oldProgramId);
+
+    // 4. Create a new program
+    const programName = `program_${transitionTime.replace(/[-:]/g, '').replace(/\..+/, '').replace('T', '_')}`;
+    const result = db.prepare('INSERT INTO programs (name) VALUES (?)').run(programName);
+    const newProgramId = result.lastInsertRowid;
+
+    log.programCreated(newProgramId, programName);
+
+    // 4. Create program_stats row
+    db.prepare(`
+      INSERT INTO program_stats (program_id, start_ts, end_ts)
+      VALUES (?, ?, NULL)
+    `).run(newProgramId, transitionTime);
+
+    // 6. Create recipe_stats rows for current active recipes (completed=0, still running)
+    const activeRecipes = machineState.getActiveRecipes();
+    for (const recipe of activeRecipes) {
+      if (recipe.batchLimitTransitioning || recipe.isFinishing) continue;
+      const gatesAssigned = (recipe.gates || []).join(',');
+      const orderId = recipe.orderId || null;
+      try {
+        db.prepare(`
+          INSERT INTO recipe_stats (
+            program_id, recipe_id, order_id, gates_assigned,
+            total_batches, total_batched_weight_g, total_reject_weight_g, total_giveaway_weight_g,
+            total_items_batched, total_items_rejected, completed
+          ) VALUES (?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0)
+        `).run(newProgramId, recipe.recipeId, orderId, gatesAssigned);
+      } catch (e) {
+        log.error('system', 'batch_limit_create_recipe_stats_error', e, { newProgramId, recipeId: recipe.recipeId });
+      }
+    }
+
+    // 7. Update machine state with new program ID and snapshot
+    machineState.updateState({ currentProgramId: newProgramId });
+    machineState.snapshotRecipes();
+
+    log.operations('batch_limit_program_transition', `Program transitioned: ${oldProgramId} → ${newProgramId} (recipe ${completedRecipeName} completed)`, {
+      oldProgramId,
+      newProgramId,
+      completedRecipe: completedRecipeName,
+      activeRecipes: activeRecipes.filter(r => !r.batchLimitTransitioning).map(r => r.recipeName),
+    });
+
+    eventBus.broadcast('program_change', {
+      action: 'batch_limit_transition',
+      oldProgramId,
+      programId: newProgramId,
+      completedRecipe: completedRecipeName,
+      ts: transitionTime,
+    });
+
+    return { oldProgramId, newProgramId, programName };
+  } catch (error) {
+    log.error('system', 'batch_limit_program_transition_error', error);
+    return null;
+  }
+}
+
 // Export router and helper functions
 module.exports = router;
 module.exports.handleAllTransitionsComplete = handleAllTransitionsComplete;
+module.exports.handleBatchLimitProgramTransition = handleBatchLimitProgramTransition;

@@ -9,6 +9,7 @@ const recipeManager = require("../lib/recipeManager");
 const machineState = require("../services/machineState");
 const db = require("../db/sqlite");
 const log = require("../lib/logger");
+const orderRepo = require("../repositories/orderRepo");
 
 // Simple shared-secret for PLCs (machines don't send JWTs)
 function verifyPlcSecret(req, res, next) {
@@ -130,8 +131,21 @@ router.post("/piece", verifyPlcSecret, async (req, res) => {
     const eligibleGates = [];
     const transitioningGates = machineState.getTransitioningGates();
     const currentMachineState = machineState.getState();
+    const pausedGates = currentMachineState.pausedGates || [];
+    const activeRecipes = currentMachineState.activeRecipes || [];
+
+    // Build set of gates belonging to paused recipes
+    const pausedRecipeGates = new Set();
+    for (const r of activeRecipes) {
+      if (r.paused) {
+        for (const g of (r.gates || [])) pausedRecipeGates.add(g);
+      }
+    }
     
     for (let gate = gates.GATE_MIN; gate <= gates.GATE_MAX; gate++) {
+      // Skip paused gates and gates belonging to paused recipes
+      if (pausedGates.includes(gate) || pausedRecipeGates.has(gate)) continue;
+
       const recipe = recipeManager.getRecipeForGate(gate);
       if (recipe && w >= recipe.pieceMin && w <= recipe.pieceMax) {
         eligibleGates.push(gate);
@@ -204,21 +218,341 @@ router.post("/piece", verifyPlcSecret, async (req, res) => {
             programIdForBatch = getCurrentProgramId();
           }
           
+          // Get order_id from active recipes (for composite key tracking)
+          const activeRecipes = machineState.getActiveRecipes();
+          const recipeOnGate = activeRecipes.find(r => r.gates && r.gates.includes(g) && r.recipeName === recipeName);
+          const orderIdForBatch = recipeOnGate?.orderId || null;
+          
           db.prepare(`
-            INSERT INTO batch_completions (gate, completed_at, pieces, weight_g, recipe_id, program_id)
-            VALUES (?, ?, ?, ?, ?, ?)
-          `).run(g, tsIso, result.pieces, result.grams, recipeIdForStats, programIdForBatch);
+            INSERT INTO batch_completions (gate, completed_at, pieces, weight_g, recipe_id, order_id, program_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+          `).run(g, tsIso, result.pieces, result.grams, recipeIdForStats, orderIdForBatch, programIdForBatch);
           
           // Log batch completion
           log.batchCompleted(g, recipeName, result.pieces, result.grams, programIdForBatch);
+          
+          // Always increment recipe batch count in machine state for real-time tracking
+          const updatedRecipe = machineState.incrementRecipeBatchCount(g, recipeName);
+          if (updatedRecipe) {
+            // Create a unique key for this recipe/order to handle duplicates
+            // Orders use order_${orderId}, recipes use gates as unique identifier
+            const recipeKey = updatedRecipe.orderId 
+              ? `order_${updatedRecipe.orderId}` 
+              : `recipe_${(updatedRecipe.gates || []).sort().join('_')}`;
+            
+            // Broadcast recipe batch update for real-time UI updates (all recipes)
+            broadcast("recipe_batch_update", {
+              recipeKey, // Unique identifier for tracking
+              recipeName: updatedRecipe.recipeName,
+              completedBatches: updatedRecipe.completedBatches,
+              requestedBatches: updatedRecipe.requestedBatches || 0,
+              gate: g,
+              gates: updatedRecipe.gates || [],
+              orderId: updatedRecipe.orderId || null,
+              batchLimitTransitioning: updatedRecipe.batchLimitTransitioning || false,
+              ts: tsIso,
+            });
+            
+            // ================================================================
+            // BATCH LIMIT TRANSITIONING LOGIC
+            // When approaching batch limit, start transitioning gates one by one
+            // Formula: Start when completedBatches >= requestedBatches - numberOfGates
+            // ================================================================
+            
+            if (updatedRecipe.batchLimitTransitioning) {
+              // Recipe is already in batch limit transitioning mode
+              // This gate just completed its final batch - free it and assign to queue
+              log.operations('batch_limit_gate_complete', `Gate ${g} completing final batch for ${updatedRecipe.recipeName}`, {
+                gate: g,
+                recipeName: updatedRecipe.recipeName,
+                completedBatches: updatedRecipe.completedBatches,
+                requestedBatches: updatedRecipe.requestedBatches,
+              });
+              
+              const handoffResult = machineState.handleBatchLimitGateComplete(g, updatedRecipe);
+              
+              if (handoffResult) {
+                // Broadcast gate handoff event
+                broadcast("gate_handoff", {
+                  gate: g,
+                  fromRecipe: updatedRecipe.recipeName,
+                  fromRecipeKey: recipeKey,
+                  toRecipe: handoffResult.recipe?.recipeName || null,
+                  handoffType: handoffResult.type,
+                  assigned: handoffResult.assigned,
+                  needed: handoffResult.needed,
+                  ts: tsIso,
+                });
+              }
+              
+              // Check if recipe is now fully complete (all gates freed)
+              // Use stable matching - orderId for orders, or recipeName + batchLimitTransitioning flag
+              const currentRecipes = machineState.getActiveRecipes();
+              const stillExists = currentRecipes.some(r => {
+                if (updatedRecipe.orderId) {
+                  return r.orderId === updatedRecipe.orderId && r.batchLimitTransitioning;
+                }
+                // For non-order recipes, match by name AND transitioning flag AND still having gates
+                return r.recipeName === updatedRecipe.recipeName && r.batchLimitTransitioning && (r.gates || []).length > 0;
+              });
+              
+              if (!stillExists) {
+                // Recipe fully completed - all gates freed
+                log.operations('recipe_completed', `Recipe ${updatedRecipe.recipeName} completed all batches (batch limit transitioning)`, {
+                  recipeName: updatedRecipe.recipeName,
+                  completedBatches: updatedRecipe.requestedBatches,
+                  requestedBatches: updatedRecipe.requestedBatches,
+                  orderId: updatedRecipe.orderId || null,
+                });
+                
+                // Remove from order queue
+                const currentQueue = machineState.getOrderQueue();
+                const updatedQueue = currentQueue.filter(qItem => {
+                  if (updatedRecipe.orderId) {
+                    return qItem.orderId !== updatedRecipe.orderId;
+                  }
+                  return qItem.recipeName !== updatedRecipe.recipeName;
+                });
+                
+                if (updatedQueue.length < currentQueue.length) {
+                  machineState.setOrderQueue(updatedQueue);
+                  log.queue('queue_item_removed_on_completion', `Removed completed recipe from queue: ${updatedRecipe.recipeName}`, {
+                    recipeName: updatedRecipe.recipeName,
+                    removedCount: currentQueue.length - updatedQueue.length,
+                    remainingCount: updatedQueue.length,
+                  });
+                }
+                
+                // Update order status if it's an order
+                if (updatedRecipe.orderId) {
+                  try {
+                    db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('completed', updatedRecipe.orderId);
+                    log.operations('order_completed', `Order #${updatedRecipe.orderId} marked as completed`, {
+                      orderId: updatedRecipe.orderId,
+                    });
+                  } catch (orderErr) {
+                    log.error('system', 'order_status_update_error', orderErr, { orderId: updatedRecipe.orderId });
+                  }
+                }
+                
+                // Broadcast recipe completion
+                broadcast("recipe_completed", {
+                  recipeKey,
+                  recipeName: updatedRecipe.recipeName,
+                  completedBatches: updatedRecipe.requestedBatches,
+                  requestedBatches: updatedRecipe.requestedBatches,
+                  orderId: updatedRecipe.orderId || null,
+                  gate: g,
+                  gates: [],
+                  ts: tsIso,
+                });
+
+                // Automatic program transition: end the old program and start a new one
+                // so that each distinct recipe configuration is captured in its own program
+                const { handleBatchLimitProgramTransition } = require('./machine');
+                const transResult = handleBatchLimitProgramTransition(updatedRecipe.recipeName);
+                if (transResult) {
+                  broadcast("program_change", {
+                    action: 'batch_limit_transition',
+                    oldProgramId: transResult.oldProgramId,
+                    programId: transResult.newProgramId,
+                    ts: tsIso,
+                  });
+                }
+              }
+            } else if (machineState.shouldStartBatchLimitTransition(updatedRecipe)) {
+              // Recipe should start batch limit transitioning
+              // This happens when: completedBatches >= requestedBatches - numberOfGates
+              log.operations('batch_limit_threshold_reached', `Recipe ${updatedRecipe.recipeName} reached batch limit threshold`, {
+                recipeName: updatedRecipe.recipeName,
+                completedBatches: updatedRecipe.completedBatches,
+                requestedBatches: updatedRecipe.requestedBatches,
+                gates: updatedRecipe.gates,
+                threshold: updatedRecipe.requestedBatches - updatedRecipe.gates.length,
+              });
+              
+              machineState.startBatchLimitTransition(updatedRecipe);
+              
+              // Broadcast that transitioning has started
+              broadcast("batch_limit_transition_started", {
+                recipeKey,
+                recipeName: updatedRecipe.recipeName,
+                completedBatches: updatedRecipe.completedBatches,
+                requestedBatches: updatedRecipe.requestedBatches,
+                gates: updatedRecipe.gates,
+                ts: tsIso,
+              });
+            } else if (updatedRecipe.requestedBatches && updatedRecipe.completedBatches === updatedRecipe.requestedBatches) {
+              // Fallback: Recipe completed but wasn't in transitioning mode (single gate or edge case)
+              log.operations('recipe_completed', `Recipe ${updatedRecipe.recipeName} completed all batches`, {
+                recipeName: updatedRecipe.recipeName,
+                completedBatches: updatedRecipe.completedBatches,
+                requestedBatches: updatedRecipe.requestedBatches,
+                orderId: updatedRecipe.orderId || null,
+                gate: g,
+              });
+              
+              // AUTO-REMOVE: Server-side removal for reliability
+              const currentActiveRecipes = machineState.getActiveRecipes();
+              const updatedActiveRecipes = currentActiveRecipes.filter(r => {
+                const rKey = r.orderId 
+                  ? `order_${r.orderId}` 
+                  : `recipe_${(r.gates || []).slice().sort().join('_')}`;
+                return rKey !== recipeKey;
+              });
+              
+              if (updatedActiveRecipes.length < currentActiveRecipes.length) {
+                machineState.setActiveRecipes(updatedActiveRecipes);
+                log.operations('recipe_auto_removed', `Recipe ${updatedRecipe.recipeName} auto-removed after completing ${updatedRecipe.requestedBatches} batches`, {
+                  recipeName: updatedRecipe.recipeName,
+                  recipeKey,
+                  orderId: updatedRecipe.orderId || null,
+                });
+                
+                // Try to assign the freed gate(s) to queue
+                for (const freedGate of (updatedRecipe.gates || [])) {
+                  machineState.assignFreedGateToQueue(freedGate);
+                }
+                
+                // Remove from order queue
+                const currentQueue = machineState.getOrderQueue();
+                const updatedQueue = currentQueue.filter(qItem => {
+                  if (updatedRecipe.orderId) {
+                    return qItem.orderId !== updatedRecipe.orderId;
+                  }
+                  return qItem.recipeName !== updatedRecipe.recipeName;
+                });
+                
+                if (updatedQueue.length < currentQueue.length) {
+                  machineState.setOrderQueue(updatedQueue);
+                  log.queue('queue_item_removed_on_completion', `Removed completed recipe from queue: ${updatedRecipe.recipeName}`, {
+                    recipeName: updatedRecipe.recipeName,
+                    removedCount: currentQueue.length - updatedQueue.length,
+                    remainingCount: updatedQueue.length,
+                  });
+                }
+                
+                // Update order status if it's an order
+                if (updatedRecipe.orderId) {
+                  try {
+                    db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('completed', updatedRecipe.orderId);
+                    log.operations('order_completed', `Order #${updatedRecipe.orderId} marked as completed`, {
+                      orderId: updatedRecipe.orderId,
+                    });
+                  } catch (orderErr) {
+                    log.error('system', 'order_status_update_error', orderErr, { orderId: updatedRecipe.orderId });
+                  }
+                }
+              }
+              
+              // Broadcast recipe completion
+              broadcast("recipe_completed", {
+                recipeKey,
+                recipeName: updatedRecipe.recipeName,
+                completedBatches: updatedRecipe.completedBatches,
+                requestedBatches: updatedRecipe.requestedBatches,
+                orderId: updatedRecipe.orderId || null,
+                gate: g,
+                gates: updatedRecipe.gates || [],
+                ts: tsIso,
+              });
+
+              // Automatic program transition for non-batch-limit completions too
+              if (updatedActiveRecipes.length < currentActiveRecipes.length) {
+                const { handleBatchLimitProgramTransition } = require('./machine');
+                const transResult = handleBatchLimitProgramTransition(updatedRecipe.recipeName);
+                if (transResult) {
+                  broadcast("program_change", {
+                    action: 'batch_limit_transition',
+                    oldProgramId: transResult.oldProgramId,
+                    programId: transResult.newProgramId,
+                    ts: tsIso,
+                  });
+                }
+              }
+            }
+          }
+          
+          // Also increment order batch count if this gate has an associated order
+          // (recipeOnGate is already defined above from the order_id lookup)
+          if (recipeOnGate && recipeOnGate.orderId) {
+            try {
+              const order = orderRepo.incrementCompletedBatches(recipeOnGate.orderId);
+              if (order) {
+                log.operations('order_batch_completed', `Order ${order.id} batch completed`, {
+                  orderId: order.id,
+                  completedBatches: order.completed_batches,
+                  requestedBatches: order.requested_batches,
+                  gate: g,
+                });
+                
+                // Broadcast order batch update for real-time UI updates
+                broadcast("order_batch_update", {
+                  orderId: order.id,
+                  completedBatches: order.completed_batches,
+                  requestedBatches: order.requested_batches,
+                  recipeName: recipeOnGate.recipeName,
+                  ts: tsIso,
+                });
+                
+                // Check if order is complete
+                if (order.completed_batches >= order.requested_batches) {
+                  orderRepo.updateOrderStatus(order.id, orderRepo.ORDER_STATUS.COMPLETED);
+                  log.operations('order_completed', `Order ${order.id} completed all batches`, {
+                    orderId: order.id,
+                    completedBatches: order.completed_batches,
+                  });
+                  
+                  // Broadcast order completion
+                  broadcast("order_completed", { 
+                    orderId: order.id, 
+                    completedBatches: order.completed_batches,
+                    ts: tsIso 
+                  });
+                }
+              }
+            } catch (orderErr) {
+              log.error('system', 'order_batch_increment_error', orderErr, { 
+                orderId: recipeOnGate.orderId, 
+                gate: g 
+              });
+            }
+          }
           
         } catch (err) {
           log.error('system', 'batch_write_error', err, { gate: g });
         }
         
         // Complete gate transition if needed
-        if (isTransitioning) {
+        // Re-check current state: batch limit handling above may have already
+        // completed this gate via handleBatchLimitGateComplete → completeGateTransition
+        if (isTransitioning && machineState.getTransitioningGates().includes(g)) {
           machineState.completeGateTransition(g);
+          
+          // For normal transitions (not batch limit), assign freed gates to queue items
+          // as they become available (gate-by-gate, same as batch limit transitions)
+          const assignResult = machineState.assignFreedGateToQueue(g);
+          if (assignResult) {
+            // Clear the gate from completedTransitionGates so the receiving recipe
+            // doesn't appear as "LOCKED" on the frontend
+            const currentState = machineState.getState();
+            const cleanedCompleted = (currentState.completedTransitionGates || []).filter(cg => cg !== g);
+            if (cleanedCompleted.length !== (currentState.completedTransitionGates || []).length) {
+              machineState.updateState({ completedTransitionGates: cleanedCompleted });
+            }
+            
+            log.queue('normal_transition_gate_assigned', `Gate ${g} freed during normal transition, assigned to queue item`, {
+              gate: g,
+              result: assignResult,
+            });
+            broadcast("gate_handoff", {
+              gate: g,
+              recipeName: assignResult.recipe?.recipeName,
+              type: 'normal_transition',
+              ts: tsIso,
+            });
+          }
+          
           recipeManager.loadGateAssignments();
           
           if (!machineState.hasTransitioningGates()) {
@@ -256,6 +590,9 @@ router.post("/piece", verifyPlcSecret, async (req, res) => {
           ts: tsIso,
         }).catch(err => log.error('system', 'm2_write_error', err));
       }
+      
+      // Persist gate state to survive restarts/crashes
+      machineState.persistGateSnapshot();
     }
 
     res.json({ ok: true, piece_id });

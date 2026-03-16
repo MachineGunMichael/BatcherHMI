@@ -287,15 +287,69 @@ const Dashboard = () => {
     return map;
   }, [activeRecipes, transitionStartRecipes]);
 
-  // Helper to get display name for a recipe
-  const getDisplayName = (recipeName) => {
-    if (!recipeName || recipeName === "Total") return recipeName;
-    const displayName = recipeDisplayNames[recipeName];
-    return displayName || formatRecipeName(recipeName);
-  };
-
   // global toggles from AppContext
-  const { dashboardVisibleSeries, setDashboardVisibleSeries } = useAppContext();
+  const { dashboardVisibleSeries, setDashboardVisibleSeries, recipeOrderMap } = useAppContext();
+
+  // Build a lookup from recipeName to order info (handles composite keys)
+  // recipeOrderMap is now keyed by composite key (order_${orderId} or recipe_${gates})
+  // We need to build a reverse lookup from recipeName to the info
+  const recipeNameToOrderInfo = useMemo(() => {
+    const map = {};
+    if (!recipeOrderMap) return map;
+    
+    Object.entries(recipeOrderMap).forEach(([key, info]) => {
+      const recipeName = info.recipeName;
+      if (recipeName) {
+        // If there's already an entry for this recipeName, keep it as array
+        if (!map[recipeName]) {
+          map[recipeName] = [];
+        }
+        map[recipeName].push({ key, ...info });
+      }
+    });
+    return map;
+  }, [recipeOrderMap]);
+
+  // Helper to get display name for a recipe (with order bracket notation if applicable)
+  // Can receive either just recipeName (string) or an object with more info
+  const getDisplayName = (recipeNameOrObj, includeOrderInfo = true) => {
+    if (!recipeNameOrObj || recipeNameOrObj === "Total") return recipeNameOrObj;
+    
+    // Handle both string and object input
+    const recipeName = typeof recipeNameOrObj === 'string' 
+      ? recipeNameOrObj 
+      : recipeNameOrObj.recipeName || recipeNameOrObj.id;
+    
+    if (!recipeName || recipeName === "Total") return recipeName;
+    
+    // Get base display name
+    const displayName = recipeDisplayNames[recipeName] || formatRecipeName(recipeName);
+    
+    // Check if this recipe is associated with an order
+    if (includeOrderInfo && recipeNameToOrderInfo[recipeName]) {
+      const entries = recipeNameToOrderInfo[recipeName];
+      
+      // If only one entry, use it directly
+      if (entries.length === 1 && entries[0].orderId) {
+        const orderInfo = entries[0];
+        return `${displayName} (${orderInfo.customerName} - #${orderInfo.orderId})`;
+      }
+      
+      // If multiple entries, try to find the order one (has orderId)
+      const orderEntry = entries.find(e => e.orderId);
+      if (orderEntry) {
+        // Check if we can determine which one to use from the input object
+        if (typeof recipeNameOrObj === 'object' && recipeNameOrObj.orderId) {
+          return `${displayName} (${orderEntry.customerName} - #${orderEntry.orderId})`;
+        }
+        // If input is just a string and there's an order, show the order info
+        // (This is a fallback - ideally we'd pass the full object)
+        return `${displayName} (${orderEntry.customerName} - #${orderEntry.orderId})`;
+      }
+    }
+    
+    return displayName;
+  };
 
   const {
     mode,

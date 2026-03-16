@@ -41,7 +41,7 @@ function upsertProgramTotals(programId, delta) {
   });
 }
 
-function upsertRecipeTotals(programId, recipeId, delta) {
+function upsertRecipeTotals(programId, recipeId, delta, orderId = null) {
   const {
     total_batches = 0,
     total_batched_weight_g = 0,
@@ -51,12 +51,13 @@ function upsertRecipeTotals(programId, recipeId, delta) {
     total_items_rejected = 0,
   } = delta || {};
 
+  // Use composite key with order_id for proper separation of orders vs regular recipes
   db.prepare(`
     INSERT INTO recipe_stats
-      (program_id, recipe_id, total_batches, total_batched_weight_g, total_reject_weight_g,
+      (program_id, recipe_id, order_id, total_batches, total_batched_weight_g, total_reject_weight_g,
        total_giveaway_weight_g, total_items_batched, total_items_rejected, updated_at)
-    VALUES (@pid, @rid, @tb, @tbtw, @trw, @tg, @tib, @tir, CURRENT_TIMESTAMP)
-    ON CONFLICT(program_id, recipe_id) DO UPDATE SET
+    VALUES (@pid, @rid, @oid, @tb, @tbtw, @trw, @tg, @tib, @tir, CURRENT_TIMESTAMP)
+    ON CONFLICT(program_id, recipe_id, COALESCE(order_id, 0)) DO UPDATE SET
       total_batches             = total_batches + @tb,
       total_batched_weight_g    = total_batched_weight_g + @tbtw,
       total_reject_weight_g     = total_reject_weight_g + @trw,
@@ -65,7 +66,7 @@ function upsertRecipeTotals(programId, recipeId, delta) {
       total_items_rejected      = total_items_rejected + @tir,
       updated_at                = CURRENT_TIMESTAMP
   `).run({
-    pid: programId, rid: recipeId, tb: total_batches, tbtw: total_batched_weight_g,
+    pid: programId, rid: recipeId, oid: orderId, tb: total_batches, tbtw: total_batched_weight_g,
     trw: total_reject_weight_g, tg: total_giveaway_weight_g,
     tib: total_items_batched, tir: total_items_rejected,
   });

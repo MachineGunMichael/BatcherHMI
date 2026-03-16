@@ -1,19 +1,21 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useCallback } from "react";
 import {
   Box,
-  FormControl,
   Typography,
-  InputLabel,
-  Select,
-  MenuItem,
   useTheme,
   Paper,
+  Tabs,
+  Tab,
+  Autocomplete,
+  TextField,
 } from "@mui/material";
+import dayjs from "dayjs";
 import { ResponsiveBar } from "@nivo/bar";
 import { ResponsivePie } from "@nivo/pie";
 import { ResponsiveSunburst } from "@nivo/sunburst";
 import { ResponsiveBoxPlot } from "@nivo/boxplot";
 import { ResponsiveLine } from "@nivo/line";
+// eslint-disable-next-line no-unused-vars
 import { ResponsiveScatterPlot } from "@nivo/scatterplot";
 import { tokens } from "../../theme";
 import Header from "../../components/Header";
@@ -29,11 +31,39 @@ const Stats = () => {
   const isDarkMode = theme.palette.mode === 'dark';
   const { isConnected } = useMachineState();
 
+  // Tab state: 0 = Order View, 1 = Program View
+  const [activeTab, setActiveTab] = useState(() => {
+    return parseInt(localStorage.getItem('stats_active_tab') || '0');
+  });
+
+  // Program view state
   const [programs, setPrograms] = useState([]);
+  const [programDates, setProgramDates] = useState([]);
+  const [selectedProgramDate, setSelectedProgramDate] = useState(() => {
+    return localStorage.getItem('stats_selected_program_date') || null;
+  });
   const [selectedProgramId, setSelectedProgramId] = useState(() => {
-    // Initialize from localStorage if available
     return localStorage.getItem('stats_selected_program_id') || "";
   });
+
+  // Order view state
+  const [customers, setCustomers] = useState([]);
+  const [selectedCustomerId, setSelectedCustomerId] = useState(() => {
+    return localStorage.getItem('stats_selected_customer_id') || '';
+  });
+  const [orderDates, setOrderDates] = useState([]);
+  const [selectedOrderDate, setSelectedOrderDate] = useState(() => {
+    return localStorage.getItem('stats_selected_order_date') || null;
+  });
+  const [orderEntries, setOrderEntries] = useState([]);
+  const [selectedOrderEntry, setSelectedOrderEntry] = useState(() => {
+    try {
+      const stored = localStorage.getItem('stats_selected_order_entry');
+      return stored ? JSON.parse(stored) : null;
+    } catch { return null; }
+  });
+
+  // Shared stats state (used by both views)
   const [programStats, setProgramStats] = useState(null);
   const [recipeStats, setRecipeStats] = useState([]);
   const [assignments, setAssignments] = useState([]);
@@ -43,7 +73,7 @@ const Stats = () => {
   const [pieceWeights, setPieceWeights] = useState([]);
   const [loading, setLoading] = useState(true);
   const [visibleRecipes, setVisibleRecipes] = useState({});
-  const [allRecipes, setAllRecipes] = useState([]); // All recipes for display name lookup
+  const [allRecipes, setAllRecipes] = useState([]);
   
   // Separate visibility state for sunburst charts
   const [visiblePiecesCategories, setVisiblePiecesCategories] = useState({
@@ -111,10 +141,12 @@ const Stats = () => {
     borderRadius: '4px',
   };
 
-  // Load programs and recipes on mount
+  // Load data on mount
   useEffect(() => {
     fetchPrograms();
     fetchAllRecipes();
+    fetchProgramDates();
+    fetchCustomers();
     log.pageViewed('/stats');
   }, []);
 
@@ -133,6 +165,233 @@ const Stats = () => {
     }
   };
 
+  const fetchProgramDates = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/api/stats/programs-dates`, {
+        headers: getAuthHeaders()
+      });
+      if (response.ok) {
+        const data = await response.json();
+        setProgramDates(data || []);
+      }
+    } catch (error) {
+      console.error("Error fetching program dates:", error);
+    }
+  };
+
+  const fetchCustomers = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/api/customers`, {
+        headers: getAuthHeaders()
+      });
+      if (response.ok) {
+        const data = await response.json();
+        setCustomers(data.customers || []);
+      }
+    } catch (error) {
+      console.error("Error fetching customers:", error);
+    }
+  };
+
+  // Fetch order dates when customer changes
+  useEffect(() => {
+    if (activeTab !== 0) return;
+    const fetchDates = async () => {
+      try {
+        const params = new URLSearchParams();
+        if (selectedCustomerId) params.set('customer_id', selectedCustomerId);
+        const response = await fetch(`${API_BASE}/api/stats/orders/dates?${params}`, {
+          headers: getAuthHeaders()
+        });
+        if (response.ok) {
+          const data = await response.json();
+          setOrderDates(data || []);
+        }
+      } catch (error) {
+        console.error("Error fetching order dates:", error);
+      }
+    };
+    fetchDates();
+  }, [activeTab, selectedCustomerId]);
+
+  // Fetch order entries when date changes
+  useEffect(() => {
+    if (activeTab !== 0 || !selectedOrderDate) return;
+    const fetchEntries = async () => {
+      try {
+        const params = new URLSearchParams({ date: selectedOrderDate });
+        if (selectedCustomerId) params.set('customer_id', selectedCustomerId);
+        const response = await fetch(`${API_BASE}/api/stats/orders?${params}`, {
+          headers: getAuthHeaders()
+        });
+        if (response.ok) {
+          const data = await response.json();
+          setOrderEntries(data || []);
+        }
+      } catch (error) {
+        console.error("Error fetching order entries:", error);
+      }
+    };
+    fetchEntries();
+  }, [activeTab, selectedOrderDate, selectedCustomerId]);
+
+  // Fetch order details when an order entry is selected
+  const fetchOrderDetails = useCallback(async (entry) => {
+    if (!entry) return;
+    const rid = entry.recipe_id;
+    const pid = entry.program_id;
+    const orderParam = entry.order_id ? `?order_id=${entry.order_id}` : '';
+    const base = `${API_BASE}/api/stats/orders/${rid}/program/${pid}`;
+    const headers = getAuthHeaders();
+
+    try {
+      const [statsRes, assignRes, histRes, histogramRes, dwellRes, piecesRes] = await Promise.all([
+        fetch(`${base}${orderParam}`, { headers }),
+        fetch(`${base}/assignments${orderParam}`, { headers }),
+        fetch(`${base}/history${orderParam}`, { headers }),
+        fetch(`${base}/pieces-histogram${orderParam}`, { headers }),
+        fetch(`${base}/gate-dwell${orderParam}`, { headers }),
+        fetch(`${base}/pieces${orderParam}`, { headers }),
+      ]);
+
+      let statsData = null;
+      if (statsRes.ok) {
+        statsData = await statsRes.json();
+        setProgramStats(statsData);
+      }
+
+      let assignData = [];
+      if (assignRes.ok) {
+        const d = await assignRes.json();
+        assignData = d.assignments || [];
+        setAssignments(assignData);
+      }
+      if (histRes.ok) setHistoryData(await histRes.json());
+      if (histogramRes.ok) setPieceDistribution(await histogramRes.json());
+      else setPieceDistribution(null);
+      if (dwellRes.ok) setGateDwellData(await dwellRes.json());
+      else setGateDwellData(null);
+      if (piecesRes.ok) setPieceWeights(await piecesRes.json());
+      else setPieceWeights({ scatterPoints: [], trendLine: [] });
+
+      if (statsData) {
+        const batchedW = statsData.total_batched_weight_g || 0;
+        const giveawayW = statsData.total_giveaway_weight_g || 0;
+        const rejectW = statsData.total_reject_weight_g || 0;
+        setRecipeStats([{
+          recipe_name: statsData.recipe_name,
+          order_id: statsData.order_id,
+          customer_name: statsData.customer_name,
+          total_batches: statsData.total_batches,
+          total_batched_weight_g: batchedW,
+          total_reject_weight_g: rejectW,
+          total_giveaway_weight_g: giveawayW,
+          total_items_batched: statsData.total_items_batched,
+          total_items_rejected: statsData.total_items_rejected,
+          total_giveaway_pct: statsData.total_giveaway_pct || 0,
+          total_weight_processed_g: batchedW + giveawayW,
+          total_weight_g: batchedW + giveawayW + rejectW,
+          gates_assigned: assignData.map(a => a.gate).join(','),
+        }]);
+      }
+    } catch (error) {
+      console.error("Error fetching order details:", error);
+    }
+  }, []);
+
+  const handleTabChange = (_, newValue) => {
+    setActiveTab(newValue);
+    localStorage.setItem('stats_active_tab', String(newValue));
+    // Clear shared data then re-fetch for the new tab's selection
+    setProgramStats(null);
+    setRecipeStats([]);
+    setAssignments([]);
+    setPieceDistribution(null);
+    setGateDwellData(null);
+    setHistoryData(null);
+    setPieceWeights({ scatterPoints: [], trendLine: [] });
+    setVisibleRecipes({});
+
+    if (newValue === 1 && selectedProgramId) {
+      fetchProgramDetails(selectedProgramId);
+    } else if (newValue === 0 && selectedOrderEntry) {
+      fetchOrderDetails(selectedOrderEntry);
+    }
+  };
+
+  // Programs filtered by selected date
+  const filteredPrograms = useMemo(() => {
+    if (!selectedProgramDate) return programs;
+    return programs.filter(p => p.start_ts && p.start_ts.startsWith(selectedProgramDate));
+  }, [programs, selectedProgramDate]);
+
+  const formatTime = (ts) => {
+    if (!ts) return '';
+    const d = new Date(ts);
+    return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  };
+
+  const getOrderEntryDisplayName = (entry) => {
+    if (entry.order_id && entry.customer_name) {
+      return `${entry.customer_name} - #${entry.order_id}`;
+    }
+    const raw = entry.recipe_display_name || entry.order_display_name || entry.recipe_name || 'Unknown';
+    let formatted = raw;
+    if (formatted.startsWith("R_")) formatted = formatted.substring(2);
+    if (formatted.endsWith("_NA_0")) formatted = formatted.slice(0, -5);
+    return formatted;
+  };
+
+  const formatOrderLabel = (entry) => {
+    const name = getOrderEntryDisplayName(entry);
+    const start = formatTime(entry.first_batch);
+    const end = formatTime(entry.last_batch);
+    const batches = entry.total_batches != null ? `${entry.total_batches}` : '0';
+    return `${name}  |  ${start} → ${end}  |  ${batches} batches`;
+  };
+
+  const renderOrderOption = (props, entry) => {
+    const name = getOrderEntryDisplayName(entry);
+    const start = formatTime(entry.first_batch);
+    const end = formatTime(entry.last_batch);
+    const batches = entry.total_batches != null ? `${entry.total_batches}` : '0';
+    return (
+      <li {...props} key={`${entry.program_id}-${entry.recipe_id}-${entry.order_id || 0}`}>
+        <Box sx={{ display: 'flex', width: '100%', fontSize: '0.85rem', gap: 0, alignItems: 'center' }}>
+          <Box sx={{ minWidth: 280, flexShrink: 0 }}>{name}</Box>
+          <Box sx={{ minWidth: 100, flexShrink: 0, textAlign: 'center', color: 'text.secondary' }}>{start}</Box>
+          <Box sx={{ minWidth: 20, flexShrink: 0, textAlign: 'center', color: 'text.secondary' }}>→</Box>
+          <Box sx={{ minWidth: 100, flexShrink: 0, textAlign: 'center', color: 'text.secondary' }}>{end}</Box>
+          <Box sx={{ minWidth: 100, flexShrink: 0, textAlign: 'right', color: 'text.secondary', pl: 2 }}>{batches} batches</Box>
+        </Box>
+      </li>
+    );
+  };
+
+  const formatProgramLabel = (prog) => {
+    const start = formatTime(prog.start_ts);
+    const end = formatTime(prog.end_ts);
+    const batches = prog.total_batches != null ? `${prog.total_batches}` : '0';
+    return `${prog.name}  |  ${start} → ${end}  |  ${batches} batches`;
+  };
+
+  const renderProgramOption = (props, prog) => {
+    const start = formatTime(prog.start_ts);
+    const end = formatTime(prog.end_ts);
+    const batches = prog.total_batches != null ? `${prog.total_batches}` : '0';
+    return (
+      <li {...props} key={prog.id}>
+        <Box sx={{ display: 'flex', width: '100%', fontSize: '0.85rem', gap: 0, alignItems: 'center' }}>
+          <Box sx={{ minWidth: 320, flexShrink: 0 }}>{prog.name}</Box>
+          <Box sx={{ minWidth: 100, flexShrink: 0, textAlign: 'center', color: 'text.secondary' }}>{start}</Box>
+          <Box sx={{ minWidth: 20, flexShrink: 0, textAlign: 'center', color: 'text.secondary' }}>→</Box>
+          <Box sx={{ minWidth: 100, flexShrink: 0, textAlign: 'center', color: 'text.secondary' }}>{end}</Box>
+          <Box sx={{ minWidth: 100, flexShrink: 0, textAlign: 'right', color: 'text.secondary', pl: 2 }}>{batches} batches</Box>
+        </Box>
+      </li>
+    );
+  };
+
   // Build display name mapping from recipes
   const recipeDisplayNames = useMemo(() => {
     const map = {};
@@ -144,24 +403,73 @@ const Stats = () => {
     return map;
   }, [allRecipes]);
 
-  // Helper to get display name for a recipe (returns display_name if available, otherwise formatted name)
-  const getDisplayName = (recipeName) => {
+  // Build a lookup from recipe_name -> order info from assignments data
+  const recipeOrderInfoMap = useMemo(() => {
+    const map = {};
+    assignments.forEach(a => {
+      if (a.order_id && a.customer_name && !map[a.recipe_name]) {
+        map[a.recipe_name] = { order_id: a.order_id, customer_name: a.customer_name };
+      }
+    });
+    recipeStats.forEach(r => {
+      if (r.order_id && r.customer_name && !map[r.recipe_name]) {
+        map[r.recipe_name] = { order_id: r.order_id, customer_name: r.customer_name };
+      }
+    });
+    return map;
+  }, [assignments, recipeStats]);
+
+  // Helper to get display name for a recipe
+  // For orders: shows "Customer Name - #OrderId"
+  // For non-orders: shows display_name or formatted recipe name
+  const getDisplayName = (recipeOrName) => {
+    if (!recipeOrName) return '';
+    
+    const recipeName = typeof recipeOrName === 'string' ? recipeOrName : recipeOrName.recipe_name;
     if (!recipeName) return '';
+    
+    // Check for order info (from object or from lookup map)
+    const orderInfo = typeof recipeOrName === 'object' && recipeOrName.order_id
+      ? { order_id: recipeOrName.order_id, customer_name: recipeOrName.customer_name }
+      : recipeOrderInfoMap[recipeName];
+    
+    if (orderInfo?.order_id && orderInfo?.customer_name) {
+      return `${orderInfo.customer_name} - #${orderInfo.order_id}`;
+    }
+    
+    // Non-order: use display_name or formatted recipe name
     const displayName = recipeDisplayNames[recipeName];
-    if (displayName) return displayName;
-    // Format: remove R_ prefix and _NA_0 suffix for cleaner display
-    let formatted = recipeName;
-    if (formatted.startsWith("R_")) formatted = formatted.substring(2);
-    if (formatted.endsWith("_NA_0")) formatted = formatted.slice(0, -5);
+    let formatted = displayName || recipeName;
+    
+    if (!displayName) {
+      if (formatted.startsWith("R_")) formatted = formatted.substring(2);
+      if (formatted.endsWith("_NA_0")) formatted = formatted.slice(0, -5);
+    }
+    
     return formatted;
   };
+  
+  // Helper to generate unique key for recipe (for charts/lists when same recipe name can appear multiple times)
+  const getRecipeKey = (recipe) => {
+    if (typeof recipe === 'string') return recipe;
+    return recipe.order_id 
+      ? `order_${recipe.order_id}` 
+      : `recipe_${recipe.recipe_name}_${recipe.gates_assigned || 'unknown'}`;
+  };
 
-  // Load program details when selection changes
+  // Load program details when selection changes (also fires on mount with restored localStorage)
   useEffect(() => {
     if (selectedProgramId) {
       fetchProgramDetails(selectedProgramId);
     }
   }, [selectedProgramId]);
+
+  // Load order details when selection changes (also fires on mount with restored localStorage)
+  useEffect(() => {
+    if (selectedOrderEntry) {
+      fetchOrderDetails(selectedOrderEntry);
+    }
+  }, [selectedOrderEntry]);
 
   const getAuthHeaders = () => {
     const token = localStorage.getItem('token');
@@ -368,13 +676,9 @@ const Stats = () => {
     ].filter(item => item.value > 0);
   }, [programStats]);
 
-  const handleProgramChange = (event) => {
-    const programId = event.target.value;
+  const handleProgramChange = (programId) => {
     setSelectedProgramId(programId);
-    // Save to localStorage to persist across navigation
     localStorage.setItem('stats_selected_program_id', programId);
-    
-    // Log program selection
     const program = programs.find(p => String(p.id) === String(programId));
     if (program) {
       log.statsProgramSelected(programId, program.name);
@@ -390,12 +694,15 @@ const Stats = () => {
     return <Box m="20px"><Typography>Loading...</Typography></Box>;
   }
 
+  // Determine if we have a valid selection for displaying content
+  const hasActiveSelection = activeTab === 0 ? !!selectedOrderEntry : !!selectedProgramId;
+
   return (
     <Box m="20px">
       <Header title="Stats" subtitle="Historic Program & Recipe Analysis" />
 
       <Box 
-        mt="72px" 
+        mt="48px" 
         display="flex" 
         flexDirection="column" 
         gap={8}
@@ -407,45 +714,163 @@ const Stats = () => {
         }}
       >
         
-        {/* Program Selection */}
-            <Box>
-              <Typography
-                variant="h4"
-                fontWeight="bold"
-                sx={{ mb: 2, color: colors.tealAccent[500] }}
-              >
-            Program Selection
-              </Typography>
-              
-          <FormControl fullWidth sx={{ maxWidth: "500px" }}>
-            <InputLabel id="program-select-label" color="secondary">
-              Select Program
-                </InputLabel>
-                <Select
-              labelId="program-select-label"
-              value={selectedProgramId}
-              label="Select Program"
-              onChange={handleProgramChange}
-                  color="secondary"
-                >
-              {programs.map((prog) => (
-                <MenuItem key={prog.id} value={prog.id}>
-                  {prog.name}
-                    </MenuItem>
-                  ))}
-                </Select>
-              </FormControl>
-            </Box>
+        {/* Tab Selector */}
+        <Box>
+          <Tabs
+            value={activeTab}
+            onChange={handleTabChange}
+            sx={{
+              mb: 3,
+              ml: -1,
+              '& .MuiTab-root': {
+                fontWeight: 'bold',
+                fontSize: '14px',
+                textTransform: 'none',
+                minWidth: 140,
+                color: colors.grey[500],
+              },
+              '& .Mui-selected': {
+                color: `${colors.tealAccent[500]} !important`,
+              },
+              '& .MuiTabs-indicator': {
+                backgroundColor: colors.tealAccent[500],
+                height: 3,
+                borderRadius: '3px 3px 0 0',
+              },
+            }}
+          >
+            <Tab label="Order View" />
+            <Tab label="Program View" />
+          </Tabs>
 
-        {/* Program Information - Only show when program is selected */}
-        {selectedProgramId && assignments.length > 0 && (
+          {/* Order View Selection */}
+          {activeTab === 0 && (
+            <Box display="flex" gap={2} alignItems="flex-start" flexWrap="wrap">
+              <Autocomplete
+                options={[{ id: '', name: 'All Customers' }, ...customers]}
+                getOptionLabel={(option) => option.name || ''}
+                value={
+                  selectedCustomerId
+                    ? customers.find(c => String(c.id) === String(selectedCustomerId)) || null
+                    : { id: '', name: 'All Customers' }
+                }
+                onChange={(_, newValue) => {
+                  const val = newValue?.id ? String(newValue.id) : '';
+                  setSelectedCustomerId(val);
+                  localStorage.setItem('stats_selected_customer_id', val);
+                  setSelectedOrderDate(null);
+                  localStorage.removeItem('stats_selected_order_date');
+                  setSelectedOrderEntry(null);
+                  localStorage.removeItem('stats_selected_order_entry');
+                }}
+                isOptionEqualToValue={(option, value) => String(option.id) === String(value.id)}
+                renderInput={(params) => (
+                  <TextField {...params} label="Customer" color="secondary" size="small" />
+                )}
+                sx={{ minWidth: 220 }}
+                disableClearable
+                size="small"
+              />
+
+              <Autocomplete
+                options={orderDates}
+                getOptionLabel={(d) => d ? dayjs(d).format('ddd, MMM D, YYYY') : ''}
+                value={selectedOrderDate}
+                onChange={(_, newValue) => {
+                  setSelectedOrderDate(newValue);
+                  if (newValue) localStorage.setItem('stats_selected_order_date', newValue);
+                  else localStorage.removeItem('stats_selected_order_date');
+                  setSelectedOrderEntry(null);
+                  localStorage.removeItem('stats_selected_order_entry');
+                }}
+                renderInput={(params) => (
+                  <TextField {...params} label="Date" color="secondary" size="small" />
+                )}
+                sx={{ minWidth: 220 }}
+                size="small"
+              />
+
+              {selectedOrderDate && (
+                <Autocomplete
+                  options={orderEntries}
+                  getOptionLabel={(entry) => formatOrderLabel(entry)}
+                  renderOption={renderOrderOption}
+                  value={selectedOrderEntry}
+                  onChange={(_, newValue) => {
+                    setSelectedOrderEntry(newValue);
+                    if (newValue) {
+                      localStorage.setItem('stats_selected_order_entry', JSON.stringify(newValue));
+                    } else {
+                      localStorage.removeItem('stats_selected_order_entry');
+                    }
+                  }}
+                  isOptionEqualToValue={(a, b) =>
+                    a.order_id === b.order_id && a.recipe_id === b.recipe_id && a.program_id === b.program_id
+                  }
+                  renderInput={(params) => (
+                    <TextField {...params} label="Select Order / Recipe" color="secondary" size="small" />
+                  )}
+                  sx={{ minWidth: 400, flex: 1 }}
+                  componentsProps={{ popper: { sx: { minWidth: 700 } } }}
+                  size="small"
+                />
+              )}
+            </Box>
+          )}
+
+          {/* Program View Selection */}
+          {activeTab === 1 && (
+            <Box display="flex" gap={2} alignItems="flex-start" flexWrap="wrap">
+              <Autocomplete
+                options={programDates}
+                getOptionLabel={(d) => d ? dayjs(d).format('ddd, MMM D, YYYY') : ''}
+                value={selectedProgramDate}
+                onChange={(_, newValue) => {
+                  setSelectedProgramDate(newValue);
+                  if (newValue) localStorage.setItem('stats_selected_program_date', newValue);
+                  else localStorage.removeItem('stats_selected_program_date');
+                  setSelectedProgramId('');
+                  localStorage.removeItem('stats_selected_program_id');
+                }}
+                renderInput={(params) => (
+                  <TextField {...params} label="Date" color="secondary" size="small" />
+                )}
+                sx={{ minWidth: 220 }}
+                size="small"
+              />
+
+              {selectedProgramDate && (
+                <Autocomplete
+                  options={filteredPrograms}
+                  getOptionLabel={(prog) => formatProgramLabel(prog)}
+                  renderOption={renderProgramOption}
+                  value={filteredPrograms.find(p => String(p.id) === String(selectedProgramId)) || null}
+                  onChange={(_, newValue) => {
+                    if (newValue) handleProgramChange(newValue.id);
+                    else setSelectedProgramId('');
+                  }}
+                  isOptionEqualToValue={(a, b) => String(a.id) === String(b.id)}
+                  renderInput={(params) => (
+                    <TextField {...params} label="Select Program" color="secondary" size="small" />
+                  )}
+                  componentsProps={{ popper: { sx: { minWidth: 700 } } }}
+                  sx={{ minWidth: 400, flex: 1 }}
+                  size="small"
+                />
+              )}
+            </Box>
+          )}
+        </Box>
+
+        {/* Program/Order Information - Only show when a selection is active */}
+        {hasActiveSelection && assignments.length > 0 && (
               <Box>
                 <Typography
                   variant="h4"
                   fontWeight="bold"
                   sx={{ mb: 1, color: colors.tealAccent[500] }}
                 >
-                  Program Information
+                  {activeTab === 0 ? 'Order Information' : 'Program Information'}
                 </Typography>
                 
                 {/* Time Range Display */}
@@ -581,15 +1006,15 @@ const Stats = () => {
           </Box>
         )}
 
-        {/* Program Total Stats */}
-        {selectedProgramId && programStats && (
+        {/* Program/Order Total Stats */}
+        {hasActiveSelection && programStats && (
           <Box>
               <Typography
                 variant="h4"
                 fontWeight="bold"
                 sx={{ mb: 2, color: colors.tealAccent[500] }}
               >
-              Program Stats
+              {activeTab === 0 ? 'Order Stats' : 'Program Stats'}
               </Typography>
               
             <Box 
@@ -784,7 +1209,7 @@ const Stats = () => {
         )}
 
         {/* Recipe Total Stats */}
-        {selectedProgramId && recipeStats.length > 0 && (
+        {hasActiveSelection && recipeStats.length > 0 && (
           <Box>
             <Box mb="20px">
                   <Typography
@@ -829,19 +1254,19 @@ const Stats = () => {
                     <Box display="flex" alignItems="center" gap={1}>
                       <span style={{ color: colors.tealAccent[500], minWidth: '20px', display: 'inline-block' }}>✓</span>
                       <Typography variant="body1" sx={{ color: colors.primary[800] }}>
-                        Recipe <strong>{getDisplayName(mostBatchesRecipe.recipe_name)}</strong> processed <strong>{mostBatchesPercent}%</strong> of all batches
+                        Recipe <strong>{getDisplayName(mostBatchesRecipe)}</strong> processed <strong>{mostBatchesPercent}%</strong> of all batches
                       </Typography>
                     </Box>
                     <Box display="flex" alignItems="center" gap={1}>
                       <span style={{ color: colors.redAccent[500], minWidth: '20px', display: 'inline-block' }}>⚠</span>
                       <Typography variant="body1" sx={{ color: colors.primary[800] }}>
-                        Recipe <strong>{getDisplayName(highestGiveawayRecipe.recipe_name)}</strong> has highest giveaway at <strong>{(highestGiveawayRecipe.total_giveaway_pct || 0).toFixed(2)}%</strong>
+                        Recipe <strong>{getDisplayName(highestGiveawayRecipe)}</strong> has highest giveaway at <strong>{(highestGiveawayRecipe.total_giveaway_pct || 0).toFixed(2)}%</strong>
                       </Typography>
                     </Box>
                     <Box display="flex" alignItems="center" gap={1}>
                       <span style={{ color: colors.tealAccent[500], minWidth: '20px', display: 'inline-block' }}>✓</span>
                       <Typography variant="body1" sx={{ color: colors.primary[800] }}>
-                        Recipe <strong>{getDisplayName(mostPiecesRecipe.recipe_name)}</strong> processed the most pieces at <strong>{mostPiecesCount}</strong> pieces
+                        Recipe <strong>{getDisplayName(mostPiecesRecipe)}</strong> processed the most pieces at <strong>{mostPiecesCount}</strong> pieces
                       </Typography>
                     </Box>
                   </Box>
@@ -906,7 +1331,7 @@ const Stats = () => {
                           sx={{ backgroundColor: recipeColor, flexShrink: 0 }} 
                         />
                         <Typography variant="body2" color={colors.primary[800]} >
-                          {getDisplayName(recipe.recipe_name)}
+                          {getDisplayName(recipe)}
                         </Typography>
                       </Box>
                     );
@@ -924,7 +1349,7 @@ const Stats = () => {
                     data={recipeStats
                       .filter(r => visibleRecipes[r.recipe_name] !== false)
                       .map(r => ({
-                        recipe: getDisplayName(r.recipe_name),
+                        recipe: getDisplayName(r),
                         value: r.total_batches,
                         recipeColor: recipeColorMap[r.recipe_name] || colors.grey[500]
                       }))}
@@ -977,7 +1402,7 @@ const Stats = () => {
                       .map(r => {
                         const avgWeight = r.total_batches > 0 ? (r.total_weight_processed_g / r.total_batches) : 0;
                         return {
-                          recipe: getDisplayName(r.recipe_name),
+                          recipe: getDisplayName(r),
                           value: avgWeight,
                           recipeColor: recipeColorMap[r.recipe_name] || colors.grey[500]
                         };
@@ -1029,7 +1454,7 @@ const Stats = () => {
                     data={recipeStats
                       .filter(r => visibleRecipes[r.recipe_name] !== false)
                       .map(r => ({
-                        recipe: getDisplayName(r.recipe_name),
+                        recipe: getDisplayName(r),
                         value: r.total_batches > 0 ? (r.total_items_batched / r.total_batches) : 0,
                         recipeColor: recipeColorMap[r.recipe_name] || colors.grey[500]
                       }))}
@@ -1096,8 +1521,8 @@ const Stats = () => {
                     data={recipeStats
                       .filter(r => visibleRecipes[r.recipe_name] !== false && r.total_giveaway_pct != null)
                       .map(r => ({
-                        id: getDisplayName(r.recipe_name),
-                        label: getDisplayName(r.recipe_name),
+                        id: getDisplayName(r),
+                        label: getDisplayName(r),
                         value: r.total_giveaway_pct || 0,
                         color: recipeColorMap[r.recipe_name] || colors.grey[500]
                       }))}
@@ -1227,7 +1652,7 @@ const Stats = () => {
                           
                           // Add an "inner ring" entry for this recipe
                           // Children ALWAYS present - hidden ones use background color for "gap" effect
-                          const displayName = getDisplayName(r.recipe_name);
+                          const displayName = getDisplayName(r);
                           outerRingSegments.push({
                             name: displayName,
                             color: baseColor,
@@ -1418,7 +1843,7 @@ const Stats = () => {
                           const batchedValue = r.total_batched_weight_g || 0;
                           const rejectedValue = r.total_reject_weight_g || 0;
                           const giveawayValue = r.total_giveaway_weight_g || 0;
-                          const displayName = getDisplayName(r.recipe_name);
+                          const displayName = getDisplayName(r);
                           
                           // Children ALWAYS present - hidden ones use background color for "gap" effect
                           const children = [
@@ -1492,7 +1917,7 @@ const Stats = () => {
         )}
 
         {/* Recipe History Section */}
-        {selectedProgramId && historyData && Object.keys(historyData.batches || {}).length > 0 && (() => {
+        {hasActiveSelection && historyData && Object.keys(historyData.batches || {}).length > 0 && (() => {
           // Transform InfluxDB data for Nivo Line charts
           // historyData.batches: { recipeName: [{t: timestamp_ms, v: value}, ...], ... }
           // historyData.weight: { recipeName: [{t: timestamp_ms, v: value}, ...], ... }
@@ -1810,7 +2235,7 @@ const Stats = () => {
         })()}
 
         {/* Gate Dwell Time Section */}
-        {selectedProgramId && gateDwellData && gateDwellData.length > 0 && (() => {
+        {hasActiveSelection && gateDwellData && gateDwellData.length > 0 && (() => {
           // Filter gate data based on visible recipes
           const filteredGateDwellData = gateDwellData.filter(({ recipe_name }) => 
             visibleRecipes[recipe_name] !== false

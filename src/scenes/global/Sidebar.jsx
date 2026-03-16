@@ -8,6 +8,8 @@ import SimulationIcon from '@mui/icons-material/ShapeLineOutlined';
 import DashboardIcon from '@mui/icons-material/DashboardOutlined';
 import PlanAssistIcon from '@mui/icons-material/MoreTimeOutlined';
 import StatsIcon from '@mui/icons-material/BarChartOutlined';
+import OrdersIcon from '@mui/icons-material/ShoppingCartOutlined';
+import AdminIcon from '@mui/icons-material/AdminPanelSettingsOutlined';
 // import MenuOutlinedIcon from "@mui/icons-material/MenuOutlined";
 import HomeOutlinedIcon from '@mui/icons-material/HomeOutlined';
 // import PeopleOutlinedIcon from '@mui/icons-material/PeopleOutlined';
@@ -58,6 +60,10 @@ const Sidebar = () => {
         return <PlanAssistIcon />;
       case 'setup':
         return <SettingsIcon />;
+      case 'orders':
+        return <OrdersIcon />;
+      case 'admin':
+        return <AdminIcon />;
       default:
         return <HomeOutlinedIcon />;
     }

@@ -2,6 +2,8 @@ import Dashboard from "../scenes/dashboard";
 import Setup from "../scenes/setup";
 import PlanAssist from "../scenes/planAssist";
 import Stats from "../scenes/stats";
+import Orders from "../scenes/orders";
+import Admin from "../scenes/admin";
 
 // Define all available routes with their metadata
 export const ROUTES = {
@@ -28,6 +30,18 @@ export const ROUTES = {
     name: "Stats",
     component: Stats,
     icon: "stats"
+  },
+  ORDERS: {
+    path: "/orders",
+    name: "Orders",
+    component: Orders,
+    icon: "orders"
+  },
+  ADMIN: {
+    path: "/admin",
+    name: "Admin",
+    component: Admin,
+    icon: "admin"
   }
 };
 
@@ -38,6 +52,8 @@ export const ROLE_ROUTES = {
     ROUTES.SETUP,
     ROUTES.STATS,
     ROUTES.PLAN_ASSIST,
+    ROUTES.ORDERS,
+    ROUTES.ADMIN,
   ],
   manager: [
     ROUTES.DASHBOARD,
@@ -46,6 +62,9 @@ export const ROLE_ROUTES = {
   operator: [
     ROUTES.DASHBOARD,
     ROUTES.SETUP
+  ],
+  customer: [
+    ROUTES.ORDERS,
   ]
 };
 

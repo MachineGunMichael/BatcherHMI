@@ -301,6 +301,22 @@ function buildColorMap(recipeNames, PALETTE, totalColor, activeRecipes = [], tra
           }
         }
         
+        // For incoming recipes from queue (batch limit transition) with no gates yet,
+        // find the finishing recipe and inherit its slot color
+        if (inheritedSlot < 0 && recipe._isIncomingFromQueue) {
+          const finishingRecipe = activeRecipes.find(r => 
+            r.batchLimitTransitioning || r.isFinishing
+          );
+          if (finishingRecipe) {
+            const finishingSlot = programStartRecipes.findIndex(p => 
+              p.recipeName === finishingRecipe.recipeName
+            );
+            if (finishingSlot >= 0) {
+              inheritedSlot = finishingSlot;
+            }
+          }
+        }
+        
         if (inheritedSlot >= 0) {
           // Inherit the color from the slot it replaced
           map[recipe.recipeName] = PALETTE[inheritedSlot % PALETTE.length];

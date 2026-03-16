@@ -24,8 +24,15 @@ export function AppContextProvider({ children }) {
   const [settingsMode, setSettingsModeState] = useState("preset");
   const [assignedPrograms, setAssignedProgramsState] = useState([]);
   
-  // Assigned Recipes (shared between Setup and MachineControls)
+  // Assigned Recipes (queue - shared between Setup and MachineControls)
   const [assignedRecipes, setAssignedRecipesState] = useState([]);
+  
+  // Active Recipes (currently running on gates - includes order info)
+  const [activeRecipes, setActiveRecipesState] = useState([]);
+  
+  // Recipe to Order mapping (for displaying order info on Dashboard)
+  // { recipeName: { orderId, customerName, requestedBatches, completedBatches, status } }
+  const [recipeOrderMap, setRecipeOrderMapState] = useState({});
 
   // Load persisted data on mount
   useEffect(() => {
@@ -64,10 +71,20 @@ export function AppContextProvider({ children }) {
       }
     } catch (error) { /* ignore */ }
     
+    // Note: assignedRecipes (order queue) is now loaded from backend database
+    // in the Setup component, not from localStorage
+    
     try {
-      const assignedRecipesData = localStorage.getItem('assignedRecipes');
-      if (assignedRecipesData) {
-        setAssignedRecipesState(JSON.parse(assignedRecipesData));
+      const activeRecipesData = localStorage.getItem('activeRecipes');
+      if (activeRecipesData) {
+        setActiveRecipesState(JSON.parse(activeRecipesData));
+      }
+    } catch (error) { /* ignore */ }
+    
+    try {
+      const recipeOrderMapData = localStorage.getItem('recipeOrderMap');
+      if (recipeOrderMapData) {
+        setRecipeOrderMapState(JSON.parse(recipeOrderMapData));
       }
     } catch (error) { /* ignore */ }
   }, []);
@@ -128,19 +145,46 @@ export function AppContextProvider({ children }) {
     }
   };
   
+  // Note: Order queue (assignedRecipes) is now persisted to backend database
+  // by the Setup component, not to localStorage
   const setAssignedRecipes = (value) => {
     if (typeof value === 'function') {
-      setAssignedRecipesState(prev => {
+      setAssignedRecipesState(prev => value(prev));
+    } else {
+      setAssignedRecipesState(value);
+    }
+  };
+  
+  const setActiveRecipes = (value) => {
+    if (typeof value === 'function') {
+      setActiveRecipesState(prev => {
         const updated = value(prev);
         try {
-          localStorage.setItem('assignedRecipes', JSON.stringify(updated));
+          localStorage.setItem('activeRecipes', JSON.stringify(updated));
         } catch (error) { /* ignore */ }
         return updated;
       });
     } else {
-      setAssignedRecipesState(value);
+      setActiveRecipesState(value);
       try {
-        localStorage.setItem('assignedRecipes', JSON.stringify(value));
+        localStorage.setItem('activeRecipes', JSON.stringify(value));
+      } catch (error) { /* ignore */ }
+    }
+  };
+  
+  const setRecipeOrderMap = (value) => {
+    if (typeof value === 'function') {
+      setRecipeOrderMapState(prev => {
+        const updated = value(prev);
+        try {
+          localStorage.setItem('recipeOrderMap', JSON.stringify(updated));
+        } catch (error) { /* ignore */ }
+        return updated;
+      });
+    } else {
+      setRecipeOrderMapState(value);
+      try {
+        localStorage.setItem('recipeOrderMap', JSON.stringify(value));
       } catch (error) { /* ignore */ }
     }
   };
@@ -166,9 +210,17 @@ export function AppContextProvider({ children }) {
     assignedPrograms,
     setAssignedPrograms,
     
-    // Assigned Recipes (shared between Setup and MachineControls)
+    // Assigned Recipes (queue - shared between Setup and MachineControls)
     assignedRecipes,
     setAssignedRecipes,
+    
+    // Active Recipes (currently running on gates - includes order info)
+    activeRecipes,
+    setActiveRecipes,
+    
+    // Recipe to Order mapping (for Dashboard display)
+    recipeOrderMap,
+    setRecipeOrderMap,
   };
 
   return (
@@ -204,6 +256,10 @@ export function useAppContext() {
       setAssignedPrograms: () => {},
       assignedRecipes: [],
       setAssignedRecipes: () => {},
+      activeRecipes: [],
+      setActiveRecipes: () => {},
+      recipeOrderMap: {},
+      setRecipeOrderMap: () => {},
     };
   }
   return context;

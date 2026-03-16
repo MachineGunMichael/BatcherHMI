@@ -23,9 +23,10 @@ function createBaseSchema() {
       id            INTEGER PRIMARY KEY AUTOINCREMENT,
       username      TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
-      role          TEXT NOT NULL CHECK(role IN ('admin','manager','operator')),
+      role          TEXT NOT NULL CHECK(role IN ('admin','manager','operator','customer')),
       name          TEXT NOT NULL,
       permissions   TEXT,
+      customer_id   INTEGER REFERENCES customers(id) ON DELETE SET NULL,
       created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
@@ -248,10 +249,12 @@ function createStatisticsSchema() {
   }
 
   run(`
-    -- Totals per (program, recipe)
+    -- Totals per (program, recipe, order)
+    -- order_id allows tracking stats separately for orders vs regular recipes with same recipe_id
     CREATE TABLE IF NOT EXISTS recipe_stats (
       program_id INTEGER NOT NULL,
       recipe_id  INTEGER NOT NULL,
+      order_id   INTEGER,                                       -- NULL for regular recipes, set for orders
       total_batches INTEGER NOT NULL DEFAULT 0,                -- (1)
       total_batched_weight_g INTEGER NOT NULL DEFAULT 0,       -- (2)
       total_reject_weight_g INTEGER NOT NULL DEFAULT 0,        -- (3)
@@ -259,10 +262,42 @@ function createStatisticsSchema() {
       total_items_batched INTEGER NOT NULL DEFAULT 0,          -- (7)
       total_items_rejected INTEGER NOT NULL DEFAULT 0,         -- (8)
       updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (program_id, recipe_id),
+      PRIMARY KEY (program_id, recipe_id, COALESCE(order_id, 0)),
       FOREIGN KEY (program_id) REFERENCES programs(id) ON DELETE CASCADE,
-      FOREIGN KEY (recipe_id)  REFERENCES recipes(id)  ON DELETE CASCADE
+      FOREIGN KEY (recipe_id)  REFERENCES recipes(id)  ON DELETE CASCADE,
+      FOREIGN KEY (order_id)   REFERENCES orders(id)   ON DELETE SET NULL
     );
+  `);
+
+  // Migration: Add order_id column to recipe_stats if it doesn't exist
+  const recipeStatsColumns = db.prepare("PRAGMA table_info(recipe_stats)").all();
+  if (!recipeStatsColumns.find(c => c.name === 'order_id')) {
+    console.log('[SQLite] Adding order_id column to recipe_stats table...');
+    run(`ALTER TABLE recipe_stats ADD COLUMN order_id INTEGER;`);
+  }
+
+  // Migration: Add order_id column to batch_completions if it doesn't exist
+  const batchCompletionsColumns = db.prepare("PRAGMA table_info(batch_completions)").all();
+  if (!batchCompletionsColumns.find(c => c.name === 'order_id')) {
+    console.log('[SQLite] Adding order_id column to batch_completions table...');
+    run(`ALTER TABLE batch_completions ADD COLUMN order_id INTEGER;`);
+    run(`CREATE INDEX IF NOT EXISTS idx_batch_completions_order ON batch_completions(order_id);`);
+  }
+
+  // Migration: Add gates_assigned column to recipe_stats if it doesn't exist
+  const recipeStatsColumnsAll = db.prepare("PRAGMA table_info(recipe_stats)").all();
+  if (!recipeStatsColumnsAll.find(c => c.name === 'gates_assigned')) {
+    console.log('[SQLite] Adding gates_assigned column to recipe_stats table...');
+    run(`ALTER TABLE recipe_stats ADD COLUMN gates_assigned TEXT DEFAULT '';`);
+  }
+
+  // Migration: Add completed column to recipe_stats (1 = recipe finished its run, 0 = still active when program ended)
+  if (!recipeStatsColumnsAll.find(c => c.name === 'completed')) {
+    console.log('[SQLite] Adding completed column to recipe_stats table...');
+    run(`ALTER TABLE recipe_stats ADD COLUMN completed INTEGER NOT NULL DEFAULT 1;`);
+  }
+
+  run(`
 
     -- Gate dwell accumulators (min/max/avg/std via Welford)
     CREATE TABLE IF NOT EXISTS gate_dwell_accumulators (
@@ -278,6 +313,18 @@ function createStatisticsSchema() {
       FOREIGN KEY (program_id) REFERENCES programs(id) ON DELETE CASCADE
     );
 
+    -- Individual gate dwell times (per-batch inter-arrival times for boxplot visualization)
+    CREATE TABLE IF NOT EXISTS gate_dwell_times (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      program_id      INTEGER NOT NULL,
+      gate_number     INTEGER NOT NULL,
+      dwell_time_sec  REAL    NOT NULL,
+      batch_timestamp TEXT,
+      FOREIGN KEY (program_id) REFERENCES programs(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_gate_dwell_program ON gate_dwell_times(program_id);
+    CREATE INDEX IF NOT EXISTS idx_gate_dwell_gate ON gate_dwell_times(program_id, gate_number);
+
     -- Batch completions (single source of truth for batch events)
     CREATE TABLE IF NOT EXISTS batch_completions (
       id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -286,13 +333,16 @@ function createStatisticsSchema() {
       pieces       INTEGER NOT NULL,
       weight_g     REAL NOT NULL,
       recipe_id    INTEGER NOT NULL,
+      order_id     INTEGER,                    -- NULL for regular recipes, set for orders
       program_id   INTEGER,
       created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (recipe_id) REFERENCES recipes(id) ON DELETE CASCADE,
+      FOREIGN KEY (order_id)  REFERENCES orders(id)  ON DELETE SET NULL,
       FOREIGN KEY (program_id) REFERENCES programs(id) ON DELETE SET NULL
     );
     CREATE INDEX IF NOT EXISTS idx_batch_completions_time ON batch_completions(completed_at);
     CREATE INDEX IF NOT EXISTS idx_batch_completions_gate ON batch_completions(gate);
+    CREATE INDEX IF NOT EXISTS idx_batch_completions_order ON batch_completions(order_id);
     
     -- M3 KPI tables (per-minute data, migrated from InfluxDB to SQLite)
     CREATE TABLE IF NOT EXISTS kpi_minute_recipes (
@@ -386,7 +436,9 @@ function createStatisticsSchema() {
     SELECT
       rs.program_id,
       r.name AS recipe_name,
-      COALESCE(g.gates_assigned, '') AS gates_assigned,
+      COALESCE(g.gates_assigned, rs.gates_assigned, '') AS gates_assigned,
+      rs.order_id,                                             -- For composite key
+      c.name AS customer_name,                                 -- Customer name for orders
       rs.total_batches,                                        -- (1)
       rs.total_batched_weight_g,                               -- (2)
       rs.total_reject_weight_g,                                -- (3)
@@ -408,7 +460,9 @@ function createStatisticsSchema() {
       rs.updated_at
     FROM recipe_stats rs
     JOIN recipes r ON r.id = rs.recipe_id
-    LEFT JOIN gates g ON g.program_id = rs.program_id AND g.recipe_id = rs.recipe_id;
+    LEFT JOIN gates g ON g.program_id = rs.program_id AND g.recipe_id = rs.recipe_id
+    LEFT JOIN orders o ON o.id = rs.order_id
+    LEFT JOIN customers c ON c.id = o.customer_id;
 
     -- Lightweight alias view used by CSV export
     DROP VIEW IF EXISTS recipe_stats_report;
@@ -501,6 +555,15 @@ function createMachineStateSchema() {
   if (!columnExists('machine_state', 'registered_transitioning_gates')) {
     run(`ALTER TABLE machine_state ADD COLUMN registered_transitioning_gates TEXT DEFAULT '[]';`);
   }
+  if (!columnExists('machine_state', 'order_queue')) {
+    run(`ALTER TABLE machine_state ADD COLUMN order_queue TEXT DEFAULT '[]';`);
+  }
+  if (!columnExists('machine_state', 'gate_snapshot')) {
+    run(`ALTER TABLE machine_state ADD COLUMN gate_snapshot TEXT DEFAULT '[]';`);
+  }
+  if (!columnExists('machine_state', 'paused_gates')) {
+    run(`ALTER TABLE machine_state ADD COLUMN paused_gates TEXT DEFAULT '[]';`);
+  }
   
   console.log('✅ Machine state schema created.');
 }
@@ -541,6 +604,183 @@ function createSavedProgramsSchema() {
   console.log('✅ Saved programs schema created.');
 }
 
+/* --------- customers and orders schema --------- */
+function createCustomersAndOrdersSchema() {
+  // Customers table
+  run(`
+    CREATE TABLE IF NOT EXISTS customers (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      name          TEXT NOT NULL,
+      address       TEXT,
+      contact_email TEXT,
+      contact_phone TEXT,
+      notes         TEXT,
+      created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TRIGGER IF NOT EXISTS trg_customers_updated_at
+    AFTER UPDATE ON customers FOR EACH ROW BEGIN
+      UPDATE customers SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
+    END;
+  `);
+  
+  // Link users to customers (for customer accounts)
+  if (!columnExists('users', 'customer_id')) {
+    run(`ALTER TABLE users ADD COLUMN customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL;`);
+    console.log('Added users.customer_id');
+  }
+  
+  // Orders table
+  run(`
+    CREATE TABLE IF NOT EXISTS orders (
+      id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+      customer_id           INTEGER NOT NULL,
+      recipe_id             INTEGER NOT NULL,
+      
+      -- Original configuration (from recipe)
+      piece_min_weight_g    REAL NOT NULL,
+      piece_max_weight_g    REAL NOT NULL,
+      batch_min_weight_g    REAL,
+      batch_max_weight_g    REAL,
+      batch_type            TEXT CHECK(batch_type IN ('NA', 'min', 'max', 'exact')),
+      batch_value           INTEGER,
+      
+      -- Production configuration (can be altered during production)
+      prod_piece_min_weight_g    REAL,
+      prod_piece_max_weight_g    REAL,
+      prod_batch_min_weight_g    REAL,
+      prod_batch_max_weight_g    REAL,
+      prod_batch_type            TEXT CHECK(prod_batch_type IN ('NA', 'min', 'max', 'exact')),
+      prod_batch_value           INTEGER,
+      
+      -- Order details
+      requested_batches     INTEGER NOT NULL,
+      completed_batches     INTEGER NOT NULL DEFAULT 0,
+      
+      -- Dates
+      created_at            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      due_date              DATETIME,
+      
+      -- Status tracking
+      status                TEXT NOT NULL DEFAULT 'received' 
+                           CHECK(status IN ('received', 'assigned', 'in-production', 'halted', 'completed', 'in-transit', 'arrived')),
+      
+      -- Status timestamps (JSON: { "received": "...", "assigned": "...", etc })
+      status_timestamps     TEXT NOT NULL DEFAULT '{}',
+      
+      -- Gate assignments (JSON array: [1, 2, 3])
+      assigned_gates        TEXT DEFAULT '[]',
+      
+      updated_at            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      
+      FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE,
+      FOREIGN KEY (recipe_id)   REFERENCES recipes(id)   ON DELETE RESTRICT
+    );
+    CREATE TRIGGER IF NOT EXISTS trg_orders_updated_at
+    AFTER UPDATE ON orders FOR EACH ROW BEGIN
+      UPDATE orders SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
+    END;
+    
+    CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id);
+    CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+    CREATE INDEX IF NOT EXISTS idx_orders_due_date ON orders(due_date);
+  `);
+  
+  // Order config history (track limit changes during production)
+  run(`
+    CREATE TABLE IF NOT EXISTS order_config_history (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      order_id        INTEGER NOT NULL,
+      changed_by      INTEGER,
+      changed_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      
+      -- Previous values
+      prev_piece_min_weight_g    REAL,
+      prev_piece_max_weight_g    REAL,
+      prev_batch_min_weight_g    REAL,
+      prev_batch_max_weight_g    REAL,
+      prev_batch_type            TEXT,
+      prev_batch_value           INTEGER,
+      
+      -- New values
+      new_piece_min_weight_g    REAL,
+      new_piece_max_weight_g    REAL,
+      new_batch_min_weight_g    REAL,
+      new_batch_max_weight_g    REAL,
+      new_batch_type            TEXT,
+      new_batch_value           INTEGER,
+      
+      note            TEXT,
+      
+      FOREIGN KEY (order_id)   REFERENCES orders(id)   ON DELETE CASCADE,
+      FOREIGN KEY (changed_by) REFERENCES users(id)    ON DELETE SET NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_order_config_history_order ON order_config_history(order_id);
+  `);
+  
+  // Customer-specific recipe lists (which recipes are available for each customer)
+  run(`
+    CREATE TABLE IF NOT EXISTS customer_recipes (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      customer_id INTEGER NOT NULL,
+      recipe_id   INTEGER NOT NULL,
+      is_favorite INTEGER DEFAULT 0,
+      created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (customer_id, recipe_id),
+      FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE,
+      FOREIGN KEY (recipe_id)   REFERENCES recipes(id)   ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_customer_recipes_customer ON customer_recipes(customer_id);
+  `);
+
+  console.log('✅ Customers and orders schema created.');
+}
+
+/* --------- seed customer recipes --------- */
+function seedCustomerRecipes() {
+  const customers = db.prepare('SELECT id FROM customers').all();
+  const allRecipes = db.prepare('SELECT id FROM recipes').all();
+
+  if (customers.length === 0 || allRecipes.length === 0) return;
+
+  const existing = db.prepare('SELECT COUNT(*) as cnt FROM customer_recipes').get();
+  if (existing.cnt > 0) return;
+
+  const insert = db.prepare('INSERT OR IGNORE INTO customer_recipes (customer_id, recipe_id) VALUES (?, ?)');
+  const transaction = db.transaction(() => {
+    for (const customer of customers) {
+      for (const recipe of allRecipes) {
+        insert.run(customer.id, recipe.id);
+      }
+    }
+  });
+  transaction();
+
+  // Also copy global favorites to customer favorites
+  const favorites = db.prepare('SELECT id FROM recipes WHERE is_favorite = 1').all();
+  if (favorites.length > 0) {
+    const updateFav = db.prepare('UPDATE customer_recipes SET is_favorite = 1 WHERE recipe_id = ? AND customer_id = ?');
+    for (const customer of customers) {
+      for (const fav of favorites) {
+        updateFav.run(fav.id, customer.id);
+      }
+    }
+  }
+
+  console.log(`✅ Seeded customer_recipes for ${customers.length} customers with ${allRecipes.length} recipes each.`);
+}
+
+/* --------- update users role constraint --------- */
+function updateUsersRoleConstraint() {
+  // SQLite doesn't support modifying CHECK constraints easily
+  // So we check if customer role is already allowed by trying to find it
+  // If the schema was created fresh, it will already have the right constraint
+  // For existing databases, we need to recreate the table (complex)
+  // For now, we'll just note that new databases will have the correct constraint
+  // and existing ones may need manual migration
+  console.log('ℹ️ Note: Users table now supports "customer" role in new databases.');
+}
+
 /* ---------------------- main ---------------------- */
 function main() {
   createBaseSchema();
@@ -552,6 +792,9 @@ function main() {
   seedDefaultProgramIfEmpty();
   addRecipeDisplayName();
   createSavedProgramsSchema();
+  createCustomersAndOrdersSchema();
+  updateUsersRoleConstraint();
+  seedCustomerRecipes();
   console.log('✅ SQLite setup complete.');
 }
 main();

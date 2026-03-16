@@ -51,6 +51,11 @@ const LoginForm = ({ role, onBack, onLogin, isLoading, hideTitle = false }) => {
       color: colors.orangeAccent[600],
       icon: <PersonOutlineOutlinedIcon />,
     },
+    customer: {
+      title: "Customer",
+      color: colors.purpleAccent[500],
+      icon: <PersonOutlineOutlinedIcon />,
+    },
   }[role];
 
   const handleSubmit = async (values) => {

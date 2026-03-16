@@ -100,22 +100,11 @@ const MachineControls = ({
     try {
       console.log('[MachineControls] Stopping machine...');
       
-      // Save current active recipes before stopping
-      const recipesToRestore = [...(activeRecipes || [])];
-      
       const response = await api.post('/machine/control', { action: 'stop' });
-      console.log('[MachineControls] Machine stopped:', response.data);
+      console.log('[MachineControls] Machine stopped. Recipes remain in Active Orders for operator cleanup.');
       
-      // Call optional callback with the recipes that were active (for Setup to restore them)
       if (onStop) {
-        onStop(recipesToRestore);
-      } else {
-        // Default behavior: move active recipes back to assigned recipes via context
-        // This ensures consistent behavior across Dashboard and Setup pages
-        const existingRecipeNames = new Set(assignedRecipes.map(r => r.recipeName));
-        const uniqueRecipesToRestore = recipesToRestore.filter(r => !existingRecipeNames.has(r.recipeName));
-        setAssignedRecipes([...assignedRecipes, ...uniqueRecipesToRestore]);
-        console.log('[MachineControls] Moved', uniqueRecipesToRestore.length, 'recipes back to assigned');
+        onStop();
       }
     } catch (error) {
       console.error('[MachineControls] Failed to stop machine:', error);

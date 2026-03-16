@@ -160,6 +160,8 @@ const logger = winston.createLogger({
     createCategoryTransport('operations', 'operations'),
     // System log - only system category
     createCategoryTransport('system', 'system'),
+    // Queue debug log - dedicated queue debugging
+    createCategoryTransport('queue', 'queue'),
     // Error log - all errors from all categories
     createErrorTransport(),
   ],
@@ -468,6 +470,82 @@ const log = {
   simulatorProgress: (loopCount, piecesSent, rate) => 
     system('simulator_progress', 'Simulator progress', { loop: loopCount, pieces: piecesSent, rate }),
 
+  // ==================== QUEUE DEBUG - Order Queue debugging ====================
+  // Dedicated logging for queue operations to help debug queue depletion issues
+  queueLoaded: (queueLength, items) =>
+    logger.info({
+      category: 'queue',
+      action: 'queue_loaded',
+      message: `Queue loaded from database: ${queueLength} items`,
+      queueLength,
+      items: items.map(i => ({ recipeName: i.recipeName, orderId: i.orderId, minGates: i.minGates, gatesAssigned: i.gatesAssigned })),
+    }),
+  
+  queueSaved: (queueLength, items, source) =>
+    logger.info({
+      category: 'queue',
+      action: 'queue_saved',
+      message: `Queue saved to database: ${queueLength} items (source: ${source})`,
+      queueLength,
+      source,
+      items: items.map(i => ({ recipeName: i.recipeName, orderId: i.orderId, minGates: i.minGates, gatesAssigned: i.gatesAssigned })),
+    }),
+  
+  queueItemAdded: (item, newQueueLength, source) =>
+    logger.info({
+      category: 'queue',
+      action: 'queue_item_added',
+      message: `Item added to queue: ${item.recipeName}`,
+      recipeName: item.recipeName,
+      orderId: item.orderId || null,
+      minGates: item.minGates,
+      newQueueLength,
+      source,
+    }),
+  
+  queueItemRemoved: (item, newQueueLength, reason) =>
+    logger.info({
+      category: 'queue',
+      action: 'queue_item_removed',
+      message: `Item removed from queue: ${item.recipeName} (${reason})`,
+      recipeName: item.recipeName,
+      orderId: item.orderId || null,
+      newQueueLength,
+      reason,
+    }),
+  
+  queueItemActivated: (item, gates, reason) =>
+    logger.info({
+      category: 'queue',
+      action: 'queue_item_activated',
+      message: `Item activated from queue: ${item.recipeName} to gates ${gates.join(',')}`,
+      recipeName: item.recipeName,
+      orderId: item.orderId || null,
+      gates,
+      reason,
+    }),
+  
+  queueEmptied: (previousLength, source, stackTrace) =>
+    logger.warn({
+      category: 'queue',
+      action: 'queue_emptied',
+      message: `⚠️ QUEUE WAS EMPTIED! Previous length: ${previousLength}`,
+      previousLength,
+      source,
+      stackTrace,
+    }),
+  
+  queueAutoAssign: (machineState, availableGates, queueLength, action) =>
+    logger.info({
+      category: 'queue',
+      action: 'queue_auto_assign',
+      message: `Auto-assign check: ${action}`,
+      machineState,
+      availableGates,
+      queueLength,
+      actionTaken: action,
+    }),
+
   // ==================== Base logging functions ====================
   audit: (action, message, details = {}, user = null) => 
     audit(action, message, details, user),
@@ -477,6 +555,14 @@ const log = {
   
   system: (action, message, details = {}) => 
     system(action, message, details),
+  
+  queue: (action, message, details = {}) =>
+    logger.info({
+      category: 'queue',
+      action,
+      message,
+      ...details,
+    }),
 
   // ==================== Error logging ====================
   error: (category, action, err, details = {}) => 
