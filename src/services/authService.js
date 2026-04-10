@@ -25,7 +25,7 @@ const handleNetworkError = (error) => {
 };
 
 const authService = {
-  login: async (username, password, role) => {
+  login: async (username, password) => {
     try {
       console.log(`Attempting to login at ${API_URL}/api/auth/login`);
       const response = await fetch(`${API_URL}/api/auth/login`, {
@@ -33,8 +33,7 @@ const authService = {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ username, password, role }),
-        // Add explicit timeout to prevent hanging requests
+        body: JSON.stringify({ username, password }),
         signal: AbortSignal.timeout(5000)
       });
       

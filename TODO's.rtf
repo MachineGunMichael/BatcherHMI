@@ -6,132 +6,47 @@
 }
 {\*\listtable{\list\listtemplateid1\listhybrid{\listlevel\levelnfc23\levelnfcn23\leveljc0\leveljcn0\levelfollow0\levelstartat1\levelspace360\levelindent0{\*\levelmarker \{disc\}}{\leveltext\leveltemplateid1\'01\uc0\u8226 ;}{\levelnumbers;}\fi-360\li720\lin720 }{\listlevel\levelnfc23\levelnfcn23\leveljc0\leveljcn0\levelfollow0\levelstartat1\levelspace360\levelindent0{\*\levelmarker \{circle\}}{\leveltext\leveltemplateid2\'01\uc0\u9702 ;}{\levelnumbers;}\fi-360\li1440\lin1440 }{\listname ;}\listid1}}
 {\*\listoverridetable{\listoverride\listid1\listoverridecount0\ls1}}
-\paperw11900\paperh16840\margl1440\margr1440\vieww20220\viewh17100\viewkind0
+\paperw11900\paperh16840\margl1440\margr1440\vieww21420\viewh18300\viewkind0
 \pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
 
 \f0\fs24 \cf0 TODO\'92s\
 \
-\
-- make possible to assign current running recipes to additional new gate when one comes available, currently we only have opposite to free a gate.\
-- change lay-out dashboard page? Add active recipe tables there?\
-\
-- do we want to be able to change/edit customer orders?\
-\
-- Plaatje met alle architectuur\
-- Alle buttons en forms zelfde component, maak component van en share across all pages, nu alles beetje anders qua lay-out.\
-- recipe creation and program creation: pop-up window instead of what we have now? Make all uniform?\
-- Pause button functionality to block a gate, or block a recipe?\
 - check; increase speed simulator, when does it break?\
-- seperate tab for program and recipe creation instead of in setup page?\
-\
-- add animation flippers above the gates, similar like marel\
-- transitioning -> blinking also in graphs?\
-- allow edit and removals while running instead of on pause\
-- allow additions of new recipes while other recipes have not yet been removed from a gate? Or keep it like now: wait for a gate to be removed first.\
-\
-- ! Check number of files: many: parquet files of influx? 7.6 M lines of code (24 dec) cloc .\
-\
-- Reddis? Nginx? Needed?\
-\
-- plan assist\
-- order view -> order generator\
-- user-based roles/permissions, view for admin to select what who can do. \
-\
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+\cf0 - Reddis? Nginx? Needed?\
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+\cf0 - allow edit and removals while running instead of on pause\
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+\cf0 - make possible to assign current running recipes to additional new gate when one comes available, currently we only have opposite to free a gate.\
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+\cf0 \
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+\cf0 - Plaatje met alle architectuur\
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+\cf0 - plan assist\
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+\cf0 - Alle buttons en forms zelfde component, maak component van en share across all pages, nu alles beetje anders qua lay-out.\
+- do we want to be able to change/edit customer orders?\
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+\cf0 \
 AANNAMES:\
 - transition: program ends when transition is started (because otherwise if you have to wait until transition is finished, you can potentially already have completed batches on gates that have transitioned, which would be weird)\
 - premature end of a batch: we just count it as a batch but data will simply be skewed.. much lower give-away for example.\
 - how to handle 1 program with multiple recipe changes? We don\'92t! We assume that whenever a recipe changes, a new program starts. Order entity still needs to be defined, but probably recipe = order (where recipe is unique and can have multiple orders attached to it), and we log when a recipe is finished, or maybe swapped, then a new program starts.\
 - alle gates altijd bezet, 100% utilization, wil je dit niet, geen orders toevoegen aan de order queue.\
 \
-3906\
 \
+\
+View marel:\
 \pard\tx220\tx720\pardeftab720\li720\fi-720\partightenfactor0
 \ls1\ilvl0
-\fs32 \cf2 {\listtext	\uc0\u8226 	}\expnd0\expndtw0\kerning0
-Length of (last) item\
+\fs32 \cf2 \expnd0\expndtw0\kerning0
+\
 \ls1\ilvl0\kerning1\expnd0\expndtw0 {\listtext	\uc0\u8226 	}\expnd0\expndtw0\kerning0
 Gate\
 \pard\tx940\tx1440\pardeftab720\li1440\fi-1440\partightenfactor0
 \ls1\ilvl1\cf2 \kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Lane ID (with multiple lanes)\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Upper buffer content\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Lower buffer content\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
 Batch identification/information for the last removed batch\
-\pard\tx220\tx720\pardeftab720\li720\fi-720\partightenfactor0
-\ls1\ilvl0\cf2 \kerning1\expnd0\expndtw0 {\listtext	\uc0\u8226 	}\expnd0\expndtw0\kerning0
-Table with last Pieces\
-\pard\tx940\tx1440\pardeftab720\li1440\fi-1440\partightenfactor0
-\ls1\ilvl1\cf2 \kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Time\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Delta time\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Location delta time\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Status (batched or rejected)\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Piece ID\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Weight\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Type?\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Lane (if multiple lanes)\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Gate send to\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Program (it belongs to)\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Calculation time\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Marking: last piece of completed batch\
-\pard\tx220\tx720\pardeftab720\li720\fi-720\partightenfactor0
-\ls1\ilvl0\cf2 \kerning1\expnd0\expndtw0 {\listtext	\uc0\u8226 	}\expnd0\expndtw0\kerning0
-Table with last Batches\
-\pard\tx940\tx1440\pardeftab720\li1440\fi-1440\partightenfactor0
-\ls1\ilvl1\cf2 \kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Time\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Delta time\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Location delta time\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Program (it belongs to)\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-BatchID\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Weight\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Give away (g)\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Give away (%)\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Count\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Gate #\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Status (finished or terminated early)\
-\pard\tx220\tx720\pardeftab720\li720\fi-720\partightenfactor0
-\ls1\ilvl0\cf2 \kerning1\expnd0\expndtw0 {\listtext	\uc0\u8226 	}\expnd0\expndtw0\kerning0
-Settings\
-\pard\tx940\tx1440\pardeftab720\li1440\fi-1440\partightenfactor0
-\ls1\ilvl1\cf2 \kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Preset weight tare\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Display resolution\
-\pard\tx220\tx720\pardeftab720\li720\fi-720\partightenfactor0
-\ls1\ilvl0\cf2 \kerning1\expnd0\expndtw0 {\listtext	\uc0\u8226 	}\expnd0\expndtw0\kerning0
-Cleaning mode\
-\pard\tx940\tx1440\pardeftab720\li1440\fi-1440\partightenfactor0
-\ls1\ilvl1\cf2 \kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Open/close left side\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Open/close right side\
-\ls1\ilvl1\kerning1\expnd0\expndtw0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
-Run modes: washing/normal. So 4 modes; 1. Running normal 2. Stopped normal 3. Washing normal 4. Washing stopped.\
 \pard\tx220\tx720\pardeftab720\li720\fi-720\partightenfactor0
 \ls1\ilvl0\cf2 \kerning1\expnd0\expndtw0 {\listtext	\uc0\u8226 	}\expnd0\expndtw0\kerning0
 Program settings\
@@ -153,6 +68,79 @@ Copy program/recipe?\
 \
 \
 \
+\
+(() => \{\
+  if (window._perfMon) \{ clearInterval(window._perfMon); console.log("Stopped previous monitor"); \}\
+  \
+  const log = [];\
+  const INTERVAL = 5000; // every 5 seconds\
+  \
+  function snapshot() \{\
+    const totalNodes = document.getElementsByTagName('*').length;\
+    const heap = performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1024 / 1024) : null;\
+    const heapTotal = performance.memory ? Math.round(performance.memory.totalJSHeapSize / 1024 / 1024) : null;\
+    \
+    // Break down DOM nodes by major page sections\
+    const breakdown = \{\};\
+    const selectors = \{\
+      'Charts (SVG)': 'svg',\
+      'SVG paths': 'svg path',\
+      'SVG rects': 'svg rect',\
+      'SVG circles': 'svg circle',\
+      'SVG text': 'svg text',\
+      'Table rows': 'tr',\
+      'Table cells': 'td, th',\
+      'Divs': 'div',\
+      'Spans': 'span',\
+    \};\
+    for (const [label, sel] of Object.entries(selectors)) \{\
+      breakdown[label] = document.querySelectorAll(sel).length;\
+    \}\
+    \
+    const entry = \{\
+      t: new Date().toLocaleTimeString(),\
+      heap,\
+      heapTotal,\
+      nodes: totalNodes,\
+      ...breakdown,\
+    \};\
+    log.push(entry);\
+    if (log.length > 500) log.splice(0, log.length - 500);\
+    \
+    // Show delta from previous\
+    const prev = log.length > 1 ? log[log.length - 2] : null;\
+    const delta = prev ? \{\
+      heap: heap - prev.heap,\
+      nodes: totalNodes - prev.nodes,\
+      'SVG paths': breakdown['SVG paths'] - (prev['SVG paths'] || 0),\
+      'Table rows': breakdown['Table rows'] - (prev['Table rows'] || 0),\
+      'Divs': breakdown['Divs'] - (prev['Divs'] || 0),\
+    \} : null;\
+    \
+    console.log(\
+      `%c[$\{entry.t\}]%c Heap: $\{heap\}MB ($\{heapTotal\}MB total) | DOM: $\{totalNodes\} nodes` +\
+      (delta ? ` | \uc0\u916  heap:$\{delta.heap > 0 ? '+' : ''\}$\{delta.heap\}MB nodes:$\{delta.nodes > 0 ? '+' : ''\}$\{delta.nodes\} paths:$\{delta['SVG paths'] > 0 ? '+' : ''\}$\{delta['SVG paths']\} rows:$\{delta['Table rows'] > 0 ? '+' : ''\}$\{delta['Table rows']\} divs:$\{delta['Divs'] > 0 ? '+' : ''\}$\{delta['Divs']\}` : ''),\
+      'color: cyan; font-weight: bold',\
+      'color: inherit'\
+    );\
+    \
+    // Warn if growing fast\
+    if (delta && delta.nodes > 100) \{\
+      console.warn(`\uc0\u9888 \u65039  DOM grew by $\{delta.nodes\} nodes in $\{INTERVAL/1000\}s!`);\
+    \}\
+    if (delta && delta.heap > 10) \{\
+      console.warn(`\uc0\u9888 \u65039  Heap grew by $\{delta.heap\}MB in $\{INTERVAL/1000\}s!`);\
+    \}\
+  \}\
+  \
+  snapshot(); // immediate first reading\
+  window._perfMon = setInterval(snapshot, INTERVAL);\
+  window._perfLog = log; // access with window._perfLog\
+  \
+  console.log("%c Performance monitor started (every 5s). Stop with: clearInterval(window._perfMon)", "color: lime; font-weight: bold");\
+  console.log("Access full log: window._perfLog");\
+  console.log("Dump as table: console.table(window._perfLog)");\
+\})();\
 \
 \pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
 \cf0 \

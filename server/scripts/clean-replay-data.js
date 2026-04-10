@@ -77,7 +77,8 @@ try {
     recipe_stats: db.prepare(`SELECT COUNT(*) as count FROM recipe_stats WHERE program_id IN (${programIds.join(',')})`).get().count,
     gate_dwell_times: db.prepare(`SELECT COUNT(*) as count FROM gate_dwell_times WHERE program_id IN (${programIds.join(',')})`).get().count,
     gate_dwell_accumulators: db.prepare(`SELECT COUNT(*) as count FROM gate_dwell_accumulators WHERE program_id IN (${programIds.join(',')})`).get().count,
-    kpi_minute_recipes: db.prepare(`SELECT COUNT(*) as count FROM kpi_minute_recipes WHERE program_id IN (${programIds.join(',')})`).get().count
+    kpi_minute_recipes: db.prepare(`SELECT COUNT(*) as count FROM kpi_minute_recipes WHERE program_id IN (${programIds.join(',')})`).get().count,
+    pause_intervals: db.prepare(`SELECT COUNT(*) as count FROM pause_intervals WHERE program_id IN (${programIds.join(',')})`).get().count
   };
   
   console.log('Related data to delete:');
@@ -105,7 +106,8 @@ try {
           gate_dwell_times: db.prepare(`DELETE FROM gate_dwell_times WHERE program_id IN (${placeholders})`).run(...programIds).changes,
           gate_dwell_accumulators: db.prepare(`DELETE FROM gate_dwell_accumulators WHERE program_id IN (${placeholders})`).run(...programIds).changes,
           kpi_minute_recipes: db.prepare(`DELETE FROM kpi_minute_recipes WHERE program_id IN (${placeholders})`).run(...programIds).changes,
-          program_stats: db.prepare(`DELETE FROM program_stats WHERE program_id IN (${placeholders})`).run(...programIds).changes
+          program_stats: db.prepare(`DELETE FROM program_stats WHERE program_id IN (${placeholders})`).run(...programIds).changes,
+          pause_intervals: db.prepare(`DELETE FROM pause_intervals WHERE program_id IN (${placeholders})`).run(...programIds).changes
         };
         
         return deleteCounts;

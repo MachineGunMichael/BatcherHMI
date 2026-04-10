@@ -533,6 +533,71 @@ router.get('/programs/:id/gate-dwell', verifyToken, (req, res) => {
 });
 
 /**
+ * GET /api/stats/programs/:id/ack-times
+ * Operator acknowledgment response times per gate for a program (for boxplot).
+ */
+router.get('/programs/:id/ack-times', verifyToken, (req, res) => {
+  try {
+    const programId = parseInt(req.params.id);
+
+    const rows = db.prepare(`
+      SELECT ga.gate, ga.response_time_ms, r.name as recipe_name
+      FROM gate_acknowledgments ga
+      LEFT JOIN recipes r ON r.id = ga.recipe_id OR r.name = ga.recipe_id
+      WHERE ga.program_id = ?
+      ORDER BY ga.gate
+    `).all(programId);
+
+    const byGate = {};
+    rows.forEach(row => {
+      if (!byGate[row.gate]) {
+        byGate[row.gate] = { gate: row.gate, recipe_name: row.recipe_name || 'Unknown', times: [], count: 0 };
+      }
+      byGate[row.gate].times.push(row.response_time_ms / 1000);
+      byGate[row.gate].count++;
+    });
+
+    res.json(Object.values(byGate).sort((a, b) => a.gate - b.gate));
+  } catch (error) {
+    log.error('system', 'fetch_ack_times_error', error);
+    res.status(500).json({ message: 'Failed to fetch ack times', error: error.message });
+  }
+});
+
+/**
+ * GET /api/stats/programs/:id/blocked-times
+ * Gate blocked durations per gate for a program (for boxplot).
+ * Only includes entries where the gate was fully blocked (main + buffer full).
+ */
+router.get('/programs/:id/blocked-times', verifyToken, (req, res) => {
+  try {
+    const programId = parseInt(req.params.id);
+
+    const rows = db.prepare(`
+      SELECT ga.gate, ga.blocked_duration_ms, r.name as recipe_name
+      FROM gate_acknowledgments ga
+      LEFT JOIN recipes r ON r.id = ga.recipe_id OR r.name = ga.recipe_id
+      WHERE ga.program_id = ? AND ga.was_blocked = 1
+      ORDER BY ga.gate
+    `).all(programId);
+
+    const byGate = {};
+    rows.forEach(row => {
+      if (!byGate[row.gate]) {
+        byGate[row.gate] = { gate: row.gate, recipe_name: row.recipe_name || 'Unknown', times: [], count: 0 };
+      }
+      byGate[row.gate].times.push(row.blocked_duration_ms / 1000);
+      byGate[row.gate].count++;
+    });
+
+    res.json(Object.values(byGate).sort((a, b) => a.gate - b.gate));
+  } catch (error) {
+    log.error('system', 'fetch_blocked_times_error', error);
+    res.status(500).json({ message: 'Failed to fetch blocked times', error: error.message });
+  }
+});
+
+/**
  * GET /api/stats/programs/:id/history
  * Get per-minute time series data for a program from SQLite
  * All data calculated from batch_completions (source of truth) filtered by program end_ts
@@ -801,23 +866,32 @@ router.get('/programs/:id/pieces', verifyToken, async (req, res) => {
  * List recipe runs within programs, with optional customer and date filters.
  * Each entry is a (recipe, order, program) combination - a single recipe run within one program.
  */
+/**
+ * Parse a potentially comma-separated programId param into an array of ints
+ * and return { placeholders: '?,?,?', ids: [1,2,3] }.
+ */
+function parseProgramIds(param) {
+  const ids = String(param).split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+  return { ids, placeholders: ids.map(() => '?').join(',') };
+}
+
 router.get('/orders', verifyToken, (req, res) => {
   try {
     const { customer_id, date } = req.query;
 
     let query = `
       SELECT
-        rs.program_id,
         rs.recipe_id,
         r.name as recipe_name,
         r.display_name as recipe_display_name,
         rs.order_id,
         c.name as customer_name,
-        rs.total_batches,
-        rs.total_items_batched,
-        rs.total_items_rejected,
-        COALESCE(bc_times.first_batch, ps.start_ts) as first_batch,
-        COALESCE(bc_times.last_batch, ps.end_ts) as last_batch
+        SUM(rs.total_batches) as total_batches,
+        SUM(rs.total_items_batched) as total_items_batched,
+        SUM(rs.total_items_rejected) as total_items_rejected,
+        GROUP_CONCAT(DISTINCT rs.program_id) as program_ids,
+        MIN(COALESCE(bc_times.first_batch, ps.start_ts)) as first_batch,
+        MAX(COALESCE(bc_times.last_batch, ps.end_ts)) as last_batch
       FROM recipe_stats rs
       JOIN recipes r ON r.id = rs.recipe_id
       JOIN program_stats ps ON ps.program_id = rs.program_id
@@ -833,7 +907,6 @@ router.get('/orders', verifyToken, (req, res) => {
       LEFT JOIN orders o ON o.id = rs.order_id
       LEFT JOIN customers c ON c.id = o.customer_id
       WHERE ps.end_ts IS NOT NULL
-        AND rs.completed = 1
     `;
     const params = [];
 
@@ -847,7 +920,9 @@ router.get('/orders', verifyToken, (req, res) => {
       params.push(date);
     }
 
-    query += ` ORDER BY ps.start_ts DESC, rs.total_batches DESC`;
+    query += ` GROUP BY rs.recipe_id, COALESCE(rs.order_id, 0)`;
+    query += ` HAVING MAX(rs.completed) = 1`;
+    query += ` ORDER BY MAX(COALESCE(bc_times.last_batch, ps.end_ts)) DESC, SUM(rs.total_batches) DESC`;
 
     const rows = db.prepare(query).all(...params);
     res.json(rows);
@@ -895,28 +970,32 @@ router.get('/orders/dates', verifyToken, (req, res) => {
  */
 router.get('/orders/:recipeId/program/:programId', verifyToken, (req, res) => {
   try {
-    const programId = parseInt(req.params.programId);
+    const { ids: programIds, placeholders } = parseProgramIds(req.params.programId);
     const recipeId = parseInt(req.params.recipeId);
     const orderId = req.query.order_id ? parseInt(req.query.order_id) : null;
 
-    // Get program time range
-    const ps = db.prepare(`SELECT start_ts, end_ts FROM program_stats WHERE program_id = ?`).get(programId);
-
-    // Get recipe stats - query recipe_stats directly for reliability
     const recipe = db.prepare(`SELECT * FROM recipes WHERE id = ?`).get(recipeId);
     if (!recipe) {
       return res.status(404).json({ message: 'Recipe not found' });
     }
 
+    // Aggregate recipe_stats across all programs
     let rsQuery = `
-      SELECT rs.*,
+      SELECT
+        SUM(rs.total_batches) as total_batches,
+        SUM(rs.total_items_batched) as total_items_batched,
+        SUM(rs.total_items_rejected) as total_items_rejected,
+        SUM(rs.total_batched_weight_g) as total_batched_weight_g,
+        SUM(rs.total_reject_weight_g) as total_reject_weight_g,
+        SUM(rs.total_giveaway_weight_g) as total_giveaway_weight_g,
+        rs.order_id,
         c.name as customer_name
       FROM recipe_stats rs
       LEFT JOIN orders o ON o.id = rs.order_id
       LEFT JOIN customers c ON c.id = o.customer_id
-      WHERE rs.program_id = ? AND rs.recipe_id = ?
+      WHERE rs.program_id IN (${placeholders}) AND rs.recipe_id = ?
     `;
-    const rsParams = [programId, recipeId];
+    const rsParams = [...programIds, recipeId];
     if (orderId) {
       rsQuery += ` AND rs.order_id = ?`;
       rsParams.push(orderId);
@@ -926,11 +1005,16 @@ router.get('/orders/:recipeId/program/:programId', verifyToken, (req, res) => {
 
     const rs = db.prepare(rsQuery).get(...rsParams);
 
-    if (!rs) {
-      return res.status(404).json({ message: 'No recipe stats found for this program' });
+    if (!rs || !rs.total_batches) {
+      return res.status(404).json({ message: 'No recipe stats found' });
     }
 
-    // Compute giveaway pct
+    // Get overall time range from program_stats
+    const timeRange = db.prepare(`
+      SELECT MIN(start_ts) as start_ts, MAX(end_ts) as end_ts
+      FROM program_stats WHERE program_id IN (${placeholders})
+    `).get(...programIds);
+
     const totalWeight = (rs.total_batched_weight_g || 0) + (rs.total_giveaway_weight_g || 0) + (rs.total_reject_weight_g || 0);
     const giveawayPct = totalWeight > 0
       ? ((rs.total_giveaway_weight_g || 0) * 100 / totalWeight)
@@ -943,10 +1027,9 @@ router.get('/orders/:recipeId/program/:programId', verifyToken, (req, res) => {
       order_id: rs.order_id,
       customer_name: rs.customer_name,
       order_display_name: null,
-      program_id: programId,
-      program_name: `${recipe.name} (Program ${programId})`,
-      start_ts: ps?.start_ts,
-      end_ts: ps?.end_ts,
+      program_ids: programIds.join(','),
+      start_ts: timeRange?.start_ts,
+      end_ts: timeRange?.end_ts,
       total_batches: rs.total_batches,
       total_batched_weight_g: rs.total_batched_weight_g,
       total_reject_weight_g: rs.total_reject_weight_g,
@@ -968,13 +1051,13 @@ router.get('/orders/:recipeId/program/:programId', verifyToken, (req, res) => {
  */
 router.get('/orders/:recipeId/program/:programId/assignments', verifyToken, (req, res) => {
   try {
-    const programId = parseInt(req.params.programId);
+    const { ids: programIds, placeholders } = parseProgramIds(req.params.programId);
     const recipeId = parseInt(req.params.recipeId);
 
-    // Try run_config_assignments first (accurate for live programs)
+    // Try run_config_assignments from the latest program's config
     const config = db.prepare(`
-      SELECT id FROM run_configs WHERE program_id = ? ORDER BY id DESC LIMIT 1
-    `).get(programId);
+      SELECT id FROM run_configs WHERE program_id IN (${placeholders}) ORDER BY id DESC LIMIT 1
+    `).get(...programIds);
 
     if (config) {
       const assignments = db.prepare(`
@@ -996,7 +1079,7 @@ router.get('/orders/:recipeId/program/:programId/assignments', verifyToken, (req
       }
     }
 
-    // Fallback: derive from batch_completions for this program + recipe
+    // Fallback: derive from batch_completions across all programs
     const orderId = req.query.order_id ? parseInt(req.query.order_id) : null;
     let bcQuery = `
       SELECT DISTINCT bc.gate, bc.recipe_id,
@@ -1006,9 +1089,9 @@ router.get('/orders/:recipeId/program/:programId/assignments', verifyToken, (req
         r.min_pieces_per_batch, r.max_pieces_per_batch
       FROM batch_completions bc
       JOIN recipes r ON r.id = bc.recipe_id
-      WHERE bc.program_id = ? AND bc.recipe_id = ? AND bc.gate != 0
+      WHERE bc.program_id IN (${placeholders}) AND bc.recipe_id = ? AND bc.gate != 0
     `;
-    const bcParams = [programId, recipeId];
+    const bcParams = [...programIds, recipeId];
     if (orderId) {
       bcQuery += ` AND bc.order_id = ?`;
       bcParams.push(orderId);
@@ -1029,7 +1112,7 @@ router.get('/orders/:recipeId/program/:programId/assignments', verifyToken, (req
  */
 router.get('/orders/:recipeId/program/:programId/history', verifyToken, (req, res) => {
   try {
-    const programId = parseInt(req.params.programId);
+    const { ids: programIds, placeholders } = parseProgramIds(req.params.programId);
     const recipeId = parseInt(req.params.recipeId);
     const orderId = req.query.order_id ? parseInt(req.query.order_id) : null;
 
@@ -1042,9 +1125,9 @@ router.get('/orders/:recipeId/program/:programId/history', verifyToken, (req, re
         SUM(bc.weight_g) as weight_in_batches
       FROM batch_completions bc
       LEFT JOIN recipes r ON bc.recipe_id = r.id
-      WHERE bc.program_id = ? AND bc.recipe_id = ? AND bc.gate != 0
+      WHERE bc.program_id IN (${placeholders}) AND bc.recipe_id = ? AND bc.gate != 0
     `;
-    const params = [programId, recipeId];
+    const params = [...programIds, recipeId];
     if (orderId) {
       query += ` AND bc.order_id = ?`;
       params.push(orderId);
@@ -1081,18 +1164,17 @@ router.get('/orders/:recipeId/program/:programId/history', verifyToken, (req, re
  */
 router.get('/orders/:recipeId/program/:programId/pieces-histogram', verifyToken, async (req, res) => {
   try {
-    const programId = parseInt(req.params.programId);
+    const { ids: programIds, placeholders } = parseProgramIds(req.params.programId);
     const recipeId = parseInt(req.params.recipeId);
     const orderId = req.query.order_id ? parseInt(req.query.order_id) : null;
 
-    // Get time range from batch_completions scoped to this program + recipe
     let rangeQuery = `
       SELECT MIN(bc.completed_at) as start_ts, MAX(bc.completed_at) as end_ts,
              SUM(bc.pieces) as total_pieces
       FROM batch_completions bc
-      WHERE bc.program_id = ? AND bc.recipe_id = ? AND bc.gate != 0
+      WHERE bc.program_id IN (${placeholders}) AND bc.recipe_id = ? AND bc.gate != 0
     `;
-    const rangeParams = [programId, recipeId];
+    const rangeParams = [...programIds, recipeId];
     if (orderId) {
       rangeQuery += ` AND bc.order_id = ?`;
       rangeParams.push(orderId);
@@ -1160,18 +1242,17 @@ router.get('/orders/:recipeId/program/:programId/pieces-histogram', verifyToken,
  */
 router.get('/orders/:recipeId/program/:programId/gate-dwell', verifyToken, (req, res) => {
   try {
-    const programId = parseInt(req.params.programId);
+    const { ids: programIds, placeholders } = parseProgramIds(req.params.programId);
     const recipeId = parseInt(req.params.recipeId);
     const orderId = req.query.order_id ? parseInt(req.query.order_id) : null;
 
-    // Get gates used by this recipe in this program
     let gateQuery = `
       SELECT DISTINCT bc.gate, r.name as recipe_name
       FROM batch_completions bc
       JOIN recipes r ON r.id = bc.recipe_id
-      WHERE bc.program_id = ? AND bc.recipe_id = ? AND bc.gate != 0
+      WHERE bc.program_id IN (${placeholders}) AND bc.recipe_id = ? AND bc.gate != 0
     `;
-    const gateParams = [programId, recipeId];
+    const gateParams = [...programIds, recipeId];
     if (orderId) {
       gateQuery += ` AND bc.order_id = ?`;
       gateParams.push(orderId);
@@ -1186,13 +1267,12 @@ router.get('/orders/:recipeId/program/:programId/gate-dwell', verifyToken, (req,
     const recipeName = usedGates[0].recipe_name;
     const gateNumbers = usedGates.map(g => g.gate);
 
-    // Compute dwell times from batch_completions for each gate
     const result = gateNumbers.map(gate => {
       let batchQuery = `
         SELECT completed_at FROM batch_completions
-        WHERE program_id = ? AND recipe_id = ? AND gate = ?
+        WHERE program_id IN (${placeholders}) AND recipe_id = ? AND gate = ?
       `;
-      const batchParams = [programId, recipeId, gate];
+      const batchParams = [...programIds, recipeId, gate];
       if (orderId) {
         batchQuery += ` AND order_id = ?`;
         batchParams.push(orderId);
@@ -1226,12 +1306,92 @@ router.get('/orders/:recipeId/program/:programId/gate-dwell', verifyToken, (req,
 });
 
 /**
+ * GET /api/stats/orders/:recipeId/program/:programId/ack-times
+ * Acknowledgment response times for a specific recipe within a program.
+ */
+router.get('/orders/:recipeId/program/:programId/ack-times', verifyToken, (req, res) => {
+  try {
+    const { ids: programIds, placeholders } = parseProgramIds(req.params.programId);
+    const recipeId = req.params.recipeId;
+    const orderId = req.query.order_id ? parseInt(req.query.order_id) : null;
+
+    let query = `
+      SELECT ga.gate, ga.response_time_ms, r.name as recipe_name
+      FROM gate_acknowledgments ga
+      LEFT JOIN recipes r ON r.id = ga.recipe_id OR r.name = ga.recipe_id
+      WHERE ga.program_id IN (${placeholders}) AND (ga.recipe_id = ? OR ga.recipe_id = CAST(? AS TEXT))
+    `;
+    const params = [...programIds, recipeId, recipeId];
+    if (orderId) {
+      query += ` AND ga.order_id = ?`;
+      params.push(orderId);
+    }
+    query += ` ORDER BY ga.gate`;
+
+    const rows = db.prepare(query).all(...params);
+    const byGate = {};
+    rows.forEach(row => {
+      if (!byGate[row.gate]) {
+        byGate[row.gate] = { gate: row.gate, recipe_name: row.recipe_name || 'Unknown', times: [], count: 0 };
+      }
+      byGate[row.gate].times.push(row.response_time_ms / 1000);
+      byGate[row.gate].count++;
+    });
+
+    res.json(Object.values(byGate).sort((a, b) => a.gate - b.gate));
+  } catch (error) {
+    log.error('system', 'fetch_order_ack_times_error', error);
+    res.status(500).json({ message: 'Failed to fetch order ack times' });
+  }
+});
+
+/**
+ * GET /api/stats/orders/:recipeId/program/:programId/blocked-times
+ * Gate blocked durations for a specific recipe within a program.
+ */
+router.get('/orders/:recipeId/program/:programId/blocked-times', verifyToken, (req, res) => {
+  try {
+    const { ids: programIds, placeholders } = parseProgramIds(req.params.programId);
+    const recipeId = req.params.recipeId;
+    const orderId = req.query.order_id ? parseInt(req.query.order_id) : null;
+
+    let query = `
+      SELECT ga.gate, ga.blocked_duration_ms, r.name as recipe_name
+      FROM gate_acknowledgments ga
+      LEFT JOIN recipes r ON r.id = ga.recipe_id OR r.name = ga.recipe_id
+      WHERE ga.program_id IN (${placeholders}) AND (ga.recipe_id = ? OR ga.recipe_id = CAST(? AS TEXT)) AND ga.was_blocked = 1
+    `;
+    const params = [...programIds, recipeId, recipeId];
+    if (orderId) {
+      query += ` AND ga.order_id = ?`;
+      params.push(orderId);
+    }
+    query += ` ORDER BY ga.gate`;
+
+    const rows = db.prepare(query).all(...params);
+    const byGate = {};
+    rows.forEach(row => {
+      if (!byGate[row.gate]) {
+        byGate[row.gate] = { gate: row.gate, recipe_name: row.recipe_name || 'Unknown', times: [], count: 0 };
+      }
+      byGate[row.gate].times.push(row.blocked_duration_ms / 1000);
+      byGate[row.gate].count++;
+    });
+
+    res.json(Object.values(byGate).sort((a, b) => a.gate - b.gate));
+  } catch (error) {
+    log.error('system', 'fetch_order_blocked_times_error', error);
+    res.status(500).json({ message: 'Failed to fetch order blocked times' });
+  }
+});
+
+/**
  * GET /api/stats/orders/:recipeId/program/:programId/pieces
  * Piece weight scatter/trend data from InfluxDB, scoped to a program's time range.
  */
 router.get('/orders/:recipeId/program/:programId/pieces', verifyToken, async (req, res) => {
   try {
-    const programId = parseInt(req.params.programId);
+    const { ids: programIds, placeholders } = parseProgramIds(req.params.programId);
     const recipeId = parseInt(req.params.recipeId);
     const orderId = req.query.order_id ? parseInt(req.query.order_id) : null;
 
@@ -1239,9 +1399,9 @@ router.get('/orders/:recipeId/program/:programId/pieces', verifyToken, async (re
       SELECT MIN(bc.completed_at) as start_ts, MAX(bc.completed_at) as end_ts,
              SUM(bc.pieces) as total_pieces
       FROM batch_completions bc
-      WHERE bc.program_id = ? AND bc.recipe_id = ? AND bc.gate != 0
+      WHERE bc.program_id IN (${placeholders}) AND bc.recipe_id = ? AND bc.gate != 0
     `;
-    const rangeParams = [programId, recipeId];
+    const rangeParams = [...programIds, recipeId];
     if (orderId) {
       rangeQuery += ` AND bc.order_id = ?`;
       rangeParams.push(orderId);
@@ -1356,6 +1516,151 @@ router.get('/programs-dates', verifyToken, (req, res) => {
   } catch (error) {
     log.error('system', 'fetch_program_dates_error', error);
     res.status(500).json({ message: 'Failed to fetch program dates' });
+  }
+});
+
+/**
+ * GET /api/stats/pieces-log
+ * Returns the last N pieces (default 2000) with computed delta times.
+ */
+router.get('/pieces-log', verifyToken, (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit) || 2000, 5000);
+    const rows = db.prepare(`
+      SELECT id, piece_id, gate, weight_g, length_mm, status, calculation_time_ms,
+             is_last_piece, recipe_name, order_id, program_id, created_at
+      FROM piece_log
+      ORDER BY id DESC
+      LIMIT ?
+    `).all(limit);
+
+    // Reverse to chronological order for delta computation
+    rows.reverse();
+
+    let prevTs = null;
+    const prevTsByGate = {};
+    const result = rows.map(row => {
+      const ts = new Date(row.created_at).getTime();
+      const deltaMs = prevTs !== null ? ts - prevTs : null;
+      const locDeltaMs = prevTsByGate[row.gate] != null ? ts - prevTsByGate[row.gate] : null;
+      prevTs = ts;
+      prevTsByGate[row.gate] = ts;
+      return {
+        ...row,
+        delta_ms: deltaMs,
+        location_delta_ms: locDeltaMs,
+      };
+    });
+
+    // Return in reverse-chronological order (newest first)
+    result.reverse();
+    res.json(result);
+  } catch (error) {
+    log.error('system', 'fetch_pieces_log_error', error);
+    res.status(500).json({ message: 'Failed to fetch pieces log' });
+  }
+});
+
+/**
+ * GET /api/stats/batches-log
+ * Returns the last N batches (default 2000) with computed delta times, give-away, and response time.
+ */
+router.get('/batches-log', verifyToken, (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit) || 2000, 5000);
+    const rows = db.prepare(`
+      SELECT bc.id, bc.gate, bc.completed_at, bc.pieces, bc.weight_g,
+             bc.recipe_id, bc.order_id, bc.program_id,
+             COALESCE(bc.status, 'completed') AS batch_status,
+             r.name AS recipe_name,
+             r.batch_min_weight_g, r.batch_max_weight_g,
+             r.min_pieces_per_batch, r.max_pieces_per_batch,
+             ga.response_time_ms,
+             ga.batch_filled_at,
+             ga.acknowledged_at,
+             o.id AS oid,
+             c.name AS customer_name
+      FROM batch_completions bc
+      LEFT JOIN recipes r ON r.id = bc.recipe_id
+      LEFT JOIN gate_acknowledgments ga
+        ON ga.gate = bc.gate AND ga.batch_filled_at = bc.completed_at
+      LEFT JOIN orders o ON o.id = bc.order_id
+      LEFT JOIN customers c ON c.id = o.customer_id
+      ORDER BY bc.id DESC
+      LIMIT ?
+    `).all(limit);
+
+    // Reverse to chronological order for delta computation
+    rows.reverse();
+
+    let prevTs = null;
+    const prevTsByGate = {};
+
+    // Find last batch per recipe/order per gate
+    const lastBatchMap = {};
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const row = rows[i];
+      const key = `${row.gate}_${row.recipe_id}_${row.order_id || 0}`;
+      if (!lastBatchMap[key]) lastBatchMap[key] = row.id;
+    }
+
+    const result = rows.map(row => {
+      const ts = new Date(row.completed_at).getTime();
+      const deltaMs = prevTs !== null ? ts - prevTs : null;
+      const locDeltaMs = prevTsByGate[row.gate] != null ? ts - prevTsByGate[row.gate] : null;
+      const completionTimeSec = locDeltaMs != null ? locDeltaMs / 1000 : null;
+
+      prevTs = ts;
+      prevTsByGate[row.gate] = ts;
+
+      // Give-away per batch
+      const targetWeight = row.batch_min_weight_g || 0;
+      const giveawayG = targetWeight > 0 ? Math.max(0, row.weight_g - targetWeight) : null;
+      const giveawayPct = (targetWeight > 0 && row.weight_g > 0)
+        ? Math.max(0, ((row.weight_g - targetWeight) / targetWeight) * 100)
+        : null;
+
+      // Status: read from DB column (only 'terminated' when explicitly force-stopped via setup screen)
+      const status = row.batch_status;
+
+      // Last batch for this recipe/order on this gate
+      const lastKey = `${row.gate}_${row.recipe_id}_${row.order_id || 0}`;
+      const isLastBatch = lastBatchMap[lastKey] === row.id ? 1 : 0;
+
+      // Display name: show customer order name if available, otherwise recipe name
+      const rawRecipeName = row.recipe_name || `Recipe ${row.recipe_id}`;
+      const displayName = (row.oid && row.customer_name)
+        ? `${row.customer_name} - #${row.oid}`
+        : rawRecipeName;
+
+      return {
+        id: row.id,
+        gate: row.gate,
+        completed_at: row.completed_at,
+        pieces: row.pieces,
+        weight_g: row.weight_g,
+        recipe_name: rawRecipeName,
+        display_name: displayName,
+        recipe_id: row.recipe_id,
+        order_id: row.order_id,
+        program_id: row.program_id,
+        delta_ms: deltaMs,
+        location_delta_ms: locDeltaMs,
+        giveaway_g: giveawayG != null ? Math.round(giveawayG * 10) / 10 : null,
+        giveaway_pct: giveawayPct != null ? Math.round(giveawayPct * 100) / 100 : null,
+        completion_time_sec: completionTimeSec != null ? Math.round(completionTimeSec * 100) / 100 : null,
+        response_time_ms: row.response_time_ms || null,
+        status,
+        is_last_batch: isLastBatch,
+      };
+    });
+
+    // Return in reverse-chronological order (newest first)
+    result.reverse();
+    res.json(result);
+  } catch (error) {
+    log.error('system', 'fetch_batches_log_error', error);
+    res.status(500).json({ message: 'Failed to fetch batches log' });
   }
 });
 

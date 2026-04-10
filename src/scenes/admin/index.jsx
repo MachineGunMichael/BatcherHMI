@@ -272,17 +272,20 @@ const AdminPage = () => {
     }
   };
 
+  const isDarkMode = theme.palette.mode === 'dark';
+
   // Table styling
   const tableHeaderSx = {
     fontWeight: 'bold',
-    color: colors.grey[800],
-    borderBottom: `2px solid ${colors.grey[300]}`,
-    backgroundColor: colors.grey[100],
+    color: isDarkMode ? colors.grey[800] : colors.grey[800],
+    borderBottom: `2px solid ${isDarkMode ? colors.grey[500] : colors.grey[300]}`,
+    backgroundColor: isDarkMode ? colors.primary[200] : colors.primary[200],
     py: 1.5,
   };
 
   const tableCellSx = {
-    borderBottom: `1px solid ${colors.grey[200]}`,
+    borderBottom: `1px solid ${isDarkMode ? colors.grey[400] : colors.grey[200]}`,
+    color: isDarkMode ? colors.primary[800] : 'inherit',
     py: 1.5,
   };
 
@@ -319,7 +322,7 @@ const AdminPage = () => {
       <Paper 
         elevation={0} 
         sx={{ 
-          border: `1px solid ${colors.grey[300]}`,
+          border: `1px solid ${isDarkMode ? colors.grey[600] : colors.grey[300]}`,
           borderRadius: '8px',
           mb: 3,
         }}
@@ -328,17 +331,20 @@ const AdminPage = () => {
           value={tabValue} 
           onChange={(e, v) => setTabValue(v)}
           sx={{
-            borderBottom: `1px solid ${colors.grey[300]}`,
+            borderBottom: `1px solid ${isDarkMode ? colors.grey[600] : colors.grey[300]}`,
             '& .MuiTab-root': {
               textTransform: 'none',
               fontWeight: 600,
               fontSize: '14px',
+              color: isDarkMode ? colors.grey[500] : colors.grey[500],
             },
             '& .Mui-selected': {
-              color: colors.tealAccent[600],
+              color: `${colors.tealAccent[500]} !important`,
             },
             '& .MuiTabs-indicator': {
               backgroundColor: colors.tealAccent[500],
+              height: 3,
+              borderRadius: '3px 3px 0 0',
             },
           }}
         >
@@ -385,7 +391,7 @@ const AdminPage = () => {
                     {customers.map((customer) => (
                       <TableRow key={customer.id} hover>
                         <TableCell sx={tableCellSx}>
-                          <Typography fontWeight="600" color={colors.tealAccent[600]}>
+                          <Typography fontWeight="600">
                             #{customer.id}
                           </Typography>
                         </TableCell>
@@ -483,7 +489,7 @@ const AdminPage = () => {
                       return (
                         <TableRow key={user.id} hover>
                           <TableCell sx={tableCellSx}>
-                            <Typography fontWeight="600" color={colors.tealAccent[600]}>
+                            <Typography fontWeight="600">
                               #{user.id}
                             </Typography>
                           </TableCell>
@@ -555,15 +561,14 @@ const AdminPage = () => {
         fullWidth
         PaperProps={{ sx: { borderRadius: '12px' } }}
       >
-        <DialogTitle sx={{ borderBottom: `1px solid ${colors.grey[200]}`, pb: 2 }}>
-          <Typography variant="h5" fontWeight="bold" color={colors.grey[800]}>
-            {editingCustomer ? 'Edit Customer' : 'Add Customer'}
-          </Typography>
+        <DialogTitle sx={{ fontWeight: 'bold', color: colors.tealAccent[500] }}>
+          {editingCustomer ? 'Edit Customer' : 'Add Customer'}
         </DialogTitle>
-        <DialogContent sx={{ pt: 3 }}>
-          <Box display="flex" flexDirection="column" gap={2.5}>
+        <DialogContent sx={{ overflowY: 'auto' }}>
+          <Box display="flex" flexDirection="column" gap={2.5} sx={{ mt: 2 }}>
             <TextField
               label="Company Name"
+              color="secondary"
               value={customerForm.name}
               onChange={(e) => setCustomerForm({ ...customerForm, name: e.target.value })}
               fullWidth
@@ -571,6 +576,7 @@ const AdminPage = () => {
             />
             <TextField
               label="Address"
+              color="secondary"
               value={customerForm.address}
               onChange={(e) => setCustomerForm({ ...customerForm, address: e.target.value })}
               fullWidth
@@ -580,18 +586,21 @@ const AdminPage = () => {
             <TextField
               label="Email"
               type="email"
+              color="secondary"
               value={customerForm.contact_email}
               onChange={(e) => setCustomerForm({ ...customerForm, contact_email: e.target.value })}
               fullWidth
             />
             <TextField
               label="Phone"
+              color="secondary"
               value={customerForm.contact_phone}
               onChange={(e) => setCustomerForm({ ...customerForm, contact_phone: e.target.value })}
               fullWidth
             />
             <TextField
               label="Notes"
+              color="secondary"
               value={customerForm.notes}
               onChange={(e) => setCustomerForm({ ...customerForm, notes: e.target.value })}
               fullWidth
@@ -600,18 +609,23 @@ const AdminPage = () => {
             />
           </Box>
         </DialogContent>
-        <DialogActions sx={{ p: 2.5, borderTop: `1px solid ${colors.grey[200]}` }}>
-          <Button onClick={() => setCustomerDialogOpen(false)} sx={{ color: colors.grey[600] }}>
+        <DialogActions sx={{ p: 2, gap: 1 }}>
+          <Button 
+            onClick={() => setCustomerDialogOpen(false)} 
+            variant="contained"
+            sx={{ 
+              bgcolor: colors.grey[500],
+              color: '#fff',
+              '&:hover': { bgcolor: colors.grey[600] },
+            }}
+          >
             Cancel
           </Button>
           <Button 
             onClick={handleSubmitCustomer} 
             variant="contained"
+            color="secondary"
             disabled={!customerForm.name}
-            sx={{
-              bgcolor: colors.tealAccent[500],
-              '&:hover': { bgcolor: colors.tealAccent[600] },
-            }}
           >
             {editingCustomer ? 'Update' : 'Create'}
           </Button>
@@ -626,15 +640,14 @@ const AdminPage = () => {
         fullWidth
         PaperProps={{ sx: { borderRadius: '12px' } }}
       >
-        <DialogTitle sx={{ borderBottom: `1px solid ${colors.grey[200]}`, pb: 2 }}>
-          <Typography variant="h5" fontWeight="bold" color={colors.grey[800]}>
-            {editingUser ? 'Edit User' : 'Add User'}
-          </Typography>
+        <DialogTitle sx={{ fontWeight: 'bold', color: colors.tealAccent[500] }}>
+          {editingUser ? 'Edit User' : 'Add User'}
         </DialogTitle>
-        <DialogContent sx={{ pt: 3 }}>
-          <Box display="flex" flexDirection="column" gap={2.5}>
+        <DialogContent sx={{ overflowY: 'auto' }}>
+          <Box display="flex" flexDirection="column" gap={2.5} sx={{ mt: 2 }}>
             <TextField
               label="Username"
+              color="secondary"
               value={userForm.username}
               onChange={(e) => setUserForm({ ...userForm, username: e.target.value })}
               fullWidth
@@ -644,6 +657,7 @@ const AdminPage = () => {
             <TextField
               label={editingUser ? "New Password (leave blank to keep)" : "Password"}
               type="password"
+              color="secondary"
               value={userForm.password}
               onChange={(e) => setUserForm({ ...userForm, password: e.target.value })}
               fullWidth
@@ -651,17 +665,19 @@ const AdminPage = () => {
             />
             <TextField
               label="Display Name"
+              color="secondary"
               value={userForm.name}
               onChange={(e) => setUserForm({ ...userForm, name: e.target.value })}
               fullWidth
               required
             />
-            <FormControl fullWidth>
-              <InputLabel>Role</InputLabel>
+            <FormControl fullWidth color="secondary">
+              <InputLabel color="secondary">Role</InputLabel>
               <Select
                 value={userForm.role}
                 onChange={(e) => setUserForm({ ...userForm, role: e.target.value })}
                 label="Role"
+                color="secondary"
               >
                 <MenuItem value="admin">Admin</MenuItem>
                 <MenuItem value="manager">Manager</MenuItem>
@@ -670,12 +686,13 @@ const AdminPage = () => {
               </Select>
             </FormControl>
             {userForm.role === 'customer' && (
-              <FormControl fullWidth required>
-                <InputLabel>Linked Customer</InputLabel>
+              <FormControl fullWidth required color="secondary">
+                <InputLabel color="secondary">Linked Customer</InputLabel>
                 <Select
                   value={userForm.customer_id}
                   onChange={(e) => setUserForm({ ...userForm, customer_id: e.target.value })}
                   label="Linked Customer"
+                  color="secondary"
                 >
                   {customers.map((customer) => (
                     <MenuItem key={customer.id} value={customer.id}>
@@ -687,18 +704,23 @@ const AdminPage = () => {
             )}
           </Box>
         </DialogContent>
-        <DialogActions sx={{ p: 2.5, borderTop: `1px solid ${colors.grey[200]}` }}>
-          <Button onClick={() => setUserDialogOpen(false)} sx={{ color: colors.grey[600] }}>
+        <DialogActions sx={{ p: 2, gap: 1 }}>
+          <Button 
+            onClick={() => setUserDialogOpen(false)} 
+            variant="contained"
+            sx={{ 
+              bgcolor: colors.grey[500],
+              color: '#fff',
+              '&:hover': { bgcolor: colors.grey[600] },
+            }}
+          >
             Cancel
           </Button>
           <Button 
             onClick={handleSubmitUser} 
             variant="contained"
+            color="secondary"
             disabled={!userForm.username || !userForm.name || (!editingUser && !userForm.password)}
-            sx={{
-              bgcolor: colors.tealAccent[500],
-              '&:hover': { bgcolor: colors.tealAccent[600] },
-            }}
           >
             {editingUser ? 'Update' : 'Create'}
           </Button>

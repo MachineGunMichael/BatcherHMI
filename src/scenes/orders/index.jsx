@@ -373,9 +373,9 @@ const OrdersPage = () => {
   // TABLE HEADER styling
   const tableHeaderSx = {
     fontWeight: 'bold',
-    color: isDarkMode ? colors.grey[800] : colors.grey[800],              // Header text color
+    color: isDarkMode ? colors.grey[800] : colors.grey[800],
     borderBottom: `2px solid ${isDarkMode ? colors.grey[500] : colors.grey[300]}`,
-    backgroundColor: isDarkMode ? colors.primary[200] : colors.primary[200], // Header background
+    backgroundColor: isDarkMode ? colors.primary[200] : colors.primary[200],
     py: 1.5,
   };
 
@@ -437,7 +437,7 @@ const OrdersPage = () => {
 
   const renderActiveOrdersTable = (ordersList, title = '') => (
     <Box mb={4}>
-      <Typography variant="h5" fontWeight="bold" color={isDarkMode ? colors.primary[800] : colors.primary[800]} mb={2}>
+      <Typography variant="h5" fontWeight="bold" color={colors.tealAccent[500]} mb={2}>
         {title} ({ordersList.length})
       </Typography>
       
@@ -660,7 +660,7 @@ const OrdersPage = () => {
 
   const renderOrderHistoryTable = (ordersList, title = '') => (
     <Box mb={4}>
-      <Typography variant="h5" fontWeight="bold" color={isDarkMode ? colors.primary[800] : colors.primary[800]} mb={2}>
+      <Typography variant="h5" fontWeight="bold" color={colors.tealAccent[500]} mb={2}>
         {title} ({ordersList.length})
       </Typography>
       

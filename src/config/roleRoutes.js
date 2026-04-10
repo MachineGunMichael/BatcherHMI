@@ -1,9 +1,11 @@
 import Dashboard from "../scenes/dashboard";
+import KPI from "../scenes/kpi";
 import Setup from "../scenes/setup";
 import PlanAssist from "../scenes/planAssist";
 import Stats from "../scenes/stats";
 import Orders from "../scenes/orders";
 import Admin from "../scenes/admin";
+import Maintenance from "../scenes/maintenance";
 
 // Define all available routes with their metadata
 export const ROUTES = {
@@ -12,6 +14,12 @@ export const ROUTES = {
     name: "Dashboard",
     component: Dashboard,
     icon: "dashboard"
+  },
+  KPI: {
+    path: "/kpi",
+    name: "KPI",
+    component: KPI,
+    icon: "kpi"
   },
   SETUP: {
     path: "/setup",
@@ -37,6 +45,12 @@ export const ROUTES = {
     component: Orders,
     icon: "orders"
   },
+  MAINTENANCE: {
+    path: "/maintenance",
+    name: "Maintenance",
+    component: Maintenance,
+    icon: "maintenance"
+  },
   ADMIN: {
     path: "/admin",
     name: "Admin",
@@ -49,19 +63,24 @@ export const ROUTES = {
 export const ROLE_ROUTES = {
   admin: [
     ROUTES.DASHBOARD,
+    ROUTES.KPI,
     ROUTES.SETUP,
     ROUTES.STATS,
     ROUTES.PLAN_ASSIST,
     ROUTES.ORDERS,
+    ROUTES.MAINTENANCE,
     ROUTES.ADMIN,
   ],
   manager: [
     ROUTES.DASHBOARD,
+    ROUTES.KPI,
     ROUTES.STATS,
   ],
   operator: [
     ROUTES.DASHBOARD,
-    ROUTES.SETUP
+    ROUTES.KPI,
+    ROUTES.SETUP,
+    ROUTES.MAINTENANCE,
   ],
   customer: [
     ROUTES.ORDERS,

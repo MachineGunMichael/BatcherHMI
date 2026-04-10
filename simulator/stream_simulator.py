@@ -148,6 +148,8 @@ class DataStreamSimulator:
                 "weight_g": weight_g,
                 "gate": assigned_gate
             }
+            if 'length_mm' in piece:
+                payload["length_mm"] = piece['length_mm']
             
             # Add PLC authentication header
             headers = {

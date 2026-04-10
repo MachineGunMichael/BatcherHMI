@@ -9,6 +9,7 @@ const db = require('../db/sqlite');
 const log = require('../lib/logger');
 const { verifyToken } = require('../utils/authMiddleware');
 const orderRepo = require('../repositories/orderRepo');
+const pauseTracker = require('../lib/pauseTracker');
 
 /**
  * GET /api/machine/state
@@ -21,6 +22,42 @@ router.get('/state', (req, res) => {
   } catch (error) {
     log.error('system', 'get_machine_state_error', error);
     res.status(500).json({ error: 'Failed to get machine state' });
+  }
+});
+
+/**
+ * GET /api/machine/weight-tare
+ * Get the current weight tare value
+ */
+router.get('/weight-tare', (req, res) => {
+  try {
+    const row = db.prepare('SELECT weight_tare_g FROM machine_state WHERE id = 1').get();
+    res.json({ weight_tare_g: row?.weight_tare_g ?? 0 });
+  } catch (error) {
+    log.error('system', 'get_weight_tare_error', error);
+    res.status(500).json({ error: 'Failed to get weight tare' });
+  }
+});
+
+/**
+ * POST /api/machine/weight-tare
+ * Set the weight tare value
+ * Body: { weight_tare_g: number }
+ */
+router.post('/weight-tare', verifyToken, (req, res) => {
+  try {
+    const { weight_tare_g } = req.body;
+    if (weight_tare_g == null || isNaN(Number(weight_tare_g))) {
+      return res.status(400).json({ error: 'weight_tare_g must be a number' });
+    }
+    const val = Math.round(Number(weight_tare_g) * 10) / 10;
+    db.prepare('UPDATE machine_state SET weight_tare_g = ? WHERE id = 1').run(val);
+    log.info('system', 'weight_tare_updated', { weight_tare_g: val, user: req.user?.username });
+    eventBus.broadcast('machine:state-changed', machineState.getState());
+    res.json({ ok: true, weight_tare_g: val });
+  } catch (error) {
+    log.error('system', 'set_weight_tare_error', error);
+    res.status(500).json({ error: 'Failed to set weight tare' });
   }
 });
 
@@ -178,6 +215,10 @@ function handleStart(currentState, res, user) {
     });
     
   } else if (currentState.state === 'paused') {
+    // Close the pause interval for the current program
+    const resumedAt = new Date().toISOString();
+    pauseTracker.recordResume(currentState.currentProgramId, resumedAt);
+
     // Start from paused: check if recipes changed
     const changed = machineState.recipesChanged();
     const alreadyTransitioning = machineState.hasTransitioningGates();
@@ -385,6 +426,10 @@ function handlePause(currentState, res, user) {
   }
   
   log.operations('machine_paused', `Machine paused for program ${currentState.currentProgramId}`, { programId: currentState.currentProgramId });
+
+  const pausedAt = new Date().toISOString();
+  pauseTracker.recordPause(currentState.currentProgramId, pausedAt);
+
   machineState.updateState({ state: 'paused' });
   
   return res.json({
@@ -618,6 +663,11 @@ async function handleStop(currentState, res, user) {
   
   const gates = require('../state/gates');
   gates.resetAll();
+  // Close any open pause interval before stopping
+  if (currentState.currentProgramId && currentState.state === 'paused') {
+    pauseTracker.recordResume(currentState.currentProgramId, new Date().toISOString());
+  }
+
   machineState.reset(true); // keepRecipes=true so operator can finish/skip each one
   
   // Give Python worker time to detect state change and flush KPIs
@@ -1020,43 +1070,40 @@ router.get('/stream', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  let cleaned = false;
+  function cleanup() {
+    if (cleaned) return;
+    cleaned = true;
+    clearInterval(bufferCheck);
+    eventBus.bus.off('machine:state-changed', stateListener);
+    eventBus.bus.off('order_batch_update', orderBatchListener);
+    eventBus.bus.off('order_completed', orderCompletedListener);
+    eventBus.bus.off('recipe_batch_update', recipeBatchListener);
+    eventBus.bus.off('recipe_completed', recipeCompletedListener);
+    eventBus.bus.off('batch_limit_transition_started', batchLimitTransitionListener);
+    eventBus.bus.off('machine:consistency-fix', consistencyFixListener);
+    eventBus.bus.off('gate_handoff', gateHandoffListener);
+    log.sseClientDisconnected(clientId);
+  }
+
+  function safeSend(payload) {
+    if (cleaned || res.destroyed || res.writableEnded) { cleanup(); return; }
+    try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch { cleanup(); }
+  }
   
   const initialState = machineState.getState();
-  res.write(`data: ${JSON.stringify(initialState)}\n\n`);
+  safeSend(initialState);
   
-  const stateListener = (state) => {
-    res.write(`data: ${JSON.stringify(state)}\n\n`);
-  };
-  
-  // Listen for order batch updates
-  const orderBatchListener = (data) => {
-    res.write(`data: ${JSON.stringify({ type: 'order_batch_update', ...data })}\n\n`);
-  };
-  
-  // Listen for order completion
-  const orderCompletedListener = (data) => {
-    res.write(`data: ${JSON.stringify({ type: 'order_completed', ...data })}\n\n`);
-  };
-
-  // Listen for recipe batch updates (per-recipe batch counts)
-  const recipeBatchListener = (data) => {
-    res.write(`data: ${JSON.stringify({ type: 'recipe_batch_update', ...data })}\n\n`);
-  };
-
-  // Listen for recipe completion
-  const recipeCompletedListener = (data) => {
-    res.write(`data: ${JSON.stringify({ type: 'recipe_completed', ...data })}\n\n`);
-  };
-
-  // Listen for batch limit transition start
-  const batchLimitTransitionListener = (data) => {
-    res.write(`data: ${JSON.stringify({ type: 'batch_limit_transition_started', ...data })}\n\n`);
-  };
-
-  // Listen for gate handoffs (gate freed → assigned to next queue item)
-  const gateHandoffListener = (data) => {
-    res.write(`data: ${JSON.stringify({ type: 'gate_handoff', ...data })}\n\n`);
-  };
+  const stateListener = (state) => safeSend(state);
+  const orderBatchListener = (data) => safeSend({ type: 'order_batch_update', ...data });
+  const orderCompletedListener = (data) => safeSend({ type: 'order_completed', ...data });
+  const recipeBatchListener = (data) => safeSend({ type: 'recipe_batch_update', ...data });
+  const recipeCompletedListener = (data) => safeSend({ type: 'recipe_completed', ...data });
+  const batchLimitTransitionListener = (data) => safeSend({ type: 'batch_limit_transition_started', ...data });
+  const gateHandoffListener = (data) => safeSend({ type: 'gate_handoff', ...data });
+  const consistencyFixListener = (data) => safeSend({ type: 'consistency_fix', ...data });
   
   eventBus.bus.on('machine:state-changed', stateListener);
   eventBus.bus.on('order_batch_update', orderBatchListener);
@@ -1065,20 +1112,22 @@ router.get('/stream', (req, res) => {
   eventBus.bus.on('recipe_completed', recipeCompletedListener);
   eventBus.bus.on('batch_limit_transition_started', batchLimitTransitionListener);
   eventBus.bus.on('gate_handoff', gateHandoffListener);
+  eventBus.bus.on('machine:consistency-fix', consistencyFixListener);
   
   const clientId = Math.random().toString(36).substring(7);
   log.sseClientConnected(clientId);
+
+  const bufferCheck = setInterval(() => {
+    if (res.destroyed || res.writableEnded) { cleanup(); return; }
+    if (res.writableLength > 512 * 1024) {
+      console.warn('Machine SSE: closing stale connection (buffered %d KB)', Math.round(res.writableLength / 1024));
+      cleanup();
+      try { res.end(); } catch {}
+    }
+  }, 10_000);
   
-  req.on('close', () => {
-    eventBus.bus.off('machine:state-changed', stateListener);
-    eventBus.bus.off('order_batch_update', orderBatchListener);
-    eventBus.bus.off('order_completed', orderCompletedListener);
-    eventBus.bus.off('recipe_batch_update', recipeBatchListener);
-    eventBus.bus.off('recipe_completed', recipeCompletedListener);
-    eventBus.bus.off('batch_limit_transition_started', batchLimitTransitionListener);
-    eventBus.bus.off('gate_handoff', gateHandoffListener);
-    log.sseClientDisconnected(clientId);
-  });
+  req.on('close', cleanup);
+  res.on('error', cleanup);
 });
 
 /**
@@ -1132,8 +1181,8 @@ router.post('/skip-transition', async (req, res) => {
       
       if (programIdForBatch && pieces > 0) {
         db.prepare(`
-          INSERT INTO batch_completions (gate, completed_at, pieces, weight_g, recipe_id, program_id)
-          VALUES (?, ?, ?, ?, ?, ?)
+          INSERT INTO batch_completions (gate, completed_at, pieces, weight_g, recipe_id, program_id, status)
+          VALUES (?, ?, ?, ?, ?, ?, 'terminated')
         `).run(gate, tsIso, pieces, grams, recipeIdForStats, programIdForBatch);
       }
     } catch (err) {
@@ -1316,6 +1365,20 @@ router.post('/pause-gate', verifyToken, (req, res) => {
   } catch (error) {
     log.error('system', 'pause_gate_error', error);
     res.status(500).json({ error: 'Failed to pause gate' });
+  }
+});
+
+/**
+ * GET /api/machine/consistency-check
+ * Run a consistency audit on active recipes and auto-fix issues.
+ */
+router.get('/consistency-check', verifyToken, (req, res) => {
+  try {
+    const result = machineState.runConsistencyCheck();
+    res.json(result);
+  } catch (error) {
+    log.error('system', 'consistency_check_error', error);
+    res.status(500).json({ error: 'Consistency check failed' });
   }
 });
 

@@ -1,4 +1,4 @@
-import React, { createContext, useState, useContext, useEffect } from 'react';
+import React, { createContext, useState, useContext, useEffect, useMemo, useCallback } from 'react';
 
 // Create the context
 const AppContext = createContext(null);
@@ -89,139 +89,98 @@ export function AppContextProvider({ children }) {
     } catch (error) { /* ignore */ }
   }, []);
 
-  // Update function with localStorage persistence
-  const setDashboardVisibleSeries = (value) => {
+  // Stable setter wrappers — useCallback keeps references stable across renders
+  const setDashboardVisibleSeries = useCallback((value) => {
     if (typeof value === 'function') {
       setDashboardVisibleSeriesState(prev => {
         const updated = value(prev);
-        try {
-          localStorage.setItem('dashboard_visibleSeries', JSON.stringify(updated));
-        } catch (error) { /* ignore */ }
+        try { localStorage.setItem('dashboard_visibleSeries', JSON.stringify(updated)); } catch (_) {}
         return updated;
       });
     } else {
       setDashboardVisibleSeriesState(value);
-      try {
-        localStorage.setItem('dashboard_visibleSeries', JSON.stringify(value));
-      } catch (error) { /* ignore */ }
+      try { localStorage.setItem('dashboard_visibleSeries', JSON.stringify(value)); } catch (_) {}
     }
-  };
+  }, []);
   
-  const setSelectedSimulation = (value) => {
+  const setSelectedSimulation = useCallback((value) => {
     setSelectedSimulationState(value);
-    try {
-      localStorage.setItem('simulation_selectedSimulation', value);
-    } catch (error) { /* ignore */ }
-  };
+    try { localStorage.setItem('simulation_selectedSimulation', value); } catch (_) {}
+  }, []);
   
-  const setSliderValue = (value) => {
+  const setSliderValue = useCallback((value) => {
     setSliderValueState(value);
-    try {
-      localStorage.setItem('simulation_sliderValue', String(value));
-    } catch (error) { /* ignore */ }
-  };
+    try { localStorage.setItem('simulation_sliderValue', String(value)); } catch (_) {}
+  }, []);
   
-  const setSettingsMode = (value) => {
+  const setSettingsMode = useCallback((value) => {
     setSettingsModeState(value);
-    try {
-      localStorage.setItem('settings_mode', value);
-    } catch (error) { /* ignore */ }
-  };
+    try { localStorage.setItem('settings_mode', value); } catch (_) {}
+  }, []);
   
-  const setAssignedPrograms = (value) => {
+  const setAssignedPrograms = useCallback((value) => {
     if (typeof value === 'function') {
       setAssignedProgramsState(prev => {
         const updated = value(prev);
-        try {
-          localStorage.setItem('settings_assignedPrograms', JSON.stringify(updated));
-        } catch (error) { /* ignore */ }
+        try { localStorage.setItem('settings_assignedPrograms', JSON.stringify(updated)); } catch (_) {}
         return updated;
       });
     } else {
       setAssignedProgramsState(value);
-      try {
-        localStorage.setItem('settings_assignedPrograms', JSON.stringify(value));
-      } catch (error) { /* ignore */ }
+      try { localStorage.setItem('settings_assignedPrograms', JSON.stringify(value)); } catch (_) {}
     }
-  };
+  }, []);
   
-  // Note: Order queue (assignedRecipes) is now persisted to backend database
-  // by the Setup component, not to localStorage
-  const setAssignedRecipes = (value) => {
+  const setAssignedRecipes = useCallback((value) => {
     if (typeof value === 'function') {
       setAssignedRecipesState(prev => value(prev));
     } else {
       setAssignedRecipesState(value);
     }
-  };
+  }, []);
   
-  const setActiveRecipes = (value) => {
+  const setActiveRecipes = useCallback((value) => {
     if (typeof value === 'function') {
       setActiveRecipesState(prev => {
         const updated = value(prev);
-        try {
-          localStorage.setItem('activeRecipes', JSON.stringify(updated));
-        } catch (error) { /* ignore */ }
+        try { localStorage.setItem('activeRecipes', JSON.stringify(updated)); } catch (_) {}
         return updated;
       });
     } else {
       setActiveRecipesState(value);
-      try {
-        localStorage.setItem('activeRecipes', JSON.stringify(value));
-      } catch (error) { /* ignore */ }
+      try { localStorage.setItem('activeRecipes', JSON.stringify(value)); } catch (_) {}
     }
-  };
+  }, []);
   
-  const setRecipeOrderMap = (value) => {
+  const setRecipeOrderMap = useCallback((value) => {
     if (typeof value === 'function') {
       setRecipeOrderMapState(prev => {
         const updated = value(prev);
-        try {
-          localStorage.setItem('recipeOrderMap', JSON.stringify(updated));
-        } catch (error) { /* ignore */ }
+        try { localStorage.setItem('recipeOrderMap', JSON.stringify(updated)); } catch (_) {}
         return updated;
       });
     } else {
       setRecipeOrderMapState(value);
-      try {
-        localStorage.setItem('recipeOrderMap', JSON.stringify(value));
-      } catch (error) { /* ignore */ }
+      try { localStorage.setItem('recipeOrderMap', JSON.stringify(value)); } catch (_) {}
     }
-  };
+  }, []);
 
-  const contextValue = {
-    // Role
-    currentRole,
-    setCurrentRole,
-    
-    // Dashboard
-    dashboardVisibleSeries,
-    setDashboardVisibleSeries,
-    
-    // Simulation
-    selectedSimulation,
-    setSelectedSimulation,
-    sliderValue,
-    setSliderValue,
-    
-    // Settings
-    settingsMode,
-    setSettingsMode,
-    assignedPrograms,
-    setAssignedPrograms,
-    
-    // Assigned Recipes (queue - shared between Setup and MachineControls)
-    assignedRecipes,
-    setAssignedRecipes,
-    
-    // Active Recipes (currently running on gates - includes order info)
-    activeRecipes,
-    setActiveRecipes,
-    
-    // Recipe to Order mapping (for Dashboard display)
-    recipeOrderMap,
-    setRecipeOrderMap,
-  };
+  const contextValue = useMemo(() => ({
+    currentRole, setCurrentRole,
+    dashboardVisibleSeries, setDashboardVisibleSeries,
+    selectedSimulation, setSelectedSimulation,
+    sliderValue, setSliderValue,
+    settingsMode, setSettingsMode,
+    assignedPrograms, setAssignedPrograms,
+    assignedRecipes, setAssignedRecipes,
+    activeRecipes, setActiveRecipes,
+    recipeOrderMap, setRecipeOrderMap,
+  }), [
+    currentRole, dashboardVisibleSeries, selectedSimulation, sliderValue,
+    settingsMode, assignedPrograms, assignedRecipes, activeRecipes, recipeOrderMap,
+    setCurrentRole, setDashboardVisibleSeries, setSelectedSimulation, setSliderValue,
+    setSettingsMode, setAssignedPrograms, setAssignedRecipes, setActiveRecipes, setRecipeOrderMap,
+  ]);
 
   return (
     <AppContext.Provider value={contextValue}>

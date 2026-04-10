@@ -10,6 +10,7 @@ const machineState = require("../services/machineState");
 const db = require("../db/sqlite");
 const log = require("../lib/logger");
 const orderRepo = require("../repositories/orderRepo");
+const pauseTracker = require("../lib/pauseTracker");
 
 // Simple shared-secret for PLCs (machines don't send JWTs)
 function verifyPlcSecret(req, res, next) {
@@ -51,20 +52,22 @@ function normalizeTs(ts) {
  */
 router.post("/weight", verifyPlcSecret, async (req, res) => {
   try {
-    const { piece_id, weight_g, ts } = req.body || {};
+    const { piece_id, weight_g, length_mm, ts } = req.body || {};
     const w = Number(weight_g);
     if (!Number.isFinite(w)) {
       return res.status(400).json({ message: "weight_g must be a number" });
     }
     const tIso = normalizeTs(ts);
+    const len = length_mm != null ? Number(length_mm) : null;
 
     await influx.writePiece({
       piece_id: piece_id ? String(piece_id) : undefined,
       weight_g: w,
+      length_mm: len,
       ts: tIso,
     });
 
-    broadcast("piece", { piece_id: piece_id ?? null, weight_g: w, ts: tIso });
+    broadcast("piece", { piece_id: piece_id ?? null, weight_g: w, length_mm: len, ts: tIso });
 
     res.json({ ok: true });
   } catch (e) {
@@ -83,18 +86,20 @@ router.post("/weight/batch", verifyPlcSecret, async (req, res) => {
 
     let count = 0;
     for (const item of arr) {
-      const { piece_id, weight_g, ts } = item || {};
+      const { piece_id, weight_g, length_mm: itemLen, ts } = item || {};
       const w = Number(weight_g);
       if (!Number.isFinite(w)) continue;
 
       const tIso = normalizeTs(ts);
+      const batchLen = itemLen != null ? Number(itemLen) : null;
       await influx.writePiece({
         piece_id: piece_id ? String(piece_id) : undefined,
         weight_g: w,
+        length_mm: batchLen,
         ts: tIso,
       });
 
-      broadcast("piece", { piece_id: piece_id ?? null, weight_g: w, ts: tIso });
+      broadcast("piece", { piece_id: piece_id ?? null, weight_g: w, length_mm: batchLen, ts: tIso });
       count++;
     }
 
@@ -120,12 +125,14 @@ router.post("/piece", verifyPlcSecret, async (req, res) => {
       return res.json({ ok: true, dropped: true, reason: `machine is ${state.state}` });
     }
     
-    const { weight_g, timestamp } = req.body || {};
+    const { weight_g, length_mm, timestamp } = req.body || {};
     const w = Number(weight_g);
     if (!Number.isFinite(w)) return res.status(400).json({ message: "weight_g must be a number" });
+    const len = length_mm != null ? Number(length_mm) : null;
 
     const tsIso = normalizeTs(timestamp);
     const piece_id = String(nextPieceId++);
+    const calcStart = process.hrtime.bigint();
 
     // RE-ASSIGN PIECE based on active recipes
     const eligibleGates = [];
@@ -145,6 +152,9 @@ router.post("/piece", verifyPlcSecret, async (req, res) => {
     for (let gate = gates.GATE_MIN; gate <= gates.GATE_MAX; gate++) {
       // Skip paused gates and gates belonging to paused recipes
       if (pausedGates.includes(gate) || pausedRecipeGates.has(gate)) continue;
+
+      // Skip gates that are blocked (main full in non-buffer mode, or both full in buffer mode)
+      if (gates.isGateBlocked(gate)) continue;
 
       const recipe = recipeManager.getRecipeForGate(gate);
       if (recipe && w >= recipe.pieceMin && w <= recipe.pieceMax) {
@@ -169,14 +179,15 @@ router.post("/piece", verifyPlcSecret, async (req, res) => {
       : 0;
 
     // Per-piece scatter update
-    broadcast("piece", { piece_id, gate: g, weight_g: w, ts: tsIso });
+    broadcast("piece", { piece_id, gate: g, weight_g: w, length_mm: len, ts: tsIso });
 
     // Write M1 to Influx (async)
-    influx.writePiece({ piece_id, weight_g: w, gate: g, ts: tsIso }).catch(err =>
+    influx.writePiece({ piece_id, weight_g: w, length_mm: len, gate: g, ts: tsIso }).catch(err =>
       log.error('system', 'm1_write_error', err)
     );
 
     // Update gate state + check for batch completion
+    let pieceResult = null;
     if (g >= gates.GATE_MIN && g <= gates.GATE_MAX) {
       const result = await gates.processPieceAtomic(g, w, (pieces, grams) => {
         const transitioningGates = machineState.getTransitioningGates();
@@ -188,7 +199,8 @@ router.post("/piece", verifyPlcSecret, async (req, res) => {
           }
         }
         return recipeManager.isBatchComplete(g, pieces, grams);
-      });
+      }, tsIso);
+      pieceResult = result;
       
       if (result.batchComplete) {
         const transitioningGates = machineState.getTransitioningGates();
@@ -565,34 +577,85 @@ router.post("/piece", verifyPlcSecret, async (req, res) => {
           }
         }
         
-        // Broadcast reset
-        broadcast("gate", { gate: g, pieces: 0, grams: 0, ts: tsIso });
-        
-        // Write M2 reset to InfluxDB
-        influx.writeGateState({
+        // Gate is now in filled state (no auto-reset; waits for operator acknowledgment)
+        const filledGateState = gates.getGateState(g);
+        broadcast("gate", {
           gate: g,
-          pieces_in_gate: 0,
-          weight_sum_g: 0,
+          main: filledGateState.main,
+          buffer: filledGateState.buffer,
+          mainFull: filledGateState.mainFull,
+          bufferFull: filledGateState.bufferFull,
+          pieces: filledGateState.main.pieces + filledGateState.buffer.pieces,
+          grams: filledGateState.main.grams + filledGateState.buffer.grams,
           ts: tsIso,
-        }).catch(err => log.error('system', 'm2_reset_write_error', err));
-        
-        // Broadcast full snapshot
+        });
+
+        // Emit event for operator simulator to schedule acknowledgment
+        if (result.compartment === 'main') {
+          broadcast("gate:main-filled", { gate: g, ts: tsIso });
+        }
+
         const snapshot = gates.getSnapshot();
         broadcast("overlay", { ts: tsIso, overlay: snapshot });
       } else {
-        // Normal increment
-        broadcast("gate", { gate: g, pieces: result.pieces, grams: result.grams, ts: tsIso });
+        // Normal increment — broadcast current compartment state
+        const curGateState = gates.getGateState(g);
+        broadcast("gate", {
+          gate: g,
+          main: curGateState.main,
+          buffer: curGateState.buffer,
+          mainFull: curGateState.mainFull,
+          bufferFull: curGateState.bufferFull,
+          pieces: curGateState.main.pieces + curGateState.buffer.pieces,
+          grams: curGateState.main.grams + curGateState.buffer.grams,
+          ts: tsIso,
+        });
         
         influx.writeGateState({
           gate: g,
-          pieces_in_gate: Math.floor(result.pieces),
-          weight_sum_g: Math.round(result.grams * 10) / 10,
+          pieces_in_gate: Math.floor(curGateState.main.pieces + curGateState.buffer.pieces),
+          weight_sum_g: Math.round((curGateState.main.grams + curGateState.buffer.grams) * 10) / 10,
           ts: tsIso,
         }).catch(err => log.error('system', 'm2_write_error', err));
       }
       
       // Persist gate state to survive restarts/crashes
       machineState.persistGateSnapshot();
+    }
+
+    // Log piece to SQLite for the Pieces table
+    const calcEnd = process.hrtime.bigint();
+    const calcTimeMs = Number(calcEnd - calcStart) / 1e6;
+    try {
+      const pieceStatus = (g === 0) ? 'rejected' : 'batched';
+      let isLastPiece = 0;
+      let pieceRecipeName = null;
+      let pieceOrderId = null;
+      if (g >= gates.GATE_MIN && g <= gates.GATE_MAX) {
+        const recipeForPiece = recipeManager.getRecipeForGate(g);
+        pieceRecipeName = recipeForPiece?.name || null;
+        const activeRecipesForPiece = machineState.getActiveRecipes();
+        const recipeOnGateForPiece = activeRecipesForPiece.find(r => r.gates && r.gates.includes(g));
+        pieceOrderId = recipeOnGateForPiece?.orderId || null;
+      }
+      if (pieceResult && pieceResult.batchComplete) {
+        isLastPiece = 1;
+      }
+      const programIdForPiece = getCurrentProgramId();
+      db.prepare(`
+        INSERT INTO piece_log (piece_id, gate, weight_g, length_mm, status, calculation_time_ms, is_last_piece, recipe_name, order_id, program_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(Number(piece_id), g, w, len, pieceStatus, Math.round(calcTimeMs * 100) / 100, isLastPiece, pieceRecipeName, pieceOrderId, programIdForPiece, tsIso);
+
+      // Prune periodically (every ~500 inserts) to keep table bounded
+      if (Number(piece_id) % 500 === 0) {
+        const count = db.prepare('SELECT COUNT(*) as cnt FROM piece_log').get().cnt;
+        if (count > 10000) {
+          db.prepare('DELETE FROM piece_log WHERE id <= (SELECT id FROM piece_log ORDER BY id DESC LIMIT 1 OFFSET 10000)').run();
+        }
+      }
+    } catch (pieceLogErr) {
+      // Non-critical — don't fail the ingest
     }
 
     res.json({ ok: true, piece_id });
@@ -634,6 +697,161 @@ router.post("/gate/reset", verifyPlcSecret, async (req, res) => {
   } catch (e) {
     log.error('system', 'gate_reset_error', e);
     res.status(500).json({ message: "Reset failed", error: e.message });
+  }
+});
+
+/**
+ * POST /api/ingest/gate/acknowledge
+ * Operator pressed the physical button — gate batch has been removed.
+ * In buffer mode: transfers buffer contents to main, checks for immediate completion.
+ * In non-buffer mode: resets the gate.
+ */
+router.post("/gate/acknowledge", verifyPlcSecret, async (req, res) => {
+  try {
+    const { gate, timestamp } = req.body || {};
+    const g = Number(gate);
+    if (!Number.isFinite(g) || g < gates.GATE_MIN || g > gates.GATE_MAX) {
+      return res.status(400).json({ message: "gate must be 1-8" });
+    }
+    const tsIso = normalizeTs(timestamp);
+
+    const gateStateBefore = gates.getGateState(g);
+    if (!gateStateBefore.mainFull) {
+      return res.json({ ok: true, noOp: true, reason: 'main is not full' });
+    }
+
+    const checkBatchComplete = (pieces, grams) => {
+      return recipeManager.isBatchComplete(g, pieces, grams);
+    };
+
+    const ackResult = gates.acknowledgeGate(g, checkBatchComplete, tsIso);
+
+    // Record KPI
+    const programId = getCurrentProgramId();
+    const recipeForGate = recipeManager.getRecipeForGate(g);
+    const recipeId = recipeForGate?.id || recipeForGate?.name || null;
+    const activeRecipesNow = machineState.getActiveRecipes();
+    const recipeOnGate = activeRecipesNow.find(r => r.gates && r.gates.includes(g));
+    const orderId = recipeOnGate?.orderId || null;
+
+    if (ackResult.previousMainFilledAt) {
+      const filledAt = new Date(ackResult.previousMainFilledAt);
+      const ackedAt = new Date(tsIso);
+
+      // Subtract any time the machine spent paused between fill and ack
+      const pausedMs = pauseTracker.getPausedMsBetween(programId, ackResult.previousMainFilledAt, tsIso);
+      const responseTimeMs = Math.max(0, (ackedAt - filledAt) - pausedMs);
+
+      const wasBlocked = !!ackResult.previousBothFilledAt;
+      const blockedAt = wasBlocked ? ackResult.previousBothFilledAt : null;
+      const blockedPausedMs = wasBlocked
+        ? pauseTracker.getPausedMsBetween(programId, blockedAt, tsIso)
+        : 0;
+      const blockedDurationMs = wasBlocked ? Math.max(0, (ackedAt - new Date(blockedAt)) - blockedPausedMs) : null;
+
+      try {
+        db.prepare(`
+          INSERT INTO gate_acknowledgments (gate, program_id, recipe_id, order_id, batch_filled_at, acknowledged_at, response_time_ms, was_blocked, blocked_at, blocked_duration_ms)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(g, programId, recipeId, orderId, ackResult.previousMainFilledAt, tsIso, responseTimeMs, wasBlocked ? 1 : 0, blockedAt, blockedDurationMs);
+      } catch (kpiErr) {
+        log.error('system', 'gate_ack_kpi_write_error', kpiErr, { gate: g });
+      }
+
+      log.operations('gate_acknowledged', `Gate ${g} acknowledged by operator`, {
+        gate: g,
+        responseTimeMs,
+        pausedMs,
+        wasBlocked,
+        blockedDurationMs,
+        immediateComplete: ackResult.immediateComplete,
+      });
+    }
+
+    // If buffer transfer caused an immediate batch completion
+    if (ackResult.immediateComplete) {
+      const recipeName = recipeForGate?.name || 'unknown';
+      try {
+        db.prepare(`
+          INSERT INTO batch_completions (gate, completed_at, pieces, weight_g, recipe_id, order_id, program_id)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(g, tsIso, ackResult.mainPieces, ackResult.mainGrams, recipeId, orderId, programId);
+
+        log.batchCompleted(g, recipeName, ackResult.mainPieces, ackResult.mainGrams, programId);
+
+        const updatedRecipe = machineState.incrementRecipeBatchCount(g, recipeName);
+        if (updatedRecipe) {
+          const recipeKey = updatedRecipe.orderId
+            ? `order_${updatedRecipe.orderId}`
+            : `recipe_${(updatedRecipe.gates || []).sort().join('_')}`;
+
+          broadcast("recipe_batch_update", {
+            recipeKey,
+            recipeName: updatedRecipe.recipeName,
+            completedBatches: updatedRecipe.completedBatches,
+            requestedBatches: updatedRecipe.requestedBatches || 0,
+            gate: g,
+            gates: updatedRecipe.gates || [],
+            orderId: updatedRecipe.orderId || null,
+            batchLimitTransitioning: updatedRecipe.batchLimitTransitioning || false,
+            ts: tsIso,
+          });
+        }
+
+        if (recipeOnGate && recipeOnGate.orderId) {
+          try {
+            const order = orderRepo.incrementCompletedBatches(recipeOnGate.orderId);
+            if (order) {
+              broadcast("order_batch_update", {
+                orderId: order.id,
+                completedBatches: order.completed_batches,
+                requestedBatches: order.requested_batches,
+                recipeName: recipeOnGate.recipeName,
+                ts: tsIso,
+              });
+            }
+          } catch (orderErr) {
+            log.error('system', 'ack_order_batch_error', orderErr);
+          }
+        }
+      } catch (err) {
+        log.error('system', 'ack_batch_write_error', err, { gate: g });
+      }
+
+      // Emit gate:main-filled so the simulator can schedule the next acknowledgment
+      broadcast("gate:main-filled", { gate: g, ts: tsIso });
+    }
+
+    // Write reset to Influx (gate was cleared or buffer transferred)
+    const gateStateAfter = gates.getGateState(g);
+    influx.writeGateState({
+      gate: g,
+      pieces_in_gate: Math.floor(gateStateAfter.main.pieces + gateStateAfter.buffer.pieces),
+      weight_sum_g: Math.round((gateStateAfter.main.grams + gateStateAfter.buffer.grams) * 10) / 10,
+      ts: tsIso,
+    }).catch(err => log.error('system', 'm2_ack_write_error', err));
+
+    // Broadcast updated gate state
+    broadcast("gate", {
+      gate: g,
+      main: gateStateAfter.main,
+      buffer: gateStateAfter.buffer,
+      mainFull: gateStateAfter.mainFull,
+      bufferFull: gateStateAfter.bufferFull,
+      pieces: gateStateAfter.main.pieces + gateStateAfter.buffer.pieces,
+      grams: gateStateAfter.main.grams + gateStateAfter.buffer.grams,
+      ts: tsIso,
+    });
+
+    const snapshot = gates.getSnapshot();
+    broadcast("overlay", { ts: tsIso, overlay: snapshot });
+
+    machineState.persistGateSnapshot();
+
+    res.json({ ok: true, immediateComplete: ackResult.immediateComplete, transferred: ackResult.transferred });
+  } catch (e) {
+    log.error('system', 'gate_acknowledge_error', e);
+    res.status(500).json({ message: "Acknowledge failed", error: e.message });
   }
 });
 

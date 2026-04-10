@@ -173,6 +173,23 @@ router.get('/pies', async (req, res) => {
 });
 
 /**
+ * POST /api/history/pies-cumulative
+ * Body: { recipeOrders: [{ recipe: "R_a", orderId: 5 }, { recipe: "R_b" }] }
+ * Scopes giveaway query by order_id when available.
+ */
+router.post('/pies-cumulative', async (req, res) => {
+  try {
+    const { recipeOrders } = req.body || {};
+    if (!recipeOrders || !recipeOrders.length) return res.json([]);
+    const pies = kpiRepo.getM4PiesCumulative(recipeOrders);
+    res.json(pies);
+  } catch (e) {
+    console.error('pies-cumulative error', e);
+    res.status(500).json({ error: 'Failed to fetch cumulative pies' });
+  }
+});
+
+/**
  * GET /api/history/overlay?ts=...&windowSec=60
  * Returns gate overlay (pieces and grams per gate)
  * Returns: [{ gate, pieces, grams }]

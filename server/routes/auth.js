@@ -13,26 +13,28 @@ router.post('/login', async (req, res) => {
     const { username, password, role } = req.body || {};
     const ip = req.ip || req.headers['x-forwarded-for'] || 'unknown';
     
-    if (!username || !password || !role) {
-      return res.status(400).json({ message: 'username, password and role are required' });
+    if (!username || !password) {
+      return res.status(400).json({ message: 'username and password are required' });
     }
 
-    const user = userRepo.findByUsernameAndRole(username, role);
+    const user = role
+      ? userRepo.findByUsernameAndRole(username, role)
+      : userRepo.findByUsername(username);
     if (!user) {
-      log.loginFailed(username, 'invalid_credentials_or_role', ip);
-      return res.status(401).json({ message: 'Invalid credentials or role' });
+      log.loginFailed(username, 'invalid_credentials', ip);
+      return res.status(401).json({ message: 'Invalid credentials' });
     }
 
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) {
       log.loginFailed(username, 'invalid_password', ip);
-      return res.status(401).json({ message: 'Invalid credentials or role' });
+      return res.status(401).json({ message: 'Invalid credentials' });
     }
 
     const token = jwt.sign(
       { id: user.id, username: user.username, role: user.role },
       JWT_SECRET,
-      { expiresIn: '30d' }  // Long expiration - idle timeout is handled client-side
+      { expiresIn: '30d' }
     );
 
     log.userLogin(user.username, user.role, ip);

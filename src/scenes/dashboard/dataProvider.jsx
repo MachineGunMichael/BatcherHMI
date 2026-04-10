@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useState, useRef } from "react";
 import { tokens } from "../../theme";
 import {useTheme} from "@mui/material";
+import { isPageVisible, bumpSseEvent } from "../../utils/renderMonitor";
 
 /**
  * ========= RUNTIME CONFIGURATION =======================================
@@ -201,6 +202,7 @@ const API = {
     `/api/history/weights?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
   pies: (from, to) =>
     `/api/history/pies?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
+  piesCumulative: `/api/history/pies-cumulative`,
   // SSE (server must send {"ts": ISO, "legend": [...], "overlay": [...]})
   sse: (params) => `/api/stream/dashboard${params ? `?${params}` : ""}`,
 };
@@ -255,6 +257,7 @@ let slotToColor = {}; // { slotIndex: colorIndex }
  */
 function buildColorMap(recipeNames, PALETTE, totalColor, activeRecipes = [], transitionStartRecipes = {}, programStartRecipes = [], completedTransitionGates = []) {
   const map = {};
+  const slotToColor = {};
   const hasTransitioning = Object.keys(transitionStartRecipes).length > 0;
   const completedGatesSet = new Set(completedTransitionGates);
   
@@ -476,27 +479,33 @@ function toScatterSeries(m1Recent) {
   }];
 }
 
-function toPieSlices(m4Breakdown, colorMap) {
+function toPieSlices(m4Breakdown, colorMap, liveActiveRecipes) {
   const safe = (n) => (Number.isFinite(Number(n)) ? Number(n) : 0);
   
-  // m4Breakdown can be either array of recipe objects or a single object
+  const giveawayMap = {};
   const breakdown = Array.isArray(m4Breakdown) ? m4Breakdown : (m4Breakdown ? [m4Breakdown] : []);
-  
-  const total = breakdown.map(r => ({
-    id: r.recipe || 'Unknown', 
-    value: safe(r.total_batches), 
-    color: colorMap[r.recipe] || "#888",
-  }));
-  const give_g = breakdown.map(r => ({
-    id: r.recipe || 'Unknown', 
-    value: safe(r.giveaway_g_per_batch), 
-    color: colorMap[r.recipe] || "#888",
-  }));
-  const give_pct = breakdown.map(r => ({
-    id: r.recipe || 'Unknown', 
-    value: safe(r.giveaway_pct_avg), 
-    color: colorMap[r.recipe] || "#888",
-  }));
+  breakdown.forEach(r => { giveawayMap[r.recipe] = r; });
+
+  const recipes = liveActiveRecipes && liveActiveRecipes.length > 0
+    ? liveActiveRecipes
+    : breakdown.map(r => ({ recipeName: r.recipe, completedBatches: r.total_batches }));
+
+  const total = recipes.map(r => {
+    const apiData = giveawayMap[r.recipeName];
+    return {
+      id: r.recipeName,
+      value: safe(apiData?.total_batches ?? r.completedBatches),
+      color: colorMap[r.recipeName] || "#888",
+    };
+  });
+  const give_g = recipes.map(r => {
+    const ga = giveawayMap[r.recipeName];
+    return { id: r.recipeName, value: safe(ga?.giveaway_g_per_batch), color: colorMap[r.recipeName] || "#888" };
+  });
+  const give_pct = recipes.map(r => {
+    const ga = giveawayMap[r.recipeName];
+    return { id: r.recipeName, value: safe(ga?.giveaway_pct_avg), color: colorMap[r.recipeName] || "#888" };
+  });
   return { total, give_g, give_pct };
 }
 
@@ -536,11 +545,13 @@ export function useDashboardData() {
   const [m3Combined, setM3Combined] = useState([]);
   const [m1Recent, setM1Recent] = useState([]);
   const [m4Breakdown, setM4Breakdown] = useState([]);
+  const [liveActiveRecipes, setLiveActiveRecipes] = useState([]);
 
   // Snapshot bits
   const [assignmentsByGate, setAssignmentsByGate] = useState({});
   const [overlayByGate, setOverlayByGate] = useState({});
   const [colorMap, setColorMap] = useState({});
+  const [hasBuffer, setHasBuffer] = useState(false);
 
   // Track if we're currently fetching to avoid overlapping requests
   const fetchingRef = useRef(false);
@@ -557,6 +568,16 @@ export function useDashboardData() {
   const [programStartTime, setProgramStartTime] = useState(null);
   const programStartTimeRef = useRef(null);
 
+  // Track current program ID for gate timing queries
+  const [currentProgramId, setCurrentProgramId] = useState(null);
+  const currentProgramIdRef = useRef(null);
+
+  // Gate timing data (boxplots) - refreshed every ~60s
+  const [gateTimingData, setGateTimingData] = useState({ dwell: [], ack: [], blocked: [] });
+
+  // Ref for liveActiveRecipes (accessible in fetch effect without dependency)
+  const liveActiveRecipesRef = useRef([]);
+
   // ---------- Fetch runtime configuration ----------
   useEffect(() => {
     let aborted = false;
@@ -569,7 +590,6 @@ export function useDashboardData() {
         
         setMode(config.mode);
         setConfigError(null);
-        console.log('Runtime config loaded:', config);
       } catch (err) {
         if (aborted) return;
         
@@ -628,7 +648,7 @@ export function useDashboardData() {
           // Live mode: start at current time
           const now = new Date();
           setCurrentTime(now.getTime());
-          console.log('⏰ Live mode: currentTime set to:', now.toISOString());
+          // Live mode currentTime initialized
           
           // init sticky live reservoir and hydrate persisted points
           if (!reservoirRef.current) {
@@ -652,6 +672,7 @@ export function useDashboardData() {
   // ---------- Fetch data window around currentTime ----------
   useEffect(() => {
     if (currentTime === null || fetchingRef.current || mode === null) return;
+    if (!isPageVisible()) return; // skip fetch while tab is hidden
     
     // Throttle: only in REPLAY mode (not in live mode where we want fresh data)
     if (mode === "replay") {
@@ -675,11 +696,10 @@ export function useDashboardData() {
         
         const bucketStr = `${BUCKET_SEC}s`;
 
-        // Use combined M3 endpoint to reduce API calls from 8 to 5
-        const [m3Data, rejectsData, piesData, m1Data, overlayData] = await Promise.all([
+        // Use combined M3 endpoint to reduce API calls
+        const [m3Data, rejectsData, m1Data, overlayData] = await Promise.all([
           getJSON(API.m3All(from.toISOString(), to.toISOString(), bucketStr)),
           getJSON(API.rejects(from.toISOString(), to.toISOString(), bucketStr)),
-          getJSON(API.pies(from.toISOString(), to.toISOString())),
           getJSON(API.weights(from.toISOString(), to.toISOString())),
           getJSON(API.overlay(to.toISOString(), 60)),
         ]);
@@ -751,8 +771,6 @@ export function useDashboardData() {
         });
         setM3Combined(combinedData);
 
-        setM4Breakdown(piesData || []);
-
         // ---------- M1 scatter window seed ----------
         if (mode === "live") {
           // ---------- LIVE: Seed reservoir from window ----------
@@ -774,6 +792,7 @@ export function useDashboardData() {
                 res.pushWeightForStats(p.weight_g);
                 res.addPoint({ id: p.id ?? `${p.t}-${p.gate}-${Math.round(p.weight_g*10)}`, t: p.t, weight_g: p.weight_g, gate: p.gate }, Date.now());
               });
+            setM1Recent(res.snapshot(Date.now()));
           }
         } else {
           // ---------- REPLAY: keep existing scatter sampling code as-is ----------
@@ -814,10 +833,17 @@ export function useDashboardData() {
         }
         // ---------- end M1 seed ----------
 
-        // M2 overlay (pieces and grams per gate)
+        // M2 overlay (pieces and grams per gate — now with main/buffer compartments)
         const overlayMap = {};
         (overlayData || []).forEach(item => {
-          overlayMap[item.gate] = { pieces: item.pieces, grams: item.grams };
+          overlayMap[item.gate] = {
+            main: item.main || { pieces: item.pieces || 0, grams: item.grams || 0 },
+            buffer: item.buffer || { pieces: 0, grams: 0 },
+            mainFull: item.mainFull || false,
+            bufferFull: item.bufferFull || false,
+            pieces: item.pieces || 0,
+            grams: item.grams || 0,
+          };
         });
         setOverlayByGate(overlayMap);
 
@@ -834,65 +860,77 @@ export function useDashboardData() {
         setAssignmentsByGate(assignMap);
 
         // Extract unique recipes from SQLite assignments (SOURCE OF TRUTH)
-        const activeRecipes = Array.from(new Set(Object.values(assignMap).filter(Boolean)));
+        const activeRecipeNames = Array.from(new Set(Object.values(assignMap).filter(Boolean)));
         
-        // Build color map - use merge strategy to preserve transitioning recipes
-        const newColorMap = buildColorMap(activeRecipes, PALETTE, TOTAL_COLOR);
+        // Use liveActiveRecipes from tick if available (has orderId, gates, etc.)
+        const tickRecipes = liveActiveRecipesRef.current || [];
+        const newColorMap = tickRecipes.length > 0
+          ? buildColorMap(activeRecipeNames, PALETTE, TOTAL_COLOR, tickRecipes)
+          : buildColorMap(activeRecipeNames, PALETTE, TOTAL_COLOR);
         setColorMap(prev => {
-          // Merge: keep existing colors (including transitioning recipes), add/update new ones
           const merged = { ...prev, ...newColorMap };
-          console.log('[DATA FETCH] colorMap update - prev keys:', Object.keys(prev), 'new keys:', Object.keys(newColorMap), 'merged keys:', Object.keys(merged));
           return merged;
         });
         
-        // ========== FILTER M3 DATA ==========
-        // Only show recipes that are in SQLite assignments
-        const filteredM3 = {};
-        activeRecipes.forEach(sqliteRecipe => {
-          if (m3ByRecipe[sqliteRecipe]) {
-            filteredM3[sqliteRecipe] = m3ByRecipe[sqliteRecipe];
-          } else {
-            // No data for this SQLite recipe in InfluxDB
-            filteredM3[sqliteRecipe] = tl.map(t => ({ 
-              t, 
-              batches_min: 0, 
-              giveaway_pct: 0,
-              pieces_processed: 0,
-              weight_processed_g: 0
+        // M3 data: keep all recipes from the API (no filtering to assignments).
+        // The chart rendering only shows recipes present in colorMap.
+        // No need to override setM3ByRecipe — already set above (line ~727).
+
+        // Fetch giveaway data from batch_completions, scoped by order_id when available
+        if (activeRecipeNames.length > 0) {
+          try {
+            const tickRecipes = liveActiveRecipesRef.current || [];
+            const orderLookup = {};
+            tickRecipes.forEach(r => { if (r.orderId) orderLookup[r.recipeName] = r.orderId; });
+            const recipeOrders = activeRecipeNames.map(name => ({
+              recipe: name,
+              ...(orderLookup[name] ? { orderId: orderLookup[name] } : {}),
             }));
-          }
-        });
-        
-        setM3ByRecipe(filteredM3);
-        
-        // ========== FILTER M4 DATA ==========
-        // Only show recipes that are in SQLite assignments
-        const filteredM4 = [];
-        activeRecipes.forEach(sqliteRecipe => {
-          const m4Match = (piesData || []).find(p => p.recipe === sqliteRecipe);
-          if (m4Match) {
-            filteredM4.push(m4Match);
-          } else {
-            // No data for this SQLite recipe in InfluxDB
-            filteredM4.push({
-              recipe: sqliteRecipe,
-              total_batches: 0,
-              giveaway_g_per_batch: 0,
-              giveaway_pct_avg: 0
+            const token = localStorage.getItem('token');
+            const postHeaders = { 'Content-Type': 'application/json' };
+            if (token) postHeaders['Authorization'] = `Bearer ${token}`;
+            const resp = await fetch(API.piesCumulative, {
+              method: 'POST',
+              headers: postHeaders,
+              credentials: 'include',
+              body: JSON.stringify({ recipeOrders }),
             });
+            if (!resp.ok) throw new Error(`pies-cumulative → ${resp.status}`);
+            const cumulativePies = await resp.json();
+            if (!aborted) setM4Breakdown(cumulativePies || []);
+          } catch (e) {
+            console.warn('⚠️ Cumulative pies fetch failed:', e.message);
           }
-        });
+        } else {
+          setM4Breakdown([]);
+        }
+
+        // Fetch gate timing data for current program (boxplots)
+        const pid = currentProgramIdRef.current;
+        if (pid) {
+          try {
+            const [dwellData, ackData, blockedData] = await Promise.all([
+              getJSON(`/api/stats/programs/${pid}/gate-dwell`),
+              getJSON(`/api/stats/programs/${pid}/ack-times`),
+              getJSON(`/api/stats/programs/${pid}/blocked-times`),
+            ]);
+            if (!aborted) {
+              setGateTimingData({
+                dwell: dwellData || [],
+                ack: ackData || [],
+                blocked: blockedData || [],
+              });
+            }
+          } catch (e) {
+            console.warn('⚠️ Gate timing fetch failed:', e.message);
+          }
+        }
         
-        setM4Breakdown(filteredM4);
-        
-        console.log('✅ Data fetch complete:', {
-          m3Recipes: Object.keys(filteredM3).length,
-          m4Items: filteredM4.length,
-          m1Points: mode === "live" ? (reservoirRef.current?.totalCore + reservoirRef.current?.totalOutliers || 0) : 'seeded',
-          xTicks: tl.length,
-          overlayGates: Object.keys(overlayMap).length,
-          assignments: Object.keys(assignMap).length
-        });
+        if (process.env.NODE_ENV !== 'production') {
+          console.log('✅ Data fetch complete:',
+            `{m3Recipes: ${Object.keys(m3ByRecipe).length}, m1Points: ${mode === "live" ? (reservoirRef.current?.totalCore + reservoirRef.current?.totalOutliers || 0) : 'seeded'}, xTicks: ${tl.length}, overlayGates: ${Object.keys(overlayMap).length}, assignments: ${Object.keys(assignMap).length}}`
+          );
+        }
       } catch (err) {
         console.error("❌ Failed to fetch data window:", err);
       } finally {
@@ -944,99 +982,197 @@ export function useDashboardData() {
     }
     const res = reservoirRef.current;
 
-    const es = new EventSource(API.sse(), { withCredentials: true });
+    // Unified overlay buffer — both tick and gate SSE events write here;
+    // flushed to React state at most every OVERLAY_FLUSH_MS to prevent
+    // 10+ re-renders/second when pieces are weighed continuously.
+    const pendingOverlayBuf = {};
+    let overlayFlushTimer = null;
+    const OVERLAY_FLUSH_MS = 100;
+
+    const flushPendingOverlay = () => {
+      overlayFlushTimer = null;
+      const keys = Object.keys(pendingOverlayBuf);
+      if (!keys.length) return;
+      const snapshot = {};
+      keys.forEach(k => { snapshot[k] = pendingOverlayBuf[k]; delete pendingOverlayBuf[k]; });
+      setOverlayByGate(prev => {
+        let changed = false;
+        for (const [gate, data] of Object.entries(snapshot)) {
+          const old = prev[gate];
+          if (!old
+            || (old.main?.pieces ?? old.pieces) !== (data.main?.pieces ?? data.pieces)
+            || (old.main?.grams ?? old.grams) !== (data.main?.grams ?? data.grams)
+            || (old.buffer?.pieces ?? 0) !== (data.buffer?.pieces ?? 0)
+            || old.mainFull !== data.mainFull
+            || old.bufferFull !== data.bufferFull) {
+            changed = true;
+            break;
+          }
+        }
+        return changed ? { ...prev, ...snapshot } : prev;
+      });
+    };
+    const scheduleOverlayFlush = () => {
+      if (!isPageVisible()) return; // hidden → data accumulates, flushed on visibility change
+      if (!overlayFlushTimer) {
+        overlayFlushTimer = setTimeout(flushPendingOverlay, OVERLAY_FLUSH_MS);
+      }
+    };
+
+    let es = new EventSource(API.sse(), { withCredentials: true });
+    let lastTickAt = Date.now();
+    const STALE_TIMEOUT = 5000;
+
+    function removeListeners(source) {
+      source.removeEventListener("tick", onTick);
+      source.removeEventListener("piece", onPiece);
+      source.removeEventListener("gate", onGate);
+      source.removeEventListener("overlay", onOverlay);
+      source.removeEventListener("program_change", onProgramChange);
+    }
+    function attachListeners(source) {
+      source.addEventListener("tick", onTick);
+      source.addEventListener("piece", onPiece);
+      source.addEventListener("gate", onGate);
+      source.addEventListener("overlay", onOverlay);
+      source.addEventListener("program_change", onProgramChange);
+      source.onerror = () => {};
+    }
+
+    const staleCheck = setInterval(() => {
+      if (Date.now() - lastTickAt > STALE_TIMEOUT && es.readyState !== EventSource.CLOSED) {
+        console.warn("SSE: no tick for 5s — forcing reconnect");
+        removeListeners(es);
+        es.close();
+        es = new EventSource(API.sse(), { withCredentials: true });
+        attachListeners(es);
+        lastTickAt = Date.now();
+      }
+    }, STALE_TIMEOUT);
 
     const onTick = async (ev) => {
+      lastTickAt = Date.now();
+      bumpSseEvent();
       try {
         const { 
           ts, legend, overlay, programId, 
           programStartTime: tickProgramStartTime, 
           machineState: tickMachineState,
+          hasBuffer: tickHasBuffer,
           activeRecipes: tickActiveRecipes,
           transitionStartRecipes: tickTransitionStartRecipes,
           programStartRecipes: tickProgramStartRecipes,
           completedTransitionGates: tickCompletedTransitionGates,
         } = JSON.parse(ev.data);
-        const to = new Date(ts);
-        
-        // Update program start time from tick (in case we missed program_change event)
-        // Only update if running and we have a valid programStartTime
+
+        // Always update refs (cheap, no React re-render)
         if (tickMachineState === 'running' && tickProgramStartTime) {
-          const newStartTime = new Date(tickProgramStartTime).getTime();
-          // Only update if different from current (to avoid unnecessary re-renders)
-          if (newStartTime !== programStartTimeRef.current) {
-            console.log(`📋 [TICK] Updating programStartTime from tick: ${tickProgramStartTime} (programId: ${programId})`);
-            programStartTimeRef.current = newStartTime;
-            setProgramStartTime(newStartTime);
-          }
+          programStartTimeRef.current = new Date(tickProgramStartTime).getTime();
         } else if (tickMachineState === 'idle' || tickMachineState === 'paused') {
-          // Clear program start time if not running
-          if (programStartTimeRef.current !== null) {
-            console.log(`📋 [TICK] Clearing programStartTime (machine state: ${tickMachineState})`);
-            programStartTimeRef.current = null;
-            setProgramStartTime(null);
-          }
+          programStartTimeRef.current = null;
         }
-        
-        // Update current time every 60 seconds only (for M3/M4 charts)
+        if (programId) currentProgramIdRef.current = programId;
+        if (tickActiveRecipes && tickActiveRecipes.length > 0) {
+          liveActiveRecipesRef.current = tickActiveRecipes;
+        }
+
+        // Buffer overlay data (cheap, no React re-render)
+        if (overlay && overlay.length) {
+          overlay.forEach(r => {
+            const gateNum = Number(r.gate);
+            pendingOverlayBuf[gateNum] = {
+              main: r.main || { pieces: Number(r.pieces || 0), grams: Number(r.grams || 0) },
+              buffer: r.buffer || { pieces: 0, grams: 0 },
+              mainFull: r.mainFull || false,
+              bufferFull: r.bufferFull || false,
+              pieces: Number(r.pieces || 0),
+              grams: Number(r.grams || 0),
+            };
+          });
+        }
+
+        // When tab is hidden: refs and buffers are up-to-date, skip all React state updates
+        if (!isPageVisible()) return;
+
+        const to = new Date(ts);
+
+        setProgramStartTime(prev => prev === programStartTimeRef.current ? prev : programStartTimeRef.current);
+        if (programId && programId !== currentProgramIdRef.current) {
+          setCurrentProgramId(programId);
+        }
+
         const now = Date.now();
         if (!lastFetchTimeRef.current || now - lastFetchTimeRef.current > 60000) {
           setCurrentTime(to.getTime());
           lastFetchTimeRef.current = now;
         }
         
-        // Update gate assignments from legend
         const assignMap = {};
         (legend || []).forEach(a => {
           assignMap[Number(a.gate)] = a.recipe_name || '—';
         });
-        setAssignmentsByGate(assignMap);
+        setAssignmentsByGate(prev => {
+          const prevStr = JSON.stringify(prev);
+          const newStr = JSON.stringify(assignMap);
+          return prevStr === newStr ? prev : assignMap;
+        });
+
+        if (tickActiveRecipes && tickActiveRecipes.length > 0) {
+          setLiveActiveRecipes(prev => {
+            if (prev.length !== tickActiveRecipes.length) return tickActiveRecipes;
+            const changed = tickActiveRecipes.some((r, i) =>
+              r.recipeName !== prev[i]?.recipeName ||
+              r.paused !== prev[i]?.paused
+            );
+            return changed ? tickActiveRecipes : prev;
+          });
+        }
         
-        // IMPORTANT: Build colorMap from activeRecipes (NEW recipes) for chart legend
-        // This ensures charts show NEW recipe names even during transition
-        // Gate annotations will show OLD recipe (from assignMap/legend)
-        const newRecipeNames = (tickActiveRecipes || []).map(r => r.recipeName).filter(Boolean);
+        const tickRecipeNames = (tickActiveRecipes || []).map(r => r.recipeName).filter(Boolean);
+        const legendRecipeNames = Object.values(assignMap).filter(v => v && v !== '—');
+        const allKnownRecipes = Array.from(new Set([...tickRecipeNames, ...legendRecipeNames]));
         const hasTransitioning = Object.keys(tickTransitionStartRecipes || {}).length > 0;
         
-        // Build colorMap if there are active recipes OR transitioning recipes
-        if (newRecipeNames.length > 0 || hasTransitioning) {
-          // Use activeRecipes for colorMap - these are the NEW recipes
-          // buildColorMap also adds transitioning recipes from transitionStartRecipes
-          const newColorMap = buildColorMap(newRecipeNames, PALETTE, TOTAL_COLOR, tickActiveRecipes || [], tickTransitionStartRecipes || {}, tickProgramStartRecipes || [], tickCompletedTransitionGates || []);
-          console.log('[SSE TICK] colorMap update - newRecipes:', newRecipeNames, 'newColorMap keys:', Object.keys(newColorMap));
+        if (allKnownRecipes.length > 0 || hasTransitioning) {
+          const newColorMap = buildColorMap(allKnownRecipes, PALETTE, TOTAL_COLOR, tickActiveRecipes || [], tickTransitionStartRecipes || {}, tickProgramStartRecipes || [], tickCompletedTransitionGates || []);
           setColorMap(prev => {
-            // Merge: keep existing colors, add/update new ones
             const merged = { ...prev };
             Object.entries(newColorMap).forEach(([key, color]) => {
               merged[key] = color;
             });
-            // Remove old recipes that are no longer in newColorMap
-            // buildColorMap now handles filtering out completed transition recipes
-            Object.keys(merged).forEach(key => {
-              if (key !== "Total" && !newColorMap[key]) {
-                delete merged[key];
-              }
-            });
-            console.log('[SSE TICK] colorMap merged - transitioning:', hasTransitioning, 'keys:', Object.keys(merged));
+            if (allKnownRecipes.length > 0) {
+              const liveNames = new Set(allKnownRecipes);
+              Object.keys(merged).forEach(key => {
+                if (key !== "Total" && !liveNames.has(key) && !newColorMap[key]) {
+                  delete merged[key];
+                }
+              });
+            }
+            if (!merged["Total"] && Object.keys(merged).length > 0) {
+              merged["Total"] = TOTAL_COLOR;
+            }
+            const prevKeys = Object.keys(prev).sort().join(',');
+            const mergedKeys = Object.keys(merged).sort().join(',');
+            if (prevKeys === mergedKeys) {
+              const changed = Object.keys(merged).some(k => merged[k] !== prev[k]);
+              if (!changed) return prev;
+            }
             return merged;
           });
         }
         
-        // Use overlay from SSE (real-time M2 data)
-        const overMap = {};
-        (overlay || []).forEach(r => { overMap[Number(r.gate)] = {
-          pieces: Number(r.pieces || 0), grams: Number(r.grams || 0)
-        };});
-        setOverlayByGate(overMap);
+        scheduleOverlayFlush();
+        
+        if (typeof tickHasBuffer !== 'undefined') {
+          setHasBuffer(prev => prev === !!tickHasBuffer ? prev : !!tickHasBuffer);
+        }
       } catch (e) {
         console.error("SSE tick handling failed:", e);
       }
     };
 
-    es.addEventListener("tick", onTick);
-
-    // Fire scatter point into reservoir (no direct setState)
     const onPiece = (ev) => {
+      bumpSseEvent();
       try {
         const d = JSON.parse(ev.data); // { piece_id, gate, weight_g, ts }
         const t = new Date(d.ts).getTime(); // use numeric ms for xScale: 'linear'
@@ -1050,108 +1186,117 @@ export function useDashboardData() {
         console.error("SSE piece handling failed:", e);
       }
     };
-    es.addEventListener("piece", onPiece);
-
-    // increment a single gate in the overlay (2→3→4→…)
     const onGate = (ev) => {
+      bumpSseEvent();
       try {
-        const d = JSON.parse(ev.data); // { gate, pieces, grams, ts }
-        setOverlayByGate((prev) => ({
-          ...prev,
-          [Number(d.gate)]: { pieces: Number(d.pieces || 0), grams: Number(d.grams || 0) },
-        }));
+        const d = JSON.parse(ev.data);
+        pendingOverlayBuf[Number(d.gate)] = {
+          main: d.main || { pieces: Number(d.pieces || 0), grams: Number(d.grams || 0) },
+          buffer: d.buffer || { pieces: 0, grams: 0 },
+          mainFull: d.mainFull || false,
+          bufferFull: d.bufferFull || false,
+          pieces: Number(d.pieces || 0),
+          grams: Number(d.grams || 0),
+        };
+        scheduleOverlayFlush();
       } catch (e) {
         console.error("SSE gate handling failed:", e);
       }
     };
-    es.addEventListener("gate", onGate);
-
-    // full overlay snapshot (for immediate consistency after resets)
     const onOverlay = (ev) => {
+      bumpSseEvent();
       try {
-        const d = JSON.parse(ev.data); // { ts, overlay: [{ gate, pieces, grams }, ...] }
+        const d = JSON.parse(ev.data);
         if (Array.isArray(d.overlay)) {
-          const overMap = {};
           d.overlay.forEach(item => {
-            overMap[Number(item.gate)] = {
+            pendingOverlayBuf[Number(item.gate)] = {
+              main: item.main || { pieces: Number(item.pieces || 0), grams: Number(item.grams || 0) },
+              buffer: item.buffer || { pieces: 0, grams: 0 },
+              mainFull: item.mainFull || false,
+              bufferFull: item.bufferFull || false,
               pieces: Number(item.pieces || 0),
-              grams: Number(item.grams || 0)
+              grams: Number(item.grams || 0),
             };
           });
-          setOverlayByGate(overMap);
-          console.log("📸 [OVERLAY SNAPSHOT] Applied full overlay:", overMap);
+          scheduleOverlayFlush();
         }
       } catch (e) {
         console.error("SSE overlay handling failed:", e);
       }
     };
-    es.addEventListener("overlay", onOverlay);
-
-    // Program change event: track program start time
     const onProgramChange = (ev) => {
+      bumpSseEvent();
       try {
-        const d = JSON.parse(ev.data); // { action: 'start'|'stop'|'recipe_change', programId?, ts }
-        console.log(`📋 [PROGRAM CHANGE] Received event:`, d);
-        
-        if (d.action === 'start' || d.action === 'recipe_change') {
-          // New program starting - track its start time
-          const startTs = new Date(d.ts).getTime();
-          console.log(`📋 [PROGRAM CHANGE] Setting programStartTime to ${startTs} (${new Date(startTs).toISOString()})`);
-          programStartTimeRef.current = startTs;  // Update ref immediately
-          setProgramStartTime(startTs);  // Update state for re-render
-          
-          // NOTE: Don't clear chart data here!
-          // The colorMap is built from activeRecipes (new recipes), so:
-          // - Old recipe data stays in M3ByRecipe but won't be shown (not in colorMap)
-          // - New recipes will naturally appear as data flows in
-          // This keeps graphs stable and only shows data for currently active recipes
-        } else if (d.action === 'stop') {
-          // Program stopped - clear the start time (no active program)
-          console.log(`📋 [PROGRAM CHANGE] Clearing programStartTime (was: ${programStartTimeRef.current})`);
-          programStartTimeRef.current = null;  // Update ref immediately
-          setProgramStartTime(null);  // Update state for re-render
+        const d = JSON.parse(ev.data);
+        if (process.env.NODE_ENV === 'development') {
+          console.log(`📋 [PROGRAM CHANGE] action=${d.action} programId=${d.programId}`);
         }
         
-        // Reset rejects to 0 (new program = new reject tracking)
-        setM3Combined(prev => prev.map(item => ({
-          ...item,
-          rejects_per_min: 0,
-          total_rejects_count: 0,
-          total_rejects_weight_g: 0
-        })));
+        if (d.action === 'start' || d.action === 'recipe_change') {
+          const startTs = new Date(d.ts).getTime();
+          programStartTimeRef.current = startTs;
+          if (isPageVisible()) setProgramStartTime(startTs);
+        } else if (d.action === 'stop') {
+          programStartTimeRef.current = null;
+          if (isPageVisible()) setProgramStartTime(null);
+        }
       } catch (e) {
         console.error("SSE program_change handling failed:", e);
       }
     };
-    es.addEventListener("program_change", onProgramChange);
+    attachListeners(es);
 
-    // Smooth renderer: flush reservoir → React state every 250 ms + persist ~1s
+    // Smooth renderer: flush reservoir → React state every 5s + persist ~10s
+    let lastFlushCount = -1;
     const flushTimer = setInterval(() => {
+      if (!isPageVisible()) return; // skip React updates while backgrounded
       const now = Date.now();
       if (res) {
-        setM1Recent(res.snapshot(now)); // [{t, weight_g, alpha, ...}]
-        if (now - lastPersistRef.current > 1000) {
+        const currentCount = res.totalCore + res.totalOutliers;
+        if (currentCount !== lastFlushCount) {
+          setM1Recent(res.snapshot(now));
+          lastFlushCount = currentCount;
+        }
+        if (now - lastPersistRef.current > 10000) {
           res.persistToStorage(now);
           lastPersistRef.current = now;
         }
       }
-    }, 250);
+    }, 5000);
 
-    // Keep outlier thresholds fresh
     const qTimer = setInterval(() => {
       res?.recomputeQuantiles();
-    }, 1000);
+    }, 5000);
 
-    es.onerror = (e) => console.warn("SSE error", e);
+    // Visibility change: flush all pending data and trigger fresh fetch when tab becomes visible
+    const onVisibilityChange = () => {
+      if (!isPageVisible()) return;
+      flushPendingOverlay();
+      const now = Date.now();
+      if (res) {
+        const currentCount = res.totalCore + res.totalOutliers;
+        if (currentCount !== lastFlushCount) {
+          setM1Recent(res.snapshot(now));
+          lastFlushCount = currentCount;
+        }
+      }
+      // Sync ref-only updates that accumulated while hidden
+      setProgramStartTime(prev => prev === programStartTimeRef.current ? prev : programStartTimeRef.current);
+      if (currentProgramIdRef.current) setCurrentProgramId(currentProgramIdRef.current);
+      // Trigger a fresh data fetch by updating currentTime
+      setCurrentTime(now);
+      lastFetchTimeRef.current = now;
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
     return () => {
-      es.removeEventListener("tick", onTick);
-      es.removeEventListener("piece", onPiece);
-      es.removeEventListener("gate", onGate);
-      es.removeEventListener("overlay", onOverlay);
-      es.removeEventListener("program_change", onProgramChange);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      removeListeners(es);
       es.close();
       clearInterval(flushTimer);
       clearInterval(qTimer);
+      clearInterval(staleCheck);
+      if (overlayFlushTimer) clearTimeout(overlayFlushTimer);
     };
   }, [mode]);
 
@@ -1196,7 +1341,7 @@ export function useDashboardData() {
     return toRejectsSeries({ m3Combined: filteredM3, color: colorMap["Total"] });
   }, [m3Combined, colorMap, programStartTime, mode]);
   const scatter = useMemo(() => toScatterSeries(m1Recent), [m1Recent]);
-  const pies = useMemo(() => toPieSlices(m4Breakdown, colorMap), [m4Breakdown, colorMap]);
+  const pies = useMemo(() => toPieSlices(m4Breakdown, colorMap, liveActiveRecipes), [m4Breakdown, colorMap, liveActiveRecipes]);
 
   return {
     mode,                     // "replay" | "live" | null (not configured)
@@ -1205,7 +1350,8 @@ export function useDashboardData() {
     // legend & overlays
     colorMap,                 // { recipe -> color, Total -> color }
     assignmentsByGate,        // { gate: recipe_name }
-    overlayByGate,            // { gate: { pieces, grams } }
+    overlayByGate,            // { gate: { main, buffer, mainFull, bufferFull, pieces, grams } }
+    hasBuffer,                // boolean - whether machine has buffer compartments
     // chart data
     xTicks,                   // array of ISO timestamps used on X axis
     throughput,               // { series: [...], total: [...] }
@@ -1215,6 +1361,7 @@ export function useDashboardData() {
     rejects,                  // [{ id:'Total', color, data:[{x,y}]}]
     scatter,                  // [{ id: 'Pieces', data:[{x,y,id,alpha}]}]
     pies,                     // { total:[...], give_g:[...], give_pct:[...] }
+    gateTimingData,           // { dwell: [...], ack: [...], blocked: [...] }
     // replay controls
     currentTime,              // current cursor position (milliseconds)
     datasetStart,             // dataset start time (Date object)

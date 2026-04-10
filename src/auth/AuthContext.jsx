@@ -4,8 +4,8 @@ import authService from '../services/authService';
 import { useAppContext } from '../context/AppContext';
 import useIdleTimeout from '../hooks/useIdleTimeout';
 
-// Idle timeout configuration: 2 hours in milliseconds
-const IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+// Idle timeout configuration: 12 hours in milliseconds
+const IDLE_TIMEOUT_MS = 12 * 60 * 60 * 1000;
 
 const AuthContext = createContext();
 
@@ -88,7 +88,7 @@ export const AuthProvider = ({ children }) => {
   }, [setCurrentRole]);
 
   // Login function
-  const login = async (username, password, role) => {
+  const login = async (username, password) => {
     setLoading(true);
     setError('');
     
@@ -98,7 +98,7 @@ export const AuthProvider = ({ children }) => {
         throw new Error("Authentication server is not available. Please check if the server is running.");
       }
       
-      const data = await authService.login(username, password, role);
+      const data = await authService.login(username, password);
       
       if (!data || !data.token) {
         throw new Error("Invalid authentication response");
@@ -106,7 +106,7 @@ export const AuthProvider = ({ children }) => {
       
       setUser(data.user);
       localStorage.setItem('token', data.token);
-      setCurrentRole(role);
+      setCurrentRole(data.user.role);
       setIsAuthenticated(true);
       
       navigate('/');

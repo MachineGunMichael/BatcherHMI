@@ -26,13 +26,16 @@ const MachineControls = ({
   activeRecipesCount = 0, 
   onStop,
   styles = {},
-  showTitle = true
+  showTitle = true,
+  contentOrder = 'default',
+  machineStateOverride,
 }) => {
   const theme = useTheme();
   const colors = tokens(theme.palette.mode);
   const isDark = theme.palette.mode === "dark";
   
-  const { state: machineState, activeRecipes, isConnected } = useMachineState();
+  const ownState = useMachineState({ disabled: !!machineStateOverride });
+  const { state: machineState, activeRecipes, isConnected } = machineStateOverride || ownState;
   const { assignedRecipes, setAssignedRecipes } = useAppContext();
   
   // Use prop or hook for recipe count
@@ -138,145 +141,131 @@ const MachineControls = ({
     fontWeight: 'bold',
   };
 
-  return (
+  const buttonsBlock = (
     <Box 
-      sx={{ 
-        display: 'flex', 
-        flexDirection: 'column',
-        height: '100%',
-      }}
+      display="flex" 
+      flexDirection={isVertical ? 'column' : 'row'}
+      gap={buttonGap}
+      sx={{ flex: isVertical && contentOrder === 'default' ? 1 : 'none' }}
     >
-      {/* Title */}
-      {showTitle && (
-        <Typography
-          variant={titleVariant}
-          fontWeight="bold"
-          sx={{ mb: 2, color: colors.tealAccent[500] }}
-        >
-          Machine Controls
-        </Typography>
-      )}
+      <Button
+        variant="contained"
+        onClick={handleStart}
+        disabled={recipeCount === 0 || machineState === "running" || machineState === "transitioning"}
+        sx={{
+          ...buttonBaseStyle,
+          flex: isVertical ? 'none' : 1,
+          width: isVertical ? '100%' : 'auto',
+          backgroundColor: colors.tealAccent[500],
+          '&:hover': { backgroundColor: colors.tealAccent[600] },
+          '&.Mui-disabled': {
+            backgroundColor: isDark ? 'rgba(255, 255, 255, 0.12)' : 'rgba(0, 0, 0, 0.12)',
+            color: isDark ? 'rgba(255, 255, 255, 0.3)' : 'rgba(0, 0, 0, 0.26)',
+          },
+        }}
+      >
+        START
+      </Button>
+      <Button
+        variant="contained"
+        onClick={handlePause}
+        disabled={machineState !== "running"}
+        sx={{
+          ...buttonBaseStyle,
+          flex: isVertical ? 'none' : 1,
+          width: isVertical ? '100%' : 'auto',
+          backgroundColor: colors.orangeAccent[500],
+          '&:hover': { backgroundColor: colors.orangeAccent[600] },
+          '&.Mui-disabled': {
+            backgroundColor: isDark ? 'rgba(255, 255, 255, 0.12)' : 'rgba(0, 0, 0, 0.12)',
+            color: isDark ? 'rgba(255, 255, 255, 0.3)' : 'rgba(0, 0, 0, 0.26)',
+          },
+        }}
+      >
+        PAUSE
+      </Button>
+      <Button
+        variant="contained"
+        onClick={handleStop}
+        disabled={machineState === "idle"}
+        sx={{
+          ...buttonBaseStyle,
+          flex: isVertical ? 'none' : 1,
+          width: isVertical ? '100%' : 'auto',
+          backgroundColor: colors.redAccent[500],
+          '&:hover': { backgroundColor: colors.redAccent[600] },
+          '&.Mui-disabled': {
+            backgroundColor: isDark ? 'rgba(255, 255, 255, 0.12)' : 'rgba(0, 0, 0, 0.12)',
+            color: isDark ? 'rgba(255, 255, 255, 0.3)' : 'rgba(0, 0, 0, 0.26)',
+          },
+        }}
+      >
+        STOP
+      </Button>
+    </Box>
+  );
 
-      {/* Machine State Indicator */}
-      <Box sx={{ mb: 2 }}>
-        <Box display="flex" alignItems="center" gap={1.5} flexWrap="wrap">
-          {/* State Badge */}
+  const infoBlock = (
+    <Box sx={{ mb: contentOrder === 'reversed' ? 0 : 2, mt: contentOrder === 'reversed' ? 1 : 0 }}>
+      <Box display="flex" alignItems="center" gap={1.5} flexWrap="wrap"
+        sx={contentOrder === 'reversed' ? { flexDirection: 'column-reverse', alignItems: 'flex-start' } : {}}
+      >
+        <Box
+          sx={{
+            backgroundColor: stateInfo.color,
+            color: '#fff',
+            px: badgePx,
+            py: badgePy,
+            borderRadius: badgeBorderRadius,
+            fontWeight: 'bold',
+            fontSize: badgeFontSize,
+          }}
+        >
+          {stateInfo.label}
+        </Box>
+        <Typography 
+          variant={recipesTextVariant}
+          sx={{ color: isDark ? '#fff' : '#000' }}
+        >
+          {recipeCount} {recipeCount === 1 ? 'recipe' : 'recipes'} active
+        </Typography>
+        {!isConnected && (
           <Box
             sx={{
-              backgroundColor: stateInfo.color,
+              backgroundColor: colors.redAccent[600],
               color: '#fff',
-              px: badgePx,
+              px: badgePx * 0.75,
               py: badgePy,
               borderRadius: badgeBorderRadius,
               fontWeight: 'bold',
-              fontSize: badgeFontSize,
+              fontSize: parseFloat(badgeFontSize) * 0.85 + 'rem',
             }}
           >
-            {stateInfo.label}
+            OFFLINE
           </Box>
-          
-          {/* Recipes Count */}
-          <Typography 
-            variant={recipesTextVariant}
-            sx={{ 
-              color: isDark ? '#fff' : '#000',
-            }}
-          >
-            {recipeCount} {recipeCount === 1 ? 'recipe' : 'recipes'} active
-          </Typography>
-          
-          {/* Offline Indicator */}
-          {!isConnected && (
-            <Box
-              sx={{
-                backgroundColor: colors.redAccent[600],
-                color: '#fff',
-                px: badgePx * 0.75,
-                py: badgePy,
-                borderRadius: badgeBorderRadius,
-                fontWeight: 'bold',
-                fontSize: parseFloat(badgeFontSize) * 0.85 + 'rem',
-              }}
-            >
-              OFFLINE
-            </Box>
-          )}
-        </Box>
+        )}
       </Box>
+    </Box>
+  );
 
-      {/* Control Buttons */}
-      <Box 
-        display="flex" 
-        flexDirection={isVertical ? 'column' : 'row'}
-        gap={buttonGap}
-        sx={{ flex: isVertical ? 1 : 'none' }}
-      >
-        {/* Start Button */}
-        <Button
-          variant="contained"
-          onClick={handleStart}
-          disabled={recipeCount === 0 || machineState === "running" || machineState === "transitioning"}
-          sx={{
-            ...buttonBaseStyle,
-            flex: isVertical ? 'none' : 1,
-            width: isVertical ? '100%' : 'auto',
-            backgroundColor: colors.tealAccent[500],
-            '&:hover': {
-              backgroundColor: colors.tealAccent[600],
-            },
-            '&.Mui-disabled': {
-              backgroundColor: isDark ? 'rgba(255, 255, 255, 0.12)' : 'rgba(0, 0, 0, 0.12)',
-              color: isDark ? 'rgba(255, 255, 255, 0.3)' : 'rgba(0, 0, 0, 0.26)',
-            },
-          }}
-        >
-          START
-        </Button>
-
-        {/* Pause Button */}
-        <Button
-          variant="contained"
-          onClick={handlePause}
-          disabled={machineState !== "running"}
-          sx={{
-            ...buttonBaseStyle,
-            flex: isVertical ? 'none' : 1,
-            width: isVertical ? '100%' : 'auto',
-            backgroundColor: colors.orangeAccent[500],
-            '&:hover': {
-              backgroundColor: colors.orangeAccent[600],
-            },
-            '&.Mui-disabled': {
-              backgroundColor: isDark ? 'rgba(255, 255, 255, 0.12)' : 'rgba(0, 0, 0, 0.12)',
-              color: isDark ? 'rgba(255, 255, 255, 0.3)' : 'rgba(0, 0, 0, 0.26)',
-            },
-          }}
-        >
-          PAUSE
-        </Button>
-
-        {/* Stop Button */}
-        <Button
-          variant="contained"
-          onClick={handleStop}
-          disabled={machineState === "idle"}
-          sx={{
-            ...buttonBaseStyle,
-            flex: isVertical ? 'none' : 1,
-            width: isVertical ? '100%' : 'auto',
-            backgroundColor: colors.redAccent[500],
-            '&:hover': {
-              backgroundColor: colors.redAccent[600],
-            },
-            '&.Mui-disabled': {
-              backgroundColor: isDark ? 'rgba(255, 255, 255, 0.12)' : 'rgba(0, 0, 0, 0.12)',
-              color: isDark ? 'rgba(255, 255, 255, 0.3)' : 'rgba(0, 0, 0, 0.26)',
-            },
-          }}
-        >
-          STOP
-        </Button>
-      </Box>
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+      {showTitle && (
+        <Typography variant={titleVariant} fontWeight="bold" sx={{ mb: 2, color: colors.tealAccent[500] }}>
+          Machine Controls
+        </Typography>
+      )}
+      {contentOrder === 'reversed' ? (
+        <>
+          {buttonsBlock}
+          {infoBlock}
+        </>
+      ) : (
+        <>
+          {infoBlock}
+          {buttonsBlock}
+        </>
+      )}
     </Box>
   );
 };

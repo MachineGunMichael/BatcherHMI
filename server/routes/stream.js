@@ -24,8 +24,13 @@ function openSSE(res) {
   res.write(`: connected\n\n`);
 }
 function send(res, event, payload) {
-  res.write(`event: ${event}\n`);
-  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  if (res.destroyed || res.writableEnded) return false;
+  try {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -92,6 +97,7 @@ router.get("/dashboard", async (req, res) => {
       programId: state.currentProgramId,
       programStartTime,
       machineState: state.state,
+      hasBuffer: gates.HAS_BUFFER,
       transitioningGates: state.transitioningGates || [],
       completedTransitionGates: state.completedTransitionGates || [],
       activeRecipes: state.activeRecipes || [],
@@ -102,53 +108,77 @@ router.get("/dashboard", async (req, res) => {
     console.error("initial tick failed:", e);
   }
 
-  // forward real-time events
-  const onPiece = (payload) => send(res, "piece", payload); // for scatter
-  const onGate  = (payload) => send(res, "gate", payload);  // per-gate increments + resets
-  const onOverlay = (payload) => send(res, "overlay", payload); // full overlay snapshot (for resets)
-  const onProgramChange = (payload) => send(res, "program_change", payload); // program start/stop/change
-  bus.on("piece", onPiece);
-  bus.on("gate", onGate);
-  bus.on("overlay", onOverlay);
-  bus.on("program_change", onProgramChange);
-
-  // keepalive
-  const keepAlive = setInterval(() => res.write(": ping\n\n"), 30_000);
-
-  // once per second: legend + overlay snapshot from in-memory (no Influx here)
-  const poll = setInterval(() => {
-    try {
-      const tsISO = new Date().toISOString();
-      const legend = getActiveLegend(); // from machine state (NEW)
-      const overlay = gates.getSnapshot();
-      const state = machineState.getState();
-      const programStartTime = getCurrentProgramStartTime();
-      send(res, "tick", { 
-        ts: tsISO, 
-        legend, 
-        overlay,
-        programId: state.currentProgramId,
-        programStartTime,
-        machineState: state.state,
-        transitioningGates: state.transitioningGates || [],
-        completedTransitionGates: state.completedTransitionGates || [],
-        activeRecipes: state.activeRecipes || [],
-        transitionStartRecipes: state.transitionStartRecipes || {},
-        programStartRecipes: state.programStartRecipes || [],
-      });
-    } catch (e) {
-      console.error("SSE tick error:", e);
-    }
-  }, 1000);
-
-  req.on("close", () => {
+  // Cleanup helper to prevent listener leaks
+  let cleaned = false;
+  function cleanup() {
+    if (cleaned) return;
+    cleaned = true;
     clearInterval(keepAlive);
     clearInterval(poll);
     bus.off("piece", onPiece);
     bus.off("gate", onGate);
     bus.off("overlay", onOverlay);
     bus.off("program_change", onProgramChange);
-  });
+  }
+
+  // forward real-time events (skip rejects — gate 0 pieces are picked up from InfluxDB)
+  const onPiece = (payload) => {
+    if (payload.gate === 0 || payload.gate === '0') return;
+    if (!send(res, "piece", payload)) cleanup();
+  };
+  const onGate  = (payload) => { if (!send(res, "gate", payload)) cleanup(); };
+  const onOverlay = (payload) => { if (!send(res, "overlay", payload)) cleanup(); };
+  const onProgramChange = (payload) => { if (!send(res, "program_change", payload)) cleanup(); };
+  bus.on("piece", onPiece);
+  bus.on("gate", onGate);
+  bus.on("overlay", onOverlay);
+  bus.on("program_change", onProgramChange);
+
+  // keepalive
+  const keepAlive = setInterval(() => {
+    if (res.destroyed || res.writableEnded) { cleanup(); return; }
+    try { res.write(": ping\n\n"); } catch { cleanup(); }
+  }, 30_000);
+
+  // once per second: legend + overlay snapshot from in-memory
+  const poll = setInterval(() => {
+    if (res.destroyed || res.writableEnded) { cleanup(); return; }
+    if (res.writableLength > 512 * 1024) {
+      console.warn('SSE: closing stale connection (buffered %d KB)', Math.round(res.writableLength / 1024));
+      cleanup();
+      try { res.end(); } catch {}
+      return;
+    }
+    try {
+      const tsISO = new Date().toISOString();
+      const legend = getActiveLegend();
+      const overlay = gates.getSnapshot();
+      const state = machineState.getState();
+      const programStartTime = getCurrentProgramStartTime();
+      if (!send(res, "tick", { 
+        ts: tsISO, 
+        legend, 
+        overlay,
+        programId: state.currentProgramId,
+        programStartTime,
+        machineState: state.state,
+        hasBuffer: gates.HAS_BUFFER,
+        transitioningGates: state.transitioningGates || [],
+        completedTransitionGates: state.completedTransitionGates || [],
+        activeRecipes: state.activeRecipes || [],
+        transitionStartRecipes: state.transitionStartRecipes || {},
+        programStartRecipes: state.programStartRecipes || [],
+      })) {
+        cleanup();
+      }
+    } catch (e) {
+      console.error("SSE tick error:", e);
+      cleanup();
+    }
+  }, 1000);
+
+  req.on("close", cleanup);
+  res.on("error", cleanup);
 });
 
 module.exports = router;

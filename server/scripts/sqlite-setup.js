@@ -297,6 +297,12 @@ function createStatisticsSchema() {
     run(`ALTER TABLE recipe_stats ADD COLUMN completed INTEGER NOT NULL DEFAULT 1;`);
   }
 
+  // Migration: Add status column to batch_completions ('completed' or 'terminated')
+  if (!columnExists('batch_completions', 'status')) {
+    console.log('[SQLite] Adding status column to batch_completions table...');
+    run(`ALTER TABLE batch_completions ADD COLUMN status TEXT NOT NULL DEFAULT 'completed';`);
+  }
+
   run(`
 
     -- Gate dwell accumulators (min/max/avg/std via Welford)
@@ -343,7 +349,26 @@ function createStatisticsSchema() {
     CREATE INDEX IF NOT EXISTS idx_batch_completions_time ON batch_completions(completed_at);
     CREATE INDEX IF NOT EXISTS idx_batch_completions_gate ON batch_completions(gate);
     CREATE INDEX IF NOT EXISTS idx_batch_completions_order ON batch_completions(order_id);
-    
+
+    -- Gate acknowledgment KPIs (operator response times)
+    CREATE TABLE IF NOT EXISTS gate_acknowledgments (
+      id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+      gate                INTEGER NOT NULL,
+      program_id          INTEGER,
+      recipe_id           TEXT,
+      order_id            INTEGER,
+      batch_filled_at     TEXT NOT NULL,
+      acknowledged_at     TEXT NOT NULL,
+      response_time_ms    INTEGER NOT NULL,
+      was_blocked         INTEGER NOT NULL DEFAULT 0,
+      blocked_at          TEXT,
+      blocked_duration_ms INTEGER,
+      FOREIGN KEY (program_id) REFERENCES programs(id) ON DELETE SET NULL,
+      FOREIGN KEY (order_id)   REFERENCES orders(id)   ON DELETE SET NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_gate_ack_program ON gate_acknowledgments(program_id);
+    CREATE INDEX IF NOT EXISTS idx_gate_ack_gate ON gate_acknowledgments(gate);
+
     -- M3 KPI tables (per-minute data, migrated from InfluxDB to SQLite)
     CREATE TABLE IF NOT EXISTS kpi_minute_recipes (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -564,6 +589,9 @@ function createMachineStateSchema() {
   if (!columnExists('machine_state', 'paused_gates')) {
     run(`ALTER TABLE machine_state ADD COLUMN paused_gates TEXT DEFAULT '[]';`);
   }
+  if (!columnExists('machine_state', 'weight_tare_g')) {
+    run(`ALTER TABLE machine_state ADD COLUMN weight_tare_g REAL DEFAULT 0;`);
+  }
   
   console.log('✅ Machine state schema created.');
 }
@@ -781,6 +809,35 @@ function updateUsersRoleConstraint() {
   console.log('ℹ️ Note: Users table now supports "customer" role in new databases.');
 }
 
+/* -------------- piece log (ring buffer for live pieces table) -------------- */
+function createPieceLogSchema() {
+  run(`
+    CREATE TABLE IF NOT EXISTS piece_log (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      piece_id        INTEGER NOT NULL,
+      gate            INTEGER NOT NULL,
+      weight_g        REAL NOT NULL,
+      length_mm       REAL,
+      status          TEXT NOT NULL DEFAULT 'batched',
+      calculation_time_ms REAL,
+      is_last_piece   INTEGER NOT NULL DEFAULT 0,
+      recipe_name     TEXT,
+      order_id        INTEGER,
+      program_id      INTEGER,
+      created_at      TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_piece_log_created ON piece_log(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_piece_log_id_desc ON piece_log(id DESC);
+  `);
+
+  if (!columnExists('piece_log', 'length_mm')) {
+    run(`ALTER TABLE piece_log ADD COLUMN length_mm REAL;`);
+    console.log('Added piece_log.length_mm');
+  }
+
+  console.log('✅ piece_log schema ready.');
+}
+
 /* ---------------------- main ---------------------- */
 function main() {
   createBaseSchema();
@@ -795,6 +852,7 @@ function main() {
   createCustomersAndOrdersSchema();
   updateUsersRoleConstraint();
   seedCustomerRecipes();
+  createPieceLogSchema();
   console.log('✅ SQLite setup complete.');
 }
 main();

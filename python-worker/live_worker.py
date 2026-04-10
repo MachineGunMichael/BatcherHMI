@@ -484,18 +484,37 @@ class LiveWorker:
     # =====================================================================
     
     def poll_machine_state(self):
-        """Poll backend for machine state changes"""
+        """Poll backend for machine state changes and program_id drift"""
         state = self.machine_client.get_state()
         if not state:
             return
         
         new_state = state['state']
+        backend_program_id = state.get('currentProgramId')
         
         # Detect state changes
         if new_state != self.machine_state:
             log.info(f"[MachineState] {self.machine_state} → {new_state}")
             self.handle_state_change(self.machine_state, new_state, state)
             self.machine_state = new_state
+        
+        # Detect program_id drift: backend restarted or program changed
+        # while the state name stayed the same (e.g. running → running).
+        # Also catches the case where worker starts with default program_id=1
+        # but backend has a real program_id.
+        if (new_state in ('running', 'paused')
+                and backend_program_id is not None
+                and backend_program_id != self.program_id):
+            active_recipes = state.get('activeRecipes', [])
+            log.info(f"[MachineState] program_id drift detected: "
+                     f"{self.program_id} → {backend_program_id}  "
+                     f"(state='{new_state}')")
+            # Flush any pending KPIs for the old program
+            if self.minute_accumulator and self.minute_accumulator.has_data():
+                self.process_minute_kpis()
+            self.start_program(backend_program_id, active_recipes)
+            if new_state == 'paused':
+                self.paused = True
     
     def handle_state_change(self, old_state, new_state, state_data):
         """Handle machine state transitions"""
@@ -1703,6 +1722,35 @@ class LiveWorker:
         except Exception as e:
             log.warning(f"  Error updating gate dwell accumulator: {e}")
     
+    def get_paused_seconds_between(self, start_iso: str, end_iso: str) -> float:
+        """Calculate total paused seconds between two ISO timestamps for the current program."""
+        if not self.program_id:
+            return 0.0
+        try:
+            rows = self.sqlite_conn.execute("""
+                SELECT paused_at, resumed_at
+                FROM pause_intervals
+                WHERE program_id = ?
+                  AND paused_at < ?
+                  AND (resumed_at IS NULL OR resumed_at > ?)
+                ORDER BY paused_at ASC
+            """, (self.program_id, end_iso, start_iso)).fetchall()
+
+            start_dt = datetime.fromisoformat(start_iso.replace('Z', '+00:00'))
+            end_dt = datetime.fromisoformat(end_iso.replace('Z', '+00:00'))
+            total = 0.0
+            for paused_at_str, resumed_at_str in rows:
+                p_start = datetime.fromisoformat(paused_at_str.replace('Z', '+00:00'))
+                p_end = datetime.fromisoformat(resumed_at_str.replace('Z', '+00:00')) if resumed_at_str else end_dt
+                overlap_start = max(p_start, start_dt)
+                overlap_end = min(p_end, end_dt)
+                if overlap_end > overlap_start:
+                    total += (overlap_end - overlap_start).total_seconds()
+            return total
+        except Exception as e:
+            log.warning(f"  Error reading pause_intervals: {e}")
+            return 0.0
+
     def process_completed_batch(self, batch: Dict):
         """Process a completed batch from backend for M3/M4 calculations"""
         try:
@@ -1714,8 +1762,14 @@ class LiveWorker:
             # Track gate dwell time
             if gate != 0:  # Don't track reject gate
                 if gate in self.last_batch_time:
-                    # Calculate dwell time (time since last batch on this gate)
-                    dwell_time_sec = (batch_time - self.last_batch_time[gate]).total_seconds()
+                    raw_dwell_sec = (batch_time - self.last_batch_time[gate]).total_seconds()
+
+                    # Subtract any time the machine spent paused between the two batches
+                    paused_sec = self.get_paused_seconds_between(
+                        self.last_batch_time[gate].isoformat(),
+                        batch_time.isoformat()
+                    )
+                    dwell_time_sec = max(0.0, raw_dwell_sec - paused_sec)
                     
                     # Write to database
                     try:

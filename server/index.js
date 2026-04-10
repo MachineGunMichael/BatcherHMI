@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ path: require('path').join(__dirname, '.env'), override: true });
 
 const express = require('express');
 const cors = require('cors');
@@ -402,12 +402,18 @@ setInterval(() => {
   }
 }, 60 * 1000); // Check every minute
 
+// ---------- operator simulator ----------
+const operatorSimulator = require('./lib/operatorSimulator');
+
 // ---------- start server ----------
 app.listen(PORT, () => {
   log.serverStarted(PORT);
   
   // Initialize clean state on startup
   initializeOnStartup();
+  
+  // Initialize operator simulator (if SIMULATE_OPERATOR=true)
+  operatorSimulator.init();
   
   if (outbox && typeof outbox.start === 'function') {
     outbox.start();

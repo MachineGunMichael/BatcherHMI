@@ -2,7 +2,13 @@
 // InfluxDB 3 helper using the official Node SDK for WRITES (Line Protocol)
 // + a small set of Flight SQL query helpers used by the API routes.
 
-const { InfluxDBClient } = require('@influxdata/influxdb3-client');
+const { InfluxDBClient, setLogger } = require('@influxdata/influxdb3-client');
+
+// Quieten the SDK's own error logger — we handle write errors with retries.
+setLogger({
+  error: () => {},
+  warn: (msg, err) => console.warn(`[influx-sdk] ${msg}`, err || ''),
+});
 
 // --- env ----------------------------------------------------------------
 const host = process.env.INFLUXDB3_HOST_URL || 'http://127.0.0.1:8181';
@@ -14,12 +20,22 @@ if (!token) {
 }
 
 // Single client used for Line Protocol writes and Flight SQL queries.
-const client = new InfluxDBClient({ host, token, database });
+// noSync: true  → uses /api/v3/write_lp with no_sync=true so the server
+// doesn't fsync on every HTTP request (~1 s on macOS).  WAL still flushes
+// periodically (default 1 s), so at most ~1 s of data is at risk on crash.
+const client = new InfluxDBClient({
+  host,
+  token,
+  database,
+  timeout: 30000,
+  writeOptions: { noSync: true },
+});
 
 // --- basic health --------------------------------------------------------
 async function ping() {
   try {
-    const res = await fetch(`${host}/health`).catch(() => null);
+    const headers = token ? { Authorization: `Bearer ${token}` } : {};
+    const res = await fetch(`${host}/health`, { headers }).catch(() => null);
     return !!(res && res.ok);
   } catch {
     return false;
@@ -92,28 +108,87 @@ function toLineProtocol({ measurement, tags = {}, fields = {}, timestamp }) {
   return ns ? `${meas}${tagsPart} ${fieldPairs} ${ns}` : `${meas}${tagsPart} ${fieldPairs}`;
 }
 
+// --- batched write buffer ------------------------------------------------
+const FLUSH_INTERVAL_MS = 1000;
+const MAX_BUFFER_SIZE = 500;
+let writeBuffer = [];
+let flushTimer = null;
+let flushInProgress = false;
+
+const MAX_RETRIES = 3;
+const RETRY_BASE_MS = 500;
+
+async function flushWriteBuffer() {
+  if (flushInProgress || writeBuffer.length === 0) return;
+  flushInProgress = true;
+  const batch = writeBuffer.splice(0);
+  const payload = batch.join('\n');
+
+  try {
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        await client.write(payload);
+        return;
+      } catch (err) {
+        if (attempt < MAX_RETRIES) {
+          const delay = RETRY_BASE_MS * 2 ** attempt;
+          console.warn(`[influx] Write failed (batch ${batch.length}), retry ${attempt + 1}/${MAX_RETRIES} in ${delay}ms…`);
+          await new Promise(r => setTimeout(r, delay));
+        } else {
+          console.error(`[influx] Write permanently failed after ${MAX_RETRIES} retries (batch of ${batch.length}).`, err.message || err);
+        }
+      }
+    }
+  } finally {
+    flushInProgress = false;
+  }
+}
+
+function scheduleFlush() {
+  if (!flushTimer) {
+    flushTimer = setTimeout(async () => {
+      flushTimer = null;
+      await flushWriteBuffer();
+    }, FLUSH_INTERVAL_MS);
+  }
+}
+
 // --- write helpers -------------------------------------------------------
+function bufferLineProtocol(lines) {
+  const arr = Array.isArray(lines) ? lines : [String(lines)];
+  writeBuffer.push(...arr);
+  if (writeBuffer.length >= MAX_BUFFER_SIZE) {
+    flushWriteBuffer();
+  } else {
+    scheduleFlush();
+  }
+}
+
 async function writeLineProtocol(lines) {
-  const body = Array.isArray(lines) ? lines.join('\n') : String(lines);
-  await client.write(body);
+  bufferLineProtocol(lines);
   return 'ok';
 }
 
 async function writePoint({ measurement, tags, fields, timestamp }) {
   const lp = toLineProtocol({ measurement, tags, fields, timestamp });
-  return writeLineProtocol(lp);
+  bufferLineProtocol(lp);
+  return 'ok';
 }
 
 // --- M1..M4 writers ------------------------------------------------------
 // M1: pieces — now with piece_id and gate tags
-async function writePiece({ piece_id, gate, weight_g, ts }) {
+async function writePiece({ piece_id, gate, weight_g, length_mm, ts }) {
+  const fields = { weight_g: Number(weight_g) };
+  if (length_mm != null && Number.isFinite(Number(length_mm))) {
+    fields.length_mm = Number(length_mm);
+  }
   return writePoint({
     measurement: 'pieces',
     tags: {
       ...(piece_id ? { piece_id: String(piece_id) } : {}),
       ...(gate != null ? { gate: String(gate) } : {}),
     },
-    fields: { weight_g: Number(weight_g) },
+    fields,
     timestamp: ts,
   });
 }
@@ -572,13 +647,29 @@ async function query(sql) {
   return await client.query(sql);
 }
 
+// --- graceful shutdown: flush any buffered writes ------------------------
+process.on('SIGINT', async () => {
+  if (writeBuffer.length) {
+    console.log(`[influx] Flushing ${writeBuffer.length} buffered writes before exit…`);
+    await flushWriteBuffer();
+  }
+  process.exit(0);
+});
+process.on('SIGTERM', async () => {
+  if (writeBuffer.length) {
+    console.log(`[influx] Flushing ${writeBuffer.length} buffered writes before exit…`);
+    await flushWriteBuffer();
+  }
+  process.exit(0);
+});
+
 // --- exports -------------------------------------------------------------
 module.exports = {
   // config & health
   host, token, database, ping,
 
   // low-level write helpers
-  writeLineProtocol, writePoint,
+  writeLineProtocol, writePoint, flushWriteBuffer,
 
   // writers for your measurements
   writePiece, writeGateState, writeKpiMinute, writeKpiMinuteCombined, writeKpiTotals,

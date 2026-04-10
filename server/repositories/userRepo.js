@@ -16,6 +16,16 @@ function findByUsernameAndRole(username, role) {
   return stmt.get(username, role);
 }
 
+function findByUsername(username) {
+  const stmt = db.prepare(
+    `SELECT id, username, password_hash, role, name, permissions, customer_id, created_at, updated_at
+     FROM users
+     WHERE username = ?
+     LIMIT 1`
+  );
+  return stmt.get(username);
+}
+
 function findById(id) {
   const stmt = db.prepare(
     `SELECT id, username, role, name, permissions, customer_id, created_at, updated_at
@@ -66,6 +76,7 @@ function deleteUser(id) {
 module.exports = {
   toSafe,
   findByUsernameAndRole,
+  findByUsername,
   findById,
   createUser,
   updateUser,

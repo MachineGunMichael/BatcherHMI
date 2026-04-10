@@ -5,6 +5,17 @@ const db = require('../db/sqlite');
 const eventBus = require('../lib/eventBus');
 const log = require('../lib/logger');
 
+// Auto-migrate: add weight_tare_g column if missing
+try {
+  const cols = db.prepare("PRAGMA table_info(machine_state)").all().map(c => c.name);
+  if (!cols.includes('weight_tare_g')) {
+    db.exec("ALTER TABLE machine_state ADD COLUMN weight_tare_g REAL DEFAULT 0");
+    console.log('[machineState] Migrated: added weight_tare_g column');
+  }
+} catch (e) {
+  console.error('[machineState] Migration check failed:', e.message);
+}
+
 /**
  * Get current machine state
  */
@@ -23,6 +34,7 @@ function getState() {
       order_queue as orderQueue,
       gate_snapshot as gateSnapshot,
       paused_gates as pausedGates,
+      weight_tare_g as weightTareG,
       last_updated as lastUpdated
     FROM machine_state 
     WHERE id = 1
@@ -43,6 +55,7 @@ function getState() {
     orderQueue: JSON.parse(row.orderQueue || '[]'),
     gateSnapshot: JSON.parse(row.gateSnapshot || '[]'),
     pausedGates: JSON.parse(row.pausedGates || '[]'),
+    weightTareG: row.weightTareG ?? 0,
   };
 }
 
@@ -94,10 +107,53 @@ function getActiveRecipes() {
 }
 
 /**
- * Set active recipes
+ * Set active recipes — includes gate-uniqueness enforcement.
+ * If the same gate appears in multiple recipes, it is removed from all but the
+ * last recipe that claims it (the newest assignment wins).
  */
 function setActiveRecipes(recipes) {
-  updateState({ activeRecipes: recipes });
+  const cleaned = enforceGateUniqueness(recipes);
+  updateState({ activeRecipes: cleaned });
+}
+
+/**
+ * Ensure no gate is assigned to more than one active recipe.
+ * When a conflict is found, the gate stays with the LAST recipe in the array
+ * that claims it (newest assignment) and is removed from earlier entries.
+ * Empty-gate recipes that result are kept (they may be partially assigned).
+ */
+function enforceGateUniqueness(recipes) {
+  const gateOwner = new Map(); // gate -> index of recipe that owns it
+  const conflicts = [];
+
+  recipes.forEach((r, idx) => {
+    for (const g of (r.gates || [])) {
+      if (gateOwner.has(g)) {
+        conflicts.push({ gate: g, prevIdx: gateOwner.get(g), newIdx: idx });
+      }
+      gateOwner.set(g, idx);
+    }
+  });
+
+  if (conflicts.length === 0) return recipes;
+
+  console.warn('[machineState] Gate uniqueness conflict detected:', conflicts.map(c =>
+    `gate ${c.gate} in recipe idx ${c.prevIdx} AND ${c.newIdx}`
+  ));
+
+  // Build set of gates each recipe is allowed to keep (last-writer-wins)
+  const allowedGates = recipes.map(() => new Set());
+  gateOwner.forEach((idx, gate) => allowedGates[idx].add(gate));
+
+  return recipes.map((r, idx) => {
+    const filtered = (r.gates || []).filter(g => allowedGates[idx].has(g));
+    if (filtered.length !== (r.gates || []).length) {
+      const removed = (r.gates || []).filter(g => !allowedGates[idx].has(g));
+      console.warn(`[machineState] Removed duplicate gates ${removed} from recipe "${r.recipeName}" (idx ${idx})`);
+      return { ...r, gates: filtered };
+    }
+    return r;
+  });
 }
 
 /**
@@ -869,8 +925,18 @@ function handleBatchLimitGateComplete(gate, recipe) {
   }
   
   let handoffResult = null;
-  // Find the first non-halted queue item (halted items require manual re-activation)
-  const firstNonHaltedIdx = workingQueue.findIndex(item => item.status !== 'halted');
+  // Prioritize items already on the machine (have an active recipe with gates) over pure queue items.
+  // Note: queue item.status is never set to 'assigned' by the backend — "Assigned" is derived
+  // from whether a matching active recipe exists with gates. So we check updatedRecipes directly.
+  const isOnMachine = (qItem) => updatedRecipes.some(r => {
+    if (r.batchLimitTransitioning || r.isFinishing || r._toRemove) return false;
+    if (qItem.orderId) return r.orderId === qItem.orderId && (r.gates?.length || 0) > 0;
+    return !r.orderId && r.recipeName === qItem.recipeName && (r.gates?.length || 0) > 0;
+  });
+  let firstNonHaltedIdx = workingQueue.findIndex(item => item.status !== 'halted' && isOnMachine(item));
+  if (firstNonHaltedIdx < 0) {
+    firstNonHaltedIdx = workingQueue.findIndex(item => item.status !== 'halted');
+  }
   if (firstNonHaltedIdx >= 0) {
     const firstItem = workingQueue[firstNonHaltedIdx];
     const minGates = firstItem.minGates || 1;
@@ -1153,8 +1219,18 @@ function assignFreedGateToQueue(gate) {
     return null;
   }
   
-  // Find the first non-halted queue item (halted items require manual re-activation)
-  const firstNonHaltedIdx = queue.findIndex(item => item.status !== 'halted');
+  // Prioritize items already on the machine (have an active recipe with gates) over pure queue items.
+  // Note: queue item.status is never set to 'assigned' by the backend — "Assigned" is derived
+  // from whether a matching active recipe exists with gates.
+  const isOnMachine = (qItem) => activeRecipes.some(r => {
+    if (r.batchLimitTransitioning || r.isFinishing) return false;
+    if (qItem.orderId) return r.orderId === qItem.orderId && (r.gates?.length || 0) > 0;
+    return !r.orderId && r.recipeName === qItem.recipeName && (r.gates?.length || 0) > 0;
+  });
+  let firstNonHaltedIdx = queue.findIndex(item => item.status !== 'halted' && isOnMachine(item));
+  if (firstNonHaltedIdx < 0) {
+    firstNonHaltedIdx = queue.findIndex(item => item.status !== 'halted');
+  }
   if (firstNonHaltedIdx < 0) {
     log.queue('no_queue_item', `Gate ${gate} freed but all queue items are halted`, { gate });
     return null;
@@ -1163,20 +1239,18 @@ function assignFreedGateToQueue(gate) {
   const minGates = firstItem.minGates || 1;
   
   // Check if this item is already partially assigned in active recipes
-  // Use unique key to find the exact match
+  // Match broadly: by orderId if present, otherwise by recipeName (ignore _isFromQueue
+  // which may have been stripped during graduation)
   let existingActive = null;
-  const firstItemKey = firstItem.orderId 
-    ? `order_${firstItem.orderId}` 
-    : `recipe_${firstItem.recipeName}_queue_${firstItem.recipeId || 'manual'}`;
   
   for (const r of activeRecipes) {
-    if (r.batchLimitTransitioning) continue; // Skip finishing recipes
+    if (r.batchLimitTransitioning || r.isFinishing) continue;
     
     if (firstItem.orderId && r.orderId === firstItem.orderId) {
       existingActive = r;
       break;
     }
-    if (!firstItem.orderId && !r.orderId && r.recipeName === firstItem.recipeName && r._isFromQueue) {
+    if (!firstItem.orderId && !r.orderId && r.recipeName === firstItem.recipeName) {
       existingActive = r;
       break;
     }
@@ -1290,8 +1364,12 @@ function restoreGateSnapshot() {
         const gates = require('../state/gates');
         gates.loadSnapshot(snapshot);
         log.system('gate_snapshot_restored', `Restored gate snapshot`, {
-          gates: snapshot.filter(g => g.pieces > 0 || g.grams > 0).map(g => ({
-            gate: g.gate, pieces: g.pieces, grams: Math.round(g.grams * 10) / 10,
+          gates: snapshot.filter(g => (g.pieces > 0 || g.grams > 0) || g.mainFull || g.bufferFull).map(g => ({
+            gate: g.gate,
+            pieces: g.main ? g.main.pieces : g.pieces,
+            grams: Math.round((g.main ? g.main.grams : g.grams) * 10) / 10,
+            mainFull: g.mainFull || false,
+            bufferFull: g.bufferFull || false,
           })),
         });
         return true;
@@ -1371,6 +1449,83 @@ function toggleRecipePause(recipeName, orderId, paused) {
   return updated;
 }
 
+/**
+ * Run a full consistency audit on activeRecipes.
+ * Detects and auto-fixes:
+ *  1. Duplicate gate assignments (same gate in multiple recipes)
+ *  2. Duplicate recipe rows (same recipe/order on multiple rows — merges them)
+ * Returns an object describing what was found/fixed.
+ */
+function runConsistencyCheck() {
+  const recipes = getActiveRecipes();
+  const issues = [];
+  let fixed = false;
+
+  // --- 1. Merge duplicate recipe rows ---
+  const seen = new Map(); // key -> index of first occurrence
+  const mergeTargets = new Map(); // key -> [indices]
+  recipes.forEach((r, idx) => {
+    if (r.batchLimitTransitioning || r.isFinishing || r._isIncomingFromQueue) return;
+    const key = r.orderId ? `order_${r.orderId}` : `recipe_${r.recipeName}`;
+    if (!mergeTargets.has(key)) mergeTargets.set(key, []);
+    mergeTargets.get(key).push(idx);
+  });
+
+  let merged = [...recipes];
+  const indicesToRemove = new Set();
+
+  for (const [key, indices] of mergeTargets.entries()) {
+    if (indices.length <= 1) continue;
+    issues.push({ type: 'duplicate_recipe_rows', key, count: indices.length });
+
+    // Merge all gates into the first occurrence
+    const primary = indices[0];
+    const allGates = new Set();
+    for (const idx of indices) {
+      for (const g of (merged[idx].gates || [])) allGates.add(g);
+    }
+    merged[primary] = { ...merged[primary], gates: Array.from(allGates).sort((a, b) => a - b) };
+    for (let i = 1; i < indices.length; i++) indicesToRemove.add(indices[i]);
+    fixed = true;
+  }
+
+  if (indicesToRemove.size > 0) {
+    merged = merged.filter((_, idx) => !indicesToRemove.has(idx));
+  }
+
+  // --- 2. Gate uniqueness (handled by enforceGateUniqueness in setActiveRecipes) ---
+  const gateCount = new Map();
+  for (const r of merged) {
+    for (const g of (r.gates || [])) {
+      gateCount.set(g, (gateCount.get(g) || 0) + 1);
+    }
+  }
+  for (const [gate, count] of gateCount.entries()) {
+    if (count > 1) {
+      issues.push({ type: 'duplicate_gate', gate, count });
+      fixed = true;
+    }
+  }
+
+  if (fixed) {
+    console.warn('[Consistency] Issues detected and fixed:', JSON.stringify(issues));
+    setActiveRecipes(merged); // enforceGateUniqueness runs inside
+    eventBus.broadcast('machine:consistency-fix', { issues, timestamp: Date.now() });
+  }
+
+  return { ok: issues.length === 0, issues, fixed };
+}
+
+// Run consistency check every 30 seconds while the process is alive
+setInterval(() => {
+  try {
+    const state = getState();
+    if (state.machineState === 'running') {
+      runConsistencyCheck();
+    }
+  } catch (_) { /* ignore errors in background check */ }
+}, 30000);
+
 module.exports = {
   getState,
   updateState,
@@ -1409,6 +1564,8 @@ module.exports = {
   toggleGatePause,
   getPausedGates,
   toggleRecipePause,
+  // Consistency
+  runConsistencyCheck,
 };
 
 /**

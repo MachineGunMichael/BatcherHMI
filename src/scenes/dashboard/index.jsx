@@ -1,6 +1,8 @@
 // src/scenes/dashboard/index.jsx
-import React, { useMemo, useEffect, useState, useCallback } from "react";
-import { Box, Typography, useTheme, Slider } from "@mui/material";
+import React, { useMemo, useState, useRef, useCallback, useEffect } from "react";
+import { Box, Typography, useTheme, Paper, IconButton, Tooltip } from "@mui/material";
+import PauseIcon from "@mui/icons-material/Pause";
+import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 import { ResponsiveLine } from "@nivo/line";
 import { ResponsivePie } from "@nivo/pie";
 import { ResponsiveScatterPlot } from "@nivo/scatterplot";
@@ -8,41 +10,20 @@ import Header from "../../components/Header";
 import MachineControls from "../../components/MachineControls";
 import ServerOffline from "../../components/ServerOffline";
 import { tokens } from "../../theme";
-import { useAppContext } from "../../context/AppContext";
 import { useDashboardData } from "./dataProvider";
 import useMachineState from "../../hooks/useMachineState";
 import { getSyncedAnimationStyle } from "../../utils/animationSync";
-import log from "../../services/logService";
+import { useAppContext } from "../../context/AppContext";
+import { useRenderMonitor } from "../../utils/renderMonitor";
+import api from "../../services/api";
 
 /* ---------- Recipe name formatter ---------- */
 const formatRecipeName = (name) => {
   if (!name || name === "Total") return name;
-  
-  let formatted = name;
-  
-  // Remove "R_" at the beginning
-  if (formatted.startsWith("R_")) {
-    formatted = formatted.substring(2);
-  }
-  
-  // Remove "_NA_0" at the end
-  if (formatted.endsWith("_NA_0")) {
-    formatted = formatted.substring(0, formatted.length - 5);
-  }
-  
-  // Replace exact_X with =_X
-  formatted = formatted.replace(/_exact_(\d+)/, "_=_$1");
-  
-  // Replace min_X with >_X
-  formatted = formatted.replace(/_min_(\d+)/, "_>_$1");
-  
-  // Replace max_X with <_X
-  formatted = formatted.replace(/_max_(\d+)/, "_<_$1");
-  
-  return formatted;
+  return name;
 };
 
-/* ---------- Nivo safety: normalize series shape ---------- */
+/* ---------- Nivo safety ---------- */
 const sanitizeLineSeries = (arr) => {
   const list = Array.isArray(arr) ? arr : [];
   return list
@@ -52,18 +33,15 @@ const sanitizeLineSeries = (arr) => {
       color: s.color,
       data: (s.data || [])
         .filter(p => p != null && (p.x !== undefined || p.t !== undefined))
-        .map(p => ({
-          x: p.x ?? p.t,
-          y: Number.isFinite(p.y) ? p.y : Number(p.v ?? NaN)
-        }))
+        .map(p => ({ x: p.x ?? p.t, y: Number.isFinite(p.y) ? p.y : Number(p.v ?? NaN) }))
         .filter(p => p.x !== undefined && p.x !== null && Number.isFinite(p.y))
     }))
-    .filter(s => s.data.length > 0); // only include series with actual data
+    .filter(s => s.data.length > 0);
 };
 
-/* ---------- Custom scatter node to support per-point alpha (fade) ---------- */
+/* ---------- Scatter node ---------- */
 const ScatterNode = ({ node }) => {
-  const r = (node?.size ?? 3) / 2;           // keep original thickness from nodeSize
+  const r = (node?.size ?? 3) / 2;
   const a = typeof node?.data?.alpha === 'number' ? node.data.alpha : 1;
   return (
     <g transform={`translate(${node.x}, ${node.y})`}>
@@ -72,936 +50,711 @@ const ScatterNode = ({ node }) => {
   );
 };
 
-/* ---------- Annotated machine image with per-gate overlay ---------- */
-const AnnotatedMachineImage = ({ colorMap, assignmentsByGate, overlayByGate, transitioningGates, gateToNewRecipe, getDisplayName }) => {
+/* ---------- Gate annotations grid (no machine image) ---------- */
+const GATE_GAP = 10; // px — horizontal & vertical gap between gate boxes
+
+const GateAnnotationsGrid = React.memo(({ colorMap, assignmentsByGate, overlayByGate, transitioningGates, hasBuffer }) => {
+  useRenderMonitor('GateAnnotations');
   const theme = useTheme();
   const colors = tokens(theme.palette.mode);
+  const isDark = theme.palette.mode === 'dark';
+  // const fullBg = isDark ? colors.redAccent[400] : colors.redAccent[100];
+  const fullBg = isDark ? 'rgba(244,67,54,0.25)' : 'rgba(182, 31, 31, 0.25)';
 
-  const annotationPositions = [
-    { gate: 1, x1: '36%', y1: '70%', x2: '53%', y2: '15%' },
-    { gate: 2, x1: '34%', y1: '60%', x2: '68%', y2: '15%' },
-    { gate: 3, x1: '33%', y1: '50%', x2: '83%', y2: '15%' },
-    { gate: 4, x1: '43%', y1: '35%', x2: '98%', y2: '15%' },
-    { gate: 5, x1: '36%', y1: '70%', x2: '53%', y2: '65%' },
-    { gate: 6, x1: '34%', y1: '60%', x2: '68%', y2: '65%' },
-    { gate: 7, x1: '33%', y1: '50%', x2: '83%', y2: '65%' },
-    { gate: 8, x1: '43%', y1: '35%', x2: '98%', y2: '65%' },
-  ];
-
-  // Line segments with simple x1, y1, x2, y2 coordinates (in percentages)
-  const lineSegments = [
-    // Gate 1 line - first segment (horizontal)
-    {
-      id: 'gate1-horizontal',
-      x1: 35, y1: 5,
-      x2: 39, y2: 5
-    },
-    // Gate 1 line - second segment (angled to machine)
-    {
-      id: 'gate1-angled',
-      x1: 35, y1: 5,
-      x2: 31, y2: 8
-    },
-    // Gate 5 line - first segment (horizontal)
-    {
-      id: 'gate5-horizontal',
-      x1: 35, y1: 55,
-      x2: 39, y2: 55
-    },
-    // Gate 5 line - second segment (angled to machine)
-    {
-      id: 'gate5-angled',
-      x1: 35, y1: 55,
-      x2: 27, y2: 50
-    }
-  ];
+  const gates = [1, 2, 3, 4, 5, 6, 7, 8];
 
   return (
-    <Box sx={{ position: 'relative', width: '100%', height: '100%' }}>
-      <img
-        alt="machine"
-        style={{
-          position: 'absolute',
-          top: '35%',
-          left: '19%',
-          transform: 'translate(-50%, -50%)',
-          maxHeight: '100%'
-        }}
-        src="../../assets/BatchMind.png"
-      />
-      {annotationPositions.map((pos, idx) => {
-        const program = assignmentsByGate[pos.gate] || "—";
+    <Box sx={{
+      display: 'grid',
+      gridTemplateColumns: 'repeat(4, 105px)',
+      gridTemplateRows: 'auto auto',
+      gap: `${GATE_GAP}px`,
+    }}>
+      {gates.map((gate) => {
+        const program = assignmentsByGate[gate] || "—";
         const headColor = colorMap[program] || colors.primary[500];
-        const gateInfo = overlayByGate[pos.gate] || { pieces: 0, grams: 0 };
-        const isTransitioning = (transitioningGates || []).includes(pos.gate);
+        const gateInfo = overlayByGate[gate] || { main: { pieces: 0, grams: 0 }, buffer: { pieces: 0, grams: 0 }, mainFull: false, bufferFull: false, pieces: 0, grams: 0 };
+        const isTransitioning = (transitioningGates || []).includes(gate);
+        const mainData = gateInfo.main || { pieces: gateInfo.pieces || 0, grams: gateInfo.grams || 0 };
+        const bufferData = gateInfo.buffer || { pieces: 0, grams: 0 };
+        const isMainFull = gateInfo.mainFull || false;
+        const isBufferFull = gateInfo.bufferFull || false;
+        const isGateBlocked = isMainFull && (!hasBuffer || isBufferFull);
+
+        const blockedPulse = isGateBlocked ? {
+          '@keyframes blockedBlink': {
+            '0%, 100%': { borderColor: 'transparent', boxShadow: '0 0 0px transparent' },
+            '50%': { borderColor: colors.redAccent[500], boxShadow: `0 0 12px ${colors.redAccent[500]}88` },
+          },
+          animation: 'blockedBlink 1.2s ease-in-out infinite',
+          borderWidth: '2px',
+        } : {};
 
         return (
-          <React.Fragment key={idx}>
-            {/* Main gate annotation card */}
-            <Box
-              sx={{
-                position: 'absolute',
-                top: pos.y2,
-                left: pos.x2,
-                transform: 'translate(-90%, -50%)',
-                backgroundColor: colors.primary[100],
-                borderRadius: 1,
-                border: `1px solid ${headColor}`,
-                width: '130px',
-                boxShadow: 3,
-                overflow: 'hidden',
-                // Pulsing animation for transitioning gates (uses synced timing)
-                ...(isTransitioning && getSyncedAnimationStyle()),
-              }}
-            >
-              <Box sx={{ backgroundColor: headColor, py: 0.1, px: 0.5, textAlign: 'left' }}>
-                <Typography variant="h8" color="#fff">
-                  G{pos.gate}: {getDisplayName(program)}
+          <Box key={gate} sx={{
+            backgroundColor: colors.primary[100],
+            borderRadius: 1,
+            border: `1px solid ${headColor}`,
+            width: '105px',
+            boxShadow: 3,
+            overflow: 'hidden',
+            ...(isTransitioning && getSyncedAnimationStyle()),
+            ...blockedPulse,
+          }}>
+            <Box sx={{ backgroundColor: headColor, py: 0.1, px: 0.5, textAlign: 'left' }}>
+              <Typography variant="h8" color="#fff" sx={{ fontSize: '0.65rem' }}>
+                G{gate}
+              </Typography>
+            </Box>
+
+            {hasBuffer && (
+              <>
+                <Box sx={{ px: 0.5, pt: 0.2, pb: 0.1, backgroundColor: isBufferFull ? fullBg : 'transparent' }}>
+                  <Typography variant="caption" color={colors.grey[500]} fontWeight="bold" sx={{ fontSize: '0.55rem', letterSpacing: '0.05em' }}>
+                    BUFFER {isBufferFull ? '— FULL' : ''}
+                  </Typography>
+                  <Box sx={{ display: 'flex', justifyContent: 'space-between', py: 0 }}>
+                    <Typography variant="body2" color={colors.primary[800]} sx={{ fontSize: '0.65rem' }}>Pcs:</Typography>
+                    <Typography variant="body2" color={colors.primary[800]} sx={{ fontSize: '0.65rem' }}>{bufferData.pieces ?? 0}</Typography>
+                  </Box>
+                  <Box sx={{ display: 'flex', justifyContent: 'space-between', py: 0 }}>
+                    <Typography variant="body2" color={colors.primary[800]} sx={{ fontSize: '0.65rem' }}>g:</Typography>
+                    <Typography variant="body2" color={colors.primary[800]} sx={{ fontSize: '0.65rem' }}>{Number(bufferData.grams ?? 0).toFixed(1)}</Typography>
+                  </Box>
+                </Box>
+                <Box sx={{ borderTop: `1px dashed ${colors.grey[400]}`, mx: 0.5 }} />
+              </>
+            )}
+
+            <Box sx={{ px: 0.5, pt: hasBuffer ? 0.1 : 0.3, pb: 0.2, backgroundColor: isMainFull ? fullBg : 'transparent' }}>
+              {hasBuffer && (
+                <Typography variant="caption" color={colors.grey[500]} fontWeight="bold" sx={{ fontSize: '0.55rem', letterSpacing: '0.05em' }}>
+                  MAIN {isMainFull ? '— FULL' : ''}
+                </Typography>
+              )}
+              <Box sx={{ display: 'flex', justifyContent: 'space-between', py: 0.1 }}>
+                <Typography variant="body2" color={colors.primary[800]} fontWeight={hasBuffer ? 'normal' : 'bold'} sx={{ fontSize: hasBuffer ? '0.65rem' : '0.75rem' }}>
+                  {hasBuffer ? 'Pcs:' : 'Pieces:'}
+                </Typography>
+                <Typography variant="body2" color={colors.primary[800]} sx={{ fontSize: hasBuffer ? '0.65rem' : '0.75rem' }}>
+                  {mainData.pieces ?? 0}
                 </Typography>
               </Box>
-              <Box sx={{ p: 0.5 }}>
-                <Box sx={{ display: 'flex', justifyContent: 'space-between', borderBottom: `1px solid ${colors.grey[300]}`, py: 0.1 }}>
-                  <Typography variant="body2" color={colors.primary[800]} fontWeight="bold">Pieces:</Typography>
-                  <Typography variant="body2" color={colors.primary[800]}>{gateInfo.pieces ?? 0}</Typography>
-                </Box>
-                <Box sx={{ display: 'flex', justifyContent: 'space-between', py: 0.1 }}>
-                  <Typography variant="body2" color={colors.primary[800]} fontWeight="bold">Gram:</Typography>
-                  <Typography variant="body2" color={colors.primary[800]}>{Number(gateInfo.grams ?? 0).toFixed(1)}</Typography>
-                </Box>
+              <Box sx={{ display: 'flex', justifyContent: 'space-between', py: 0.1 }}>
+                <Typography variant="body2" color={colors.primary[800]} fontWeight={hasBuffer ? 'normal' : 'bold'} sx={{ fontSize: hasBuffer ? '0.65rem' : '0.75rem' }}>
+                  {hasBuffer ? 'g:' : 'Gram:'}
+                </Typography>
+                <Typography variant="body2" color={colors.primary[800]} sx={{ fontSize: hasBuffer ? '0.65rem' : '0.75rem' }}>
+                  {Number(mainData.grams ?? 0).toFixed(1)}
+                </Typography>
               </Box>
+              {!hasBuffer && isMainFull && (
+                <Typography variant="caption" color="#f44336" fontWeight="bold" sx={{ display: 'block', textAlign: 'center', mt: 0.2, fontSize: '0.6rem' }}>
+                  FULL — AWAITING REMOVAL
+                </Typography>
+              )}
             </Box>
-          </React.Fragment>
+          </Box>
         );
-      })}
-      
-      {/* Line segments from gate boxes to machine image */}
-      {lineSegments.map((segment) => {
-        const isHorizontal = segment.y1 === segment.y2;
-        const isVertical = segment.x1 === segment.x2;
-        
-        if (isHorizontal) {
-          // Horizontal line
-          return (
-            <Box
-              key={segment.id}
-              sx={{
-                position: 'absolute',
-                left: `${segment.x1}%`,
-                top: `${segment.y1}%`,
-                width: `${segment.x2 - segment.x1}%`,
-                height: '2px',
-                backgroundColor: theme.palette.mode === 'dark' ? '#ffffff' : '#000000',
-                zIndex: 0,
-              }}
-            />
-          );
-        } else if (isVertical) {
-          // Vertical line
-          return (
-            <Box
-              key={segment.id}
-              sx={{
-                position: 'absolute',
-                left: `${segment.x1}%`,
-                top: `${segment.y1}%`,
-                width: '2px',
-                height: `${segment.y2 - segment.y1}%`,
-                backgroundColor: theme.palette.mode === 'dark' ? '#ffffff' : '#000000',
-                zIndex: 0,
-              }}
-            />
-          );
-        } else {
-          // Diagonal line - use simple math for these
-          const deltaX = segment.x2 - segment.x1;
-          const deltaY = segment.y2 - segment.y1;
-          const length = Math.sqrt(deltaX * deltaX + deltaY * deltaY);
-          const angle = Math.atan2(deltaY, deltaX) * (180 / Math.PI);
-          
-          return (
-            <Box
-              key={segment.id}
-              sx={{
-                position: 'absolute',
-                left: `${segment.x1}%`,
-                top: `${segment.y1}%`,
-                width: `${length}%`,
-                height: '2px',
-                backgroundColor: theme.palette.mode === 'dark' ? '#ffffff' : '#000000',
-                transformOrigin: '0 50%',
-                transform: `rotate(${angle}deg)`,
-                zIndex: 0,
-              }}
-            />
-          );
-        }
       })}
     </Box>
   );
-};
+});
 
-const Dashboard = () => {
+/* ---------- Active Orders Table ---------- */
+const ActiveOrdersTable = React.memo(({ activeRecipes, colorMap, pausedGates, machineState: mState }) => {
   const theme = useTheme();
   const colors = tokens(theme.palette.mode);
+
+  const handleToggleGatePause = async (gate) => {
+    const isPaused = (pausedGates || []).includes(gate);
+    try { await api.post('/machine/pause-gate', { gate, paused: !isPaused }); } catch (e) { console.error('Failed to toggle gate pause:', e); }
+  };
+
+  const handleToggleRecipePause = async (recipe) => {
+    try {
+      await api.post('/machine/pause-recipe', {
+        recipeName: recipe.recipeName,
+        orderId: recipe.orderId || null,
+        paused: !recipe.paused,
+      });
+    } catch (e) { console.error('Failed to toggle recipe pause:', e); }
+  };
+
+  if (!activeRecipes || activeRecipes.length === 0) {
+    return (
+      <Typography variant="body2" color={colors.grey[500]} sx={{ py: 2 }}>
+        No active orders. Add orders to start production.
+      </Typography>
+    );
+  }
+
+  return (
+    <Paper sx={{ p: 3, backgroundColor: colors.primary[200], width: '100%' }}>
+      <Box display="grid" gridTemplateColumns="3fr 80px repeat(8, 20px) 40px repeat(6, minmax(40px, 1fr)) minmax(80px, auto)" gap="2px" sx={{ width: '100%' }}>
+        {/* Header row 1 */}
+        <Box sx={{ p: 0, display: 'flex', alignItems: 'center', minHeight: '20px' }}>
+          <Typography variant="body2" fontWeight="bold">Order</Typography>
+        </Box>
+        <Box sx={{ p: 0, display: 'flex', alignItems: 'center', minHeight: '20px' }}>
+          <Typography variant="body2" fontWeight="bold">Batches</Typography>
+        </Box>
+        <Box sx={{ p: 0, display: 'flex', alignItems: 'center', minHeight: '20px', gridColumn: 'span 8' }}>
+          <Typography variant="body2" fontWeight="bold">Gates</Typography>
+        </Box>
+        <Box />
+        <Box sx={{ display: 'flex', alignItems: 'center', minHeight: '20px', gridColumn: 'span 2' }}>
+          <Typography variant="body2" fontWeight="bold">Piece Weight</Typography>
+        </Box>
+        <Box sx={{ display: 'flex', alignItems: 'center', minHeight: '20px', gridColumn: 'span 2' }}>
+          <Typography variant="body2" fontWeight="bold">Batch Weight</Typography>
+        </Box>
+        <Box sx={{ display: 'flex', alignItems: 'center', minHeight: '20px', gridColumn: 'span 2' }}>
+          <Typography variant="body2" fontWeight="bold">Pieces</Typography>
+        </Box>
+        <Box />
+
+        {/* Header row 2 */}
+        <Box sx={{ minHeight: '20px', mb: 1 }} />
+        <Box sx={{ minHeight: '20px', mb: 1 }} />
+        {[1, 2, 3, 4, 5, 6, 7, 8].map(gate => (
+          <Box key={gate} sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '20px', mb: 1 }}>
+            <Typography variant="body2" fontWeight="bold">{gate}</Typography>
+          </Box>
+        ))}
+        <Box sx={{ mb: 1 }} />
+        {['Min', 'Max', 'Min', 'Max', 'Min', 'Max'].map((label, i) => (
+          <Box key={i} sx={{ display: 'flex', alignItems: 'center', minHeight: '20px', mb: 1 }}>
+            <Typography variant="body2" fontWeight="bold">{label}</Typography>
+          </Box>
+        ))}
+        <Box sx={{ mb: 1 }} />
+
+        {/* Data rows */}
+        {(() => {
+          const incoming = activeRecipes.filter(r => r._isIncomingFromQueue);
+          const rest = activeRecipes.filter(r => !r._isIncomingFromQueue);
+          const hasFinishing = rest.some(r => r.batchLimitTransitioning || r.isFinishing);
+          const ordered = [];
+          for (const r of rest) {
+            ordered.push(r);
+            if ((r.batchLimitTransitioning || r.isFinishing) && hasFinishing) {
+              for (const inc of incoming) ordered.push(inc);
+            }
+          }
+          if (!hasFinishing) for (const inc of incoming) ordered.push(inc);
+          return ordered;
+        })().map((recipe, i) => {
+          const recipeColor = colorMap[recipe.recipeName] || colors.primary[500];
+          const completed = recipe.completedBatches || 0;
+          const requested = recipe.requestedBatches || recipe.batchLimit;
+          const orderName = recipe.orderId && recipe.customerName
+            ? `${recipe.customerName} - #${recipe.orderId}`
+            : (recipe.displayName || recipe.display_name || formatRecipeName(recipe.recipeName));
+          const isRecipePaused = !!recipe.paused;
+          const isFinishing = recipe.batchLimitTransitioning || recipe.isFinishing;
+          const isIncoming = recipe._isIncomingFromQueue;
+          const anyFinishing = activeRecipes.some(r => r.batchLimitTransitioning || r.isFinishing);
+          const isReplacing = isIncoming && anyFinishing;
+
+          let nameColor = colors.primary[800];
+          let labelSuffix = '';
+          if (isFinishing) {
+            nameColor = colors.tealAccent[500];
+            labelSuffix = ' (Finishing)';
+          } else if (isReplacing) {
+            nameColor = colors.redAccent[500];
+            labelSuffix = ' (Replacing)';
+          }
+
+          return (
+            <React.Fragment key={`${i}-${recipe.recipeName}`}>
+              <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', height: '28px' }}>
+                {isReplacing && (
+                  <Typography variant="body2" sx={{ mr: 0.5, color: colors.redAccent[500] }}>↳</Typography>
+                )}
+                <Typography variant="body2" sx={{ color: nameColor, fontWeight: (isFinishing || isReplacing) ? 'bold' : 'normal' }}>{orderName}{labelSuffix}</Typography>
+              </Box>
+              <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', height: '28px' }}>
+                <Typography variant="body2">{completed}/{requested || '-'}</Typography>
+              </Box>
+              {[1, 2, 3, 4, 5, 6, 7, 8].map(gate => {
+                const isAssigned = (recipe.gates || []).includes(gate);
+                const isGatePaused = isAssigned && (pausedGates || []).includes(gate);
+                return (
+                  <Box key={gate}
+                    onClick={isAssigned ? () => handleToggleGatePause(gate) : undefined}
+                    sx={{
+                      position: 'relative',
+                      backgroundColor: isAssigned
+                        ? isGatePaused ? `${recipeColor}66` : recipeColor
+                        : undefined,
+                      width: '20px', height: '20px', alignSelf: 'center',
+                      cursor: isAssigned ? 'pointer' : 'default',
+                      ...(isGatePaused && {
+                        backgroundImage: 'repeating-linear-gradient(45deg, transparent, transparent 3px, rgba(0,0,0,0.15) 3px, rgba(0,0,0,0.15) 5px)',
+                      }),
+                      '&:hover .gate-pause-icon': { opacity: isAssigned ? 1 : 0 },
+                    }}
+                  >
+                    {isAssigned && (
+                      <Box className="gate-pause-icon" sx={{
+                        opacity: isGatePaused ? 1 : 0,
+                        transition: 'opacity 0.15s',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        position: 'absolute', inset: 0,
+                        backgroundColor: 'rgba(0,0,0,0.35)', borderRadius: '2px',
+                      }}>
+                        {isGatePaused
+                          ? <PlayArrowIcon sx={{ fontSize: 14, color: '#fff' }} />
+                          : <PauseIcon sx={{ fontSize: 14, color: '#fff' }} />}
+                      </Box>
+                    )}
+                  </Box>
+                );
+              })}
+              <Box sx={{ height: '28px' }} />
+              <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', height: '28px' }}>
+                <Typography variant="body2">{recipe.params?.pieceMinWeight || '-'}</Typography>
+              </Box>
+              <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', height: '28px' }}>
+                <Typography variant="body2">{recipe.params?.pieceMaxWeight || '-'}</Typography>
+              </Box>
+              <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', height: '28px' }}>
+                <Typography variant="body2">{recipe.params?.batchMinWeight || '-'}</Typography>
+              </Box>
+              <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', height: '28px' }}>
+                <Typography variant="body2">{recipe.params?.batchMaxWeight || '-'}</Typography>
+              </Box>
+              <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', height: '28px' }}>
+                <Typography variant="body2">
+                  {recipe.params?.countType === 'min' || recipe.params?.countType === 'exact' ? recipe.params?.countValue || '-' : '-'}
+                </Typography>
+              </Box>
+              <Box sx={{ p: 0.5, display: 'flex', alignItems: 'center', height: '28px' }}>
+                <Typography variant="body2">
+                  {recipe.params?.countType === 'max' || recipe.params?.countType === 'exact' ? recipe.params?.countValue || '-' : '-'}
+                </Typography>
+              </Box>
+              <Box display="flex" alignItems="center" justifyContent="flex-end" sx={{ height: '28px' }}>
+                {isRecipePaused && (
+                  <Typography variant="body2" sx={{ color: theme.palette.action.disabled, fontSize: '0.7rem', whiteSpace: 'nowrap', mr: 0.5 }}>
+                    PAUSED
+                  </Typography>
+                )}
+                {mState !== 'idle' && (
+                  <Tooltip title={isRecipePaused ? "Resume" : "Pause"}>
+                    <IconButton
+                      size="small"
+                      onClick={() => handleToggleRecipePause(recipe)}
+                      sx={{ color: isRecipePaused ? colors.tealAccent[500] : colors.orangeAccent[500] }}
+                    >
+                      {isRecipePaused ? <PlayArrowIcon fontSize="small" /> : <PauseIcon fontSize="small" />}
+                    </IconButton>
+                  </Tooltip>
+                )}
+              </Box>
+            </React.Fragment>
+          );
+        })}
+      </Box>
+    </Paper>
+  );
+});
+
+/* ---------- Memoized chart sections ---------- */
+const MemoScatterChart = React.memo(({ scatter, scatterProps, chartBoxSx, colors }) => {
+  useRenderMonitor('ScatterChart');
+  return (
+    <Box sx={{ ...chartBoxSx, flex: 1.5, display: 'flex', flexDirection: 'column' }} p="12px">
+      <Typography variant="h5" color={colors.tealAccent[500]}>Piece Weight Distribution</Typography>
+      <Box sx={{ flex: 1, minHeight: 0, position: "relative" }}>
+        {scatter && scatter.length > 0 && scatter[0]?.data?.length > 0 ? (
+          <ResponsiveScatterPlot data={scatter} {...scatterProps} nodeComponent={ScatterNode} animate={false} />
+        ) : (
+          <Box display="flex" alignItems="center" justifyContent="center" height="100%">
+            <Typography variant="body2" color={colors.grey[500]}>No data</Typography>
+          </Box>
+        )}
+      </Box>
+    </Box>
+  );
+});
+
+const MemoLineChart = React.memo(({ data, lineProps, lineColorFn, chartBoxSx, colors }) => {
+  useRenderMonitor('LineChart');
+  return (
+    <Box sx={{ ...chartBoxSx, flex: 1.5, display: 'flex', flexDirection: 'column' }} p="12px">
+      <Typography variant="h5" color={colors.tealAccent[500]}>Pieces Processed</Typography>
+      <Box sx={{ flex: 1, minHeight: 0, position: "relative" }}>
+        {data.length > 0 ? (
+          <ResponsiveLine data={data} colors={lineColorFn} {...lineProps} enableArea areaOpacity={0.15} areaBaselineValue={0} animate={false} />
+        ) : (
+          <Box display="flex" alignItems="center" justifyContent="center" height="100%">
+            <Typography variant="body2" color={colors.grey[500]}>No data</Typography>
+          </Box>
+        )}
+      </Box>
+    </Box>
+  );
+});
+
+const MemoPieChart = React.memo(({ data, pieProps, title, label, value, chartBoxSx, colors }) => {
+  useRenderMonitor('PieChart');
+  return (
+    <Box sx={{ ...chartBoxSx, flex: 1, display: 'flex', flexDirection: 'column' }} p="12px">
+      <Typography variant="h5" color={colors.tealAccent[500]}>{title}</Typography>
+      <Typography variant="body2" color={colors.primary[800]} sx={{ mb: "-6px" }}>{label}: {value}</Typography>
+      <Box sx={{ flex: 1, minHeight: 0, position: "relative", overflow: "hidden" }}>
+        {data.length > 0 ? <ResponsivePie data={data} {...pieProps} /> : (
+          <Box display="flex" alignItems="center" justifyContent="center" height="100%">
+            <Typography variant="body2" color={colors.grey[500]}>No data</Typography>
+          </Box>
+        )}
+      </Box>
+    </Box>
+  );
+});
+
+const MemoRejectsBox = React.memo(({ rejects, chartBoxSx, colors }) => {
+  useRenderMonitor('RejectsBox');
+  return (
+    <Box sx={{ ...chartBoxSx, flex: 1, display: 'flex', flexDirection: 'column' }} p="12px">
+      <Typography variant="h5" color={colors.tealAccent[500]}>Rejects</Typography>
+      <Box display="flex" flexDirection="row" flex="1" justifyContent="space-around" alignItems="center" sx={{ minHeight: 0 }}>
+        <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center' }}>
+          <Typography variant="caption" color={colors.primary[900]} sx={{ mb: 1, whiteSpace: 'nowrap' }}>TOTAL COUNT</Typography>
+          <Typography variant="h3" color={colors.tealAccent[500]} fontWeight="bold" sx={{ lineHeight: 1 }}>
+            {(() => { const d = rejects?.[0]?.data?.[rejects[0].data.length - 1]; return d?.total_rejects_count?.toLocaleString() || '0'; })()}
+          </Typography>
+          <Typography variant="body2" color={colors.primary[900]} sx={{ mt: 1 }}>pieces</Typography>
+        </Box>
+        <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center' }}>
+          <Typography variant="caption" color={colors.primary[900]} sx={{ mb: 1, whiteSpace: 'nowrap' }}>TOTAL WEIGHT</Typography>
+          <Typography variant="h3" color={colors.tealAccent[500]} fontWeight="bold" sx={{ lineHeight: 1 }}>
+            {(() => { const d = rejects?.[0]?.data?.[rejects[0].data.length - 1]; const w = (d?.total_rejects_weight_g || 0) / 1000; return w.toLocaleString(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 }); })()}
+          </Typography>
+          <Typography variant="body2" color={colors.primary[900]} sx={{ mt: 1 }}>kg</Typography>
+        </Box>
+      </Box>
+    </Box>
+  );
+});
+
+/* ---------- Dashboard ---------- */
+const REF_W = 750;
+const REF_H = 740;
+
+/* The chart row uses flex:1 with minHeight:0 — it fills ALL remaining
+   vertical space after gates + table.  When the table grows (more orders),
+   charts shrink.  To give charts more room overall, increase REF_H above
+   (everything scales down slightly, freeing more virtual pixels for charts). */
+
+const Dashboard = () => {
+  useRenderMonitor('Dashboard');
+  const theme = useTheme();
+  const colors = useMemo(() => tokens(theme.palette.mode), [theme.palette.mode]);
   const isDark = theme.palette.mode === "dark";
 
-  // Machine state from backend
-  const { activeRecipes, transitioningGates, transitionStartRecipes } = useMachineState();
-  
-  // Build map of gate -> new recipe name (for transitioning gates display)
-  const gateToNewRecipe = useMemo(() => {
-    const map = {};
-    (activeRecipes || []).forEach(recipe => {
-      (recipe.gates || []).forEach(gate => {
-        map[gate] = recipe.recipeName;
+  const observerRef = useRef(null);
+  const [containerDims, setContainerDims] = useState({ w: 0, h: 0, scale: 1 });
+
+  const containerRef = useCallback((el) => {
+    if (observerRef.current) {
+      observerRef.current.disconnect();
+      observerRef.current = null;
+    }
+    if (el) {
+      const observer = new ResizeObserver((entries) => {
+        const { width, height } = entries[0].contentRect;
+        if (width < 10 || height < 10) return;
+        const s = Math.max(0.4, Math.min(width / REF_W, height / REF_H));
+        setContainerDims(prev => {
+          if (Math.abs(prev.scale - s) < 0.005 && Math.abs(prev.w - width) < 2 && Math.abs(prev.h - height) < 2) return prev;
+          return { w: width, h: height, scale: s };
+        });
       });
-    });
-    return map;
-  }, [activeRecipes]);
-  
-  // Get set of recipe names that are currently transitioning (shown in legend with pulsing)
-  const transitioningRecipeNames = useMemo(() => {
-    const names = new Set();
-    Object.values(transitionStartRecipes || {}).forEach(recipe => {
-      if (recipe && recipe.recipeName) {
-        names.add(recipe.recipeName);
-      }
-    });
-    return names;
-  }, [transitionStartRecipes]);
+      observer.observe(el);
+      observerRef.current = observer;
+    }
+  }, []);
 
-  // Build map of recipeName -> displayName for showing friendly names
-  const recipeDisplayNames = useMemo(() => {
-    const map = {};
-    (activeRecipes || []).forEach(recipe => {
-      if (recipe.recipeName) {
-        map[recipe.recipeName] = recipe.displayName || recipe.display_name || null;
-      }
-    });
-    // Also include transitioning recipes
-    Object.values(transitionStartRecipes || {}).forEach(recipe => {
-      if (recipe && recipe.recipeName && !map[recipe.recipeName]) {
-        map[recipe.recipeName] = recipe.displayName || recipe.display_name || null;
-      }
-    });
-    return map;
-  }, [activeRecipes, transitionStartRecipes]);
-
-  // global toggles from AppContext
+  const machineHook = useMachineState();
+  const { activeRecipes, transitioningGates, transitionStartRecipes, state: machineState, pausedGates } = machineHook;
   const { dashboardVisibleSeries, setDashboardVisibleSeries, recipeOrderMap } = useAppContext();
 
-  // Build a lookup from recipeName to order info (handles composite keys)
-  // recipeOrderMap is now keyed by composite key (order_${orderId} or recipe_${gates})
-  // We need to build a reverse lookup from recipeName to the info
+  // Stabilise array references so React.memo children don't re-render when
+  // useMachineState emits a new object whose arrays have identical content.
+  const activeRecipesRef = useRef(activeRecipes);
+  activeRecipesRef.current = activeRecipes;
+  const stableTransitioningGates = useMemo(() => transitioningGates, [JSON.stringify(transitioningGates)]);
+  const stablePausedGates = useMemo(() => pausedGates, [JSON.stringify(pausedGates)]);
+
+  const {
+    mode, configError, colorMap, assignmentsByGate, overlayByGate, hasBuffer,
+    xTicks, rejects, scatter, piecesProcessed, pies,
+  } = useDashboardData();
+
+  // Sync visibility with colorMap (same as KPI page)
+  const colorMapKeys = useMemo(() => JSON.stringify(Object.keys(colorMap || {}).sort()), [colorMap]);
+  useEffect(() => {
+    const keys = JSON.parse(colorMapKeys);
+    if (!keys.length) return;
+    setDashboardVisibleSeries(prev => {
+      const next = { ...(prev || {}) };
+      let hasChanges = false;
+      keys.forEach(k => { if (next[k] === undefined) { next[k] = true; hasChanges = true; } });
+      return hasChanges ? next : prev;
+    });
+  }, [colorMapKeys, setDashboardVisibleSeries]);
+
+  /* Display name helpers */
   const recipeNameToOrderInfo = useMemo(() => {
     const map = {};
     if (!recipeOrderMap) return map;
-    
     Object.entries(recipeOrderMap).forEach(([key, info]) => {
       const recipeName = info.recipeName;
       if (recipeName) {
-        // If there's already an entry for this recipeName, keep it as array
-        if (!map[recipeName]) {
-          map[recipeName] = [];
-        }
+        if (!map[recipeName]) map[recipeName] = [];
         map[recipeName].push({ key, ...info });
       }
     });
     return map;
   }, [recipeOrderMap]);
 
-  // Helper to get display name for a recipe (with order bracket notation if applicable)
-  // Can receive either just recipeName (string) or an object with more info
-  const getDisplayName = (recipeNameOrObj, includeOrderInfo = true) => {
+  const getDisplayName = useCallback((recipeNameOrObj) => {
     if (!recipeNameOrObj || recipeNameOrObj === "Total") return recipeNameOrObj;
-    
-    // Handle both string and object input
-    const recipeName = typeof recipeNameOrObj === 'string' 
-      ? recipeNameOrObj 
-      : recipeNameOrObj.recipeName || recipeNameOrObj.id;
-    
+    const recipeName = typeof recipeNameOrObj === 'string' ? recipeNameOrObj : recipeNameOrObj.recipeName || recipeNameOrObj.id;
     if (!recipeName || recipeName === "Total") return recipeName;
-    
-    // Get base display name
-    const displayName = recipeDisplayNames[recipeName] || formatRecipeName(recipeName);
-    
-    // Check if this recipe is associated with an order
-    if (includeOrderInfo && recipeNameToOrderInfo[recipeName]) {
+    if (recipeNameToOrderInfo[recipeName]) {
       const entries = recipeNameToOrderInfo[recipeName];
-      
-      // If only one entry, use it directly
-      if (entries.length === 1 && entries[0].orderId) {
-        const orderInfo = entries[0];
-        return `${displayName} (${orderInfo.customerName} - #${orderInfo.orderId})`;
-      }
-      
-      // If multiple entries, try to find the order one (has orderId)
       const orderEntry = entries.find(e => e.orderId);
-      if (orderEntry) {
-        // Check if we can determine which one to use from the input object
-        if (typeof recipeNameOrObj === 'object' && recipeNameOrObj.orderId) {
-          return `${displayName} (${orderEntry.customerName} - #${orderEntry.orderId})`;
-        }
-        // If input is just a string and there's an order, show the order info
-        // (This is a fallback - ideally we'd pass the full object)
-        return `${displayName} (${orderEntry.customerName} - #${orderEntry.orderId})`;
-      }
+      if (orderEntry) return `${orderEntry.customerName} - #${orderEntry.orderId}`;
     }
-    
-    return displayName;
-  };
+    const activeMatch = (activeRecipesRef.current || []).find(r => r.recipeName === recipeName && r.orderId && r.customerName);
+    if (activeMatch) return `${activeMatch.customerName} - #${activeMatch.orderId}`;
+    return formatRecipeName(recipeName);
+  }, [recipeNameToOrderInfo]);
 
-  const {
-    mode,
-    configError,
-    loading,
-    colorMap,
-    assignmentsByGate,
-    overlayByGate,
-    xTicks,
-    throughput,
-    giveaway,
-    piecesProcessed,
-    weightProcessed,
-    rejects,
-    scatter,
-    pies,
-    currentTime,
-    datasetStart,
-    datasetEnd,
-    setCurrentTime,
-  } = useDashboardData();
+  const formatTimeLabel = useCallback((ts) =>
+    new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false }), []);
 
-  // Debounced slider value to prevent rapid data fetching
-  const [sliderValue, setSliderValue] = useState(currentTime);
-  const [debounceTimeout, setDebounceTimeout] = useState(null);
-
-  // Force chart remount every 5 minutes to prevent memory leak
-  // Nivo charts accumulate internal objects (D3 scales, event listeners, animations)
-  // that aren't properly garbage collected. Remounting ensures complete cleanup.
-  const [chartKey, setChartKey] = useState(0);
-  useEffect(() => {
-    const remountInterval = setInterval(() => {
-      console.log('🔄 Forcing chart remount to release memory...');
-      setChartKey(prev => prev + 1);
-    }, 300000); // Every 5 minutes
-    
-    return () => clearInterval(remountInterval);
-  }, []);
-
-  // Update slider value when currentTime changes (from replay)
-  useEffect(() => {
-    setSliderValue(currentTime);
-  }, [currentTime]);
-
-  // Debounced slider change handler
-  const handleSliderChange = useCallback((_, value) => {
-    setSliderValue(value);
-    
-    // Clear existing timeout
-    if (debounceTimeout) {
-      clearTimeout(debounceTimeout);
-    }
-    
-    // Set new timeout to update currentTime after 100ms of no movement
-    const timeout = setTimeout(() => {
-      setCurrentTime(value);
-    }, 100);
-    
-    setDebounceTimeout(timeout);
-  }, [setCurrentTime, debounceTimeout]);
-
-  // Cleanup timeout on unmount
-  useEffect(() => {
-    return () => {
-      if (debounceTimeout) {
-        clearTimeout(debounceTimeout);
-      }
-    };
-  }, [debounceTimeout]);
-
-  // ensure toggles contain current legend keys (recipes + Total)
-  // Memoize colorMap keys to avoid infinite re-renders
-  const colorMapKeys = useMemo(() => JSON.stringify(Object.keys(colorMap || {}).sort()), [colorMap]);
-  
-  useEffect(() => {
-    const keys = JSON.parse(colorMapKeys);
-    if (!keys.length) return;
-    setDashboardVisibleSeries(prev => {
-      const next = { ...(prev || {}) };
-      // Check if there's actually a change before updating
-      let hasChanges = false;
-      keys.forEach(k => { 
-        if (next[k] === undefined) { 
-          next[k] = true; 
-          hasChanges = true;
-        } 
-      });
-      Object.keys(next).forEach(k => { 
-        if (!keys.includes(k)) { 
-          delete next[k]; 
-          hasChanges = true;
-        } 
-      });
-      // Only update if there are actual changes
-      return hasChanges ? next : prev;
-    });
-  }, [colorMapKeys, setDashboardVisibleSeries]);
-
-  const legendKeys = useMemo(() => {
-    const ks = Object.keys(colorMap || {}).filter(k => k !== "Total");
-    ks.sort();
-    if (colorMap["Total"]) ks.push("Total");
-    return ks;
-  }, [colorMap]);
-
-  const formatTimeLabel = (ts) =>
-    new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
-
-  const chartTheme = {
+  /* Chart theme & props — ALL memoized to prevent new refs every render */
+  const chartTheme = useMemo(() => ({
     axis: {
       domain: { line: { stroke: colors.primary[800], strokeWidth: 1 } },
       legend: { text: { fill: colors.primary[800] } },
-      ticks: {
-        line: { stroke: colors.primary[800], strokeWidth: 1 },
-        text: { fill: colors.primary[800], fontSize: 11 },
-      },
+      ticks: { line: { stroke: colors.primary[800], strokeWidth: 1 }, text: { fill: colors.primary[800], fontSize: 11 } },
     },
     grid: { line: { stroke: colors.primary[800], strokeWidth: 1 } },
     legends: { text: { fill: colors.primary[800] } },
     tooltip: { container: { background: isDark ? colors.primary[400] : colors.primary[100], color: isDark ? "#eee" : "#111" } },
-  };
+  }), [colors, isDark]);
 
-  const sharedLineProps = {
-    margin: { top: 10, right: 20, bottom: 50, left: 40 },
-    xScale: { type: 'point' },
-    yScale: { type: 'linear', min: 'auto', max: 'auto' },
-    curve: 'basis',
-    enableArea: false,
-    useMesh: false,
-    isInteractive: false,
-    axisTop: null,
-    axisRight: null,
-    pointSize: 0,
+  const lineTickValues = useMemo(() => {
+    const arr = (xTicks || []).filter(t => t != null);
+    if (!arr.length) return [];
+    const last = arr.length - 1;
+    if (last === 0) return [arr[0]];
+    const i2 = Math.floor(last / 3), i3 = Math.floor((2 * last) / 3);
+    return [arr[0], arr[i2], arr[i3], arr[last]].filter(t => t != null);
+  }, [xTicks]);
+
+  const lineTooltip = useCallback(({ point }) => {
+    if (!point || !point.serieId || !point.data) return null;
+    return (
+      <Box sx={{ background: isDark ? colors.primary[400] : colors.primary[100], padding: '9px 12px', borderRadius: '4px', border: `1px solid ${point.serieColor}` }}>
+        <Typography variant="body2" sx={{ color: isDark ? "#eee" : "#111", fontWeight: 'bold' }}>{getDisplayName(point.serieId)}</Typography>
+        <Typography variant="body2" sx={{ color: isDark ? "#eee" : "#111" }}>{formatTimeLabel(point.data.x)}: {Number(point.data.y).toFixed(2)}</Typography>
+      </Box>
+    );
+  }, [isDark, colors, getDisplayName, formatTimeLabel]);
+
+  const piecesProcessedProps = useMemo(() => ({
+    margin: { top: 10, right: 20, bottom: 20, left: 40 },
+    xScale: { type: 'point' }, yScale: { type: 'linear', min: 0, max: 'auto' },
+    curve: 'basis', enableArea: false, useMesh: false, isInteractive: false,
+    axisTop: null, axisRight: null, pointSize: 0,
     axisBottom: {
-      format: (value) => {
-        try {
-          return value ? formatTimeLabel(value) : '';
-        } catch (e) {
-          console.error('formatTimeLabel error:', e, value);
-          return '';
-        }
-      },
-      tickRotation: 0,
-      orient: "bottom",
-      tickValues: (() => {
-        const arr = (xTicks || []).filter(t => t != null);
-        if (!arr.length) return [];
-        const last = arr.length - 1;
-        if (last === 0) return [arr[0]];
-        const i2 = Math.floor(last / 3), i3 = Math.floor((2 * last) / 3);
-        return [arr[0], arr[i2], arr[i3], arr[last]].filter(t => t != null);
-      })(),
+      format: (v) => { try { return v ? formatTimeLabel(v) : ''; } catch { return ''; } },
+      tickRotation: 0, orient: "bottom", tickValues: lineTickValues,
       tickSize: 5, tickPadding: 5,
-      axis: { strokeWidth: 1 }, line: { strokeWidth: 1 },
     },
-    axisLeft: {
-      orient: "left",
-      tickValues: 3, tickSize: 5, tickPadding: 5, tickRotation: 0,
-      axis: { strokeWidth: 1 }, line: { strokeWidth: 1 },
-      legend: '', legendOffset: -35, legendPosition: 'middle',
-    },
-    theme: chartTheme,
-    enableGridX: false, enableGridY: false,
-    tooltip: ({ point }) => {
-      if (!point || !point.serieId || !point.data || point.data.x === undefined || point.data.y === undefined) return null;
-      return (
-        <Box sx={{ 
-          background: isDark ? colors.primary[400] : colors.primary[100], 
-          padding: '9px 12px',
-          borderRadius: '4px',
-          border: `1px solid ${point.serieColor}`,
-        }}>
-          <Typography variant="body2" sx={{ color: isDark ? "#eee" : "#111", fontWeight: 'bold' }}>
-            {getDisplayName(point.serieId)}
-          </Typography>
-          <Typography variant="body2" sx={{ color: isDark ? "#eee" : "#111" }}>
-            {formatTimeLabel(point.data.x)}: {Number(point.data.y).toFixed(2)}
-          </Typography>
-        </Box>
-      );
-    },
-  };
+    axisLeft: { orient: "left", tickValues: 3, tickSize: 5, tickPadding: 5, tickRotation: 0,
+      legend: 'pieces / min', legendOffset: -35, legendPosition: 'middle' },
+    theme: chartTheme, enableGridX: false, enableGridY: false,
+    tooltip: lineTooltip,
+  }), [lineTickValues, chartTheme, lineTooltip, formatTimeLabel]);
 
-  const throughputProps = { ...sharedLineProps, axisLeft: { ...sharedLineProps.axisLeft, legend: 'batch / min' } };
-  const giveawayProps   = { ...sharedLineProps, axisLeft: { ...sharedLineProps.axisLeft, legend: '%' }, enableArea: true, areaBaselineValue: 0, };
-  const piecesProcessedProps = { ...sharedLineProps, axisLeft: { ...sharedLineProps.axisLeft, legend: 'pieces / min' } };
-  const weightProcessedProps = { ...sharedLineProps, axisLeft: { ...sharedLineProps.axisLeft, legend: 'kg / min' } };
-  const rejectsProps    = {
-    ...sharedLineProps,
-    axisLeft: { ...sharedLineProps.axisLeft, legend: 'piece / min' },
-    enableArea: true, areaBaselineValue: 0,
-    yScale: { type: 'linear', min: 0, max: 'auto' },
-  };
+  const lineColorFn = useCallback(s => s?.color || colors.primary[700], [colors]);
 
-    const sharedPieProps = {
+  const pieTooltip = useCallback(({ datum }) => {
+    if (!datum) return null;
+    return (
+      <Box sx={{ background: isDark ? colors.primary[400] : colors.primary[100], padding: '9px 12px', borderRadius: '4px', border: `1px solid ${datum.color}` }}>
+        <Typography variant="body2" sx={{ color: isDark ? "#eee" : "#111", fontWeight: 'bold' }}>{getDisplayName(datum.id)}</Typography>
+        <Typography variant="body2" sx={{ color: isDark ? "#eee" : "#111" }}>{Number(datum.value).toFixed(1)}</Typography>
+      </Box>
+    );
+  }, [isDark, colors, getDisplayName]);
+
+  const pieColorFn = useCallback(({ id }) => colorMap[id] || colors.primary[700], [colorMap, colors]);
+
+  const sharedPieProps = useMemo(() => ({
     margin: { top: 20, right: 5, bottom: 0, left: 5 },
-    innerRadius: 0.65,
-    padAngle: 3,
-    cornerRadius: 3,
-    activeOuterRadiusOffset: 8,
-    animate: false,
-    motionConfig: 'gentle',
-    borderWidth: 1,
-    borderColor: { from: 'color', modifiers: [['darker', 0.2]] },
-    enableArcLinkLabels: false,
-    arcLabelsSkipAngle: 10,
-    arcLabelsTextColor: '#ffffff',
-    valueFormat: ">-.0f",
-    colors: ({ id }) => colorMap[id] || colors.primary[700],
+    innerRadius: 0.65, padAngle: 3, cornerRadius: 3, activeOuterRadiusOffset: 8,
+    animate: false, borderWidth: 1, borderColor: { from: 'color', modifiers: [['darker', 0.2]] },
+    enableArcLinkLabels: false, arcLabelsSkipAngle: 10, arcLabelsTextColor: '#ffffff', valueFormat: ">-.0f",
+    colors: pieColorFn,
     theme: { labels: { text: { fill: '#ffffff' } } },
-    tooltip: ({ datum }) => {
-      if (!datum || !datum.id || datum.value === undefined) return null;
-      return (
-        <Box sx={{ 
-          background: isDark ? colors.primary[400] : colors.primary[100], 
-          padding: '9px 12px',
-          borderRadius: '4px',
-          border: `1px solid ${datum.color}`,
-        }}>
-          <Typography variant="body2" sx={{ color: isDark ? "#eee" : "#111", fontWeight: 'bold' }}>
-            {getDisplayName(datum.id)}
-          </Typography>
-          <Typography variant="body2" sx={{ color: isDark ? "#eee" : "#111" }}>
-            {Number(datum.value).toFixed(1)}
-          </Typography>
-        </Box>
-      );
-    },
-  };
+    tooltip: pieTooltip,
+  }), [pieColorFn, pieTooltip]);
 
-
-
-  // 👉 Scatter: use linear time axis (prevents reshuffle)
   const HORIZON_MS = 60 * 60 * 1000;
-  const domainEnd = useMemo(
-    () => (mode === "live" ? Date.now() : (currentTime || Date.now())),
-    [mode, currentTime]
-  );
+  // Recompute domain whenever scatter data updates so the X-axis stays current
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const domainEnd = useMemo(() => Date.now(), [scatter]);
   const domainStart = domainEnd - HORIZON_MS;
-
   const fixedTicks = useMemo(() => {
     const w = domainEnd - domainStart;
-    // 4 equally spaced positions; labels will update, positions won't
-    return [
-      Math.round(domainStart),
-      Math.round(domainStart + w / 3),
-      Math.round(domainStart + (2 * w) / 3),
-      Math.round(domainEnd)
-    ];
+    return [Math.round(domainStart), Math.round(domainStart + w / 3), Math.round(domainStart + (2 * w) / 3), Math.round(domainEnd)];
   }, [domainStart, domainEnd]);
 
-  const sharedScatterProps = {
+  const scatterTooltip = useCallback(({ node }) => {
+    if (!node || !node.data) return null;
+    return (
+      <Box sx={{ background: isDark ? colors.primary[400] : colors.primary[100], padding: '9px 12px', borderRadius: '4px', border: `1px solid ${tokens(theme.palette.mode).tealAccent[500]}` }}>
+        <Typography variant="body2" sx={{ color: isDark ? "#eee" : "#111" }}>{formatTimeLabel(node.data.x)}: {Number(node.data.y).toFixed(2)}g</Typography>
+      </Box>
+    );
+  }, [isDark, colors, theme.palette.mode, formatTimeLabel]);
+
+  const scatterColorFn = useCallback(() => tokens(theme.palette.mode).tealAccent[500], [theme.palette.mode]);
+
+  const sharedScatterProps = useMemo(() => ({
     margin: { top: 10, right: 20, bottom: 20, left: 40 },
     xScale: { type: 'linear', min: domainStart, max: domainEnd },
     yScale: { type: 'linear', min: 'auto', max: 'auto' },
-    axisBottom: {
-      format: formatTimeLabel,
-      tickRotation: 0,
-      orient: "bottom",
-      tickValues: fixedTicks, // <- fixed positions
-      tickSize: 5, tickPadding: 5,
-      axis: { strokeWidth: 1 }, line: { strokeWidth: 1 },
-    },
-    axisLeft: {
-      orient: "left",
-      tickValues: 3, tickSize: 5, tickPadding: 5, tickRotation: 0,
-      axis: { strokeWidth: 1 }, line: { strokeWidth: 1 },
-      legend: 'weight (g)', legendOffset: -35, legendPosition: 'middle',
-    },
-    theme: chartTheme,
-    key: `scatter-chart-${theme.palette.mode}`,
-    colors: () => tokens(theme.palette.mode).tealAccent[500],
-    nodeSize: 3,
-    useMesh: true,
-    enableGridX: false, enableGridY: false,
-    tooltip: ({ node }) => {
-      if (!node || !node.data || node.data.x === undefined || node.data.y === undefined) return null;
-      return (
-        <Box sx={{ 
-          background: isDark ? colors.primary[400] : colors.primary[100], 
-          padding: '9px 12px',
-          borderRadius: '4px',
-          border: `1px solid ${tokens(theme.palette.mode).tealAccent[500]}`,
-        }}>
-          <Typography variant="body2" sx={{ color: isDark ? "#eee" : "#111" }}>
-            {formatTimeLabel(node.data.x)}: {Number(node.data.y).toFixed(2)}g
-          </Typography>
-        </Box>
-      );
-    },
-  };
+    axisBottom: { format: formatTimeLabel, tickRotation: 0, orient: "bottom", tickValues: fixedTicks, tickSize: 5, tickPadding: 5 },
+    axisLeft: { orient: "left", tickValues: 3, tickSize: 5, tickPadding: 5, tickRotation: 0, legend: 'weight (g)', legendOffset: -35, legendPosition: 'middle' },
+    theme: chartTheme, colors: scatterColorFn,
+    nodeSize: 3, useMesh: true, enableGridX: false, enableGridY: false,
+    tooltip: scatterTooltip,
+  }), [domainStart, domainEnd, fixedTicks, chartTheme, scatterColorFn, scatterTooltip, formatTimeLabel]);
 
-  // visibility filtering (per-recipe + total)
+  /* Filtered chart data — memoized to avoid recomputing on every render */
   const visible = dashboardVisibleSeries || {};
-  const filteredThroughput = sanitizeLineSeries([
-    ...(throughput.series || []).filter(s => visible[s.id]),
-    ...(visible["Total"] ? (throughput.total || []) : []),
-  ]);
-  const filteredGiveaway = sanitizeLineSeries([
-    ...(giveaway.series || []).filter(s => visible[s.id]),
-    ...(visible["Total"] ? (giveaway.total || []) : []),
-  ]);
-  const filteredPiecesProcessed = sanitizeLineSeries([
-    ...(piecesProcessed.series || []).filter(s => visible[s.id]),
-    ...(visible["Total"] ? (piecesProcessed.total || []) : []),
-  ]);
-  const filteredWeightProcessed = sanitizeLineSeries([
-    ...(weightProcessed.series || []).filter(s => visible[s.id]),
-    ...(visible["Total"] ? (weightProcessed.total || []) : []),
-  ]);
-  const filteredRejects = visible["Total"] ? sanitizeLineSeries(rejects) : [];
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
 
-  // pies (kept 3 charts: total, give_g, give_pct)
-  const pieBatchTotal = (pies.total || []).filter(s => visible[s.id]);
-  const pieGiveG      = (pies.give_g || []).filter(s => visible[s.id]);
-  const pieGivePct    = (pies.give_pct || []).filter(s => visible[s.id]);
+  const filteredPiecesProcessed = useMemo(
+    () => sanitizeLineSeries([...(piecesProcessed?.series || []).filter(s => visibleRef.current[s.id]), ...(visibleRef.current["Total"] ? (piecesProcessed?.total || []) : [])]),
+    [piecesProcessed, dashboardVisibleSeries]
+  );
 
-  const batchTotalSum = Math.round(pieBatchTotal.reduce((s, d) => s + (Number(d.value) || 0), 0));
-  const giveawayGramSum = Number(pieGiveG.reduce((s, d) => s + (Number(d.value) || 0), 0).toFixed(1));
-  const giveawayPercentAvg = pieGivePct.length
-    ? Number((pieGivePct.reduce((s, d) => s + (Number(d.value) || 0), 0) / pieGivePct.length).toFixed(1))
-    : 0;
+  const pieBatchTotal = useMemo(() => (pies?.total || []).filter(s => visibleRef.current[s.id]), [pies, dashboardVisibleSeries]);
+  const pieGivePct = useMemo(() => (pies?.give_pct || []).filter(s => visibleRef.current[s.id]), [pies, dashboardVisibleSeries]);
+  const batchTotalSum = useMemo(() => Math.round(pieBatchTotal.reduce((s, d) => s + (Number(d.value) || 0), 0)), [pieBatchTotal]);
+  const giveawayPercentAvg = useMemo(
+    () => pieGivePct.length ? Number((pieGivePct.reduce((s, d) => s + (Number(d.value) || 0), 0) / pieGivePct.length).toFixed(1)) : 0,
+    [pieGivePct]
+  );
 
-  const toggleSeries = (name) => {
-    const newVisible = !(dashboardVisibleSeries?.[name] ?? true);
-    setDashboardVisibleSeries(prev => ({ ...(prev || {}), [name]: newVisible }));
-    log.legendToggled(name, newVisible);
-  };
+  const chartBoxSx = useMemo(() => ({ backgroundColor: colors.primary[100], borderRadius: 1.5, overflow: "hidden" }), [colors]);
 
-  // Show server offline screen if there's a connection error
   if (mode === null && configError && configError !== 'waiting') {
     return <ServerOffline title="Dashboard" />;
   }
 
-  // Show waiting screen if no configuration is set (but server is reachable)
   if (mode === null) {
     return (
       <Box m="20px" display="flex" alignItems="center" justifyContent="center" height="calc(100vh - 200px)">
         <Box textAlign="center">
-          <Header title="Dashboard" subtitle="Waiting for configuration..." />
-          <Typography variant="h4" color={colors.grey[300]} mt={4}>
-            Loading configuration...
-          </Typography>
-          <Typography variant="body2" color={colors.grey[500]} mt={4}>
-            Checking for configuration every 2 seconds...
-          </Typography>
+          <Typography variant="h2" color={colors.primary[800]} fontWeight="bold">Dashboard</Typography>
+          <Typography variant="h5" color={colors.tealAccent[400]}>Waiting for configuration...</Typography>
+          <Typography variant="h4" color={colors.grey[300]} mt={4}>Loading configuration...</Typography>
         </Box>
       </Box>
     );
   }
 
+  const { w: cW, h: cH, scale } = containerDims;
+
   return (
-    <Box m="20px" height="calc(100vh - 200px)" maxHeight="calc(100vh - 200px)"
-      sx={{ overflow: "visible", display: "flex", flexDirection: "column" }}>
-      <Box display="flex" justifyContent="space-between" alignItems="center" mb="20px" sx={{ m: "0px 0 0 0" }}>
-        <Box display="flex" justifyContent="space-between" alignItems="center">
-          <Header title="Dashboard" subtitle="Performance Overview" />
-        </Box>
+    <Box m="20px" sx={{ height: 'calc(100vh - 180px)', display: 'flex', flexDirection: 'column' }}>
+      <Header title="Dashboard" subtitle="Performance Overview" />
 
-        {/* Time Slider (Replay mode only) */}
-        {mode === "replay" && datasetStart && datasetEnd && currentTime && (
-          <Box display="flex" alignItems="center" gap="12px" px="20px">
-            <Box flex="0 0 300px" display="flex" flexDirection="column" gap="2px">
-              <Typography variant="body2" color={colors.primary[700]} fontSize="10px">
-                {new Date(currentTime).toLocaleString('en-US', { 
-                  month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
-                })}
-              </Typography>
-              <Slider
-                value={sliderValue}
-                min={datasetStart.getTime()}
-                max={datasetEnd.getTime()}
-                onChange={handleSliderChange}
-                sx={{
-                  color: colors.tealAccent[500],
-                  '& .MuiSlider-thumb': {
-                    width: 14,
-                    height: 14,
-                  },
-                  '& .MuiSlider-track': {
-                    height: 3,
-                  },
-                  '& .MuiSlider-rail': {
-                    height: 3,
-                    opacity: 0.3,
-                  },
-                }}
-              />
-            </Box>
-          </Box>
-        )}
-      </Box>
+      <Box ref={containerRef} sx={{ flex: 1, minHeight: 0, position: 'relative', overflow: 'hidden' }}>
+        <Box sx={{
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          width: cW > 0 ? `${cW / scale}px` : '100%',
+          height: cH > 0 ? `${cH / scale}px` : '100%',
+          transform: `scale(${scale})`,
+          transformOrigin: 'top left',
+          display: 'flex',
+          flexDirection: 'column',
+        }}>
 
-      <Box
-        key={chartKey}
-        display="grid"
-        gridTemplateColumns="repeat(12, 1fr)"
-        gridTemplateRows="repeat(12, 1fr)"
-        gap="20px"
-        sx={{ flex: 1, minHeight: 0, overflow: "hidden" }}
-      >
-        {/* Machine Controls (Left of machine image) */}
-        <Box gridColumn="1 / span 2" gridRow="1 / span 4"
-          sx={{ backgroundColor: colors.primary[100], borderRadius: 1.5, overflow: "hidden", p: 1.5 }}>
-          <MachineControls 
-            layout="vertical" 
-            activeRecipesCount={activeRecipes?.length || 0}
-            showTitle={false}
-            styles={{
-              titleVariant: 'h5',
-              buttonHeight: '28px',
-              buttonFontSize: '0.80rem',
-              buttonGap: 1,
-              recipesTextVariant: 'caption',
-              stateBadge: {
-                px: 1.5,
-                py: 0.4,
-                borderRadius: 1.5,
-                fontSize: '0.65rem',
-              },
-            }}
-          />
-        </Box>
-
-        {/* Machine Image with overlays */}
-        <Box gridColumn="3 / span 8" gridRow="1 / span 4"
-          sx={{ backgroundColor: colors.primary[100], borderRadius: 1.5, overflow: "hidden", position: 'relative' }}>
-          <AnnotatedMachineImage
+          {/* Top section: Gate annotations (left) + Controls (right) — always full height */}
+          <Box sx={{ flexShrink: 0, display: 'flex', gap: 2, mb: 3 }}>
+          <GateAnnotationsGrid
             colorMap={colorMap}
             assignmentsByGate={assignmentsByGate}
             overlayByGate={overlayByGate}
-            transitioningGates={transitioningGates}
-            gateToNewRecipe={gateToNewRecipe}
-            getDisplayName={getDisplayName}
+            transitioningGates={stableTransitioningGates}
+            hasBuffer={hasBuffer}
           />
-        </Box>
-
-        {/* Row 2: Give-away, Rejects, and Piece Weight Distribution */}
-        <Box gridColumn="1 / span 10" gridRow="5 / span 4" display="grid" gridTemplateColumns="repeat(3, 1fr)" gap="20px">
-          {/* Give-away */}
-          <Box sx={{ backgroundColor: colors.primary[100], borderRadius: 1.5, overflow: "hidden" }} p="15px">
-            <Typography variant="h5" color={tokens(theme.palette.mode).tealAccent[500]}>Give-away</Typography>
-            {filteredGiveaway.length > 0 ? (
-              <ResponsiveLine
-                data={filteredGiveaway}
-                colors={serie => serie?.color || colors.primary[700]}
-                {...giveawayProps}
-              />
-            ) : (
-              <Box display="flex" alignItems="center" justifyContent="center" height="calc(100% - 30px)">
-                <Typography variant="body2" color={colors.grey[500]}>No data</Typography>
-              </Box>
-            )}
-          </Box>
-
-          {/* Rejects KPIs */}
-          <Box sx={{ backgroundColor: colors.primary[100], borderRadius: 1.5, overflow: "hidden", display: 'flex', flexDirection: 'column' }} p="15px">
-            <Typography variant="h5" color={tokens(theme.palette.mode).tealAccent[500]} mb="10px">Rejects</Typography>
-            <Box display="flex" flexDirection="row" gap="20px" flex="1" justifyContent="space-around" alignItems="center">
-              {/* Total Rejects Count */}
-              <Box 
-                sx={{ 
-                  flex: 1,
-                  display: 'flex',
-                  flexDirection: 'column',
-                  justifyContent: 'center',
-                  alignItems: 'center'
+          <Box sx={{ ml: 'auto' }}>
+            <Paper elevation={0} sx={{
+              width: '175px',
+              p: 1.5,
+              backgroundColor: isDark ? 'rgba(30,30,30,0.85)' : 'rgba(255,255,255,0.88)',
+              backdropFilter: 'blur(8px)',
+              border: `1px solid ${colors.grey[300]}`,
+              borderRadius: 2,
+            }}>
+              <MachineControls
+                layout="vertical"
+                activeRecipesCount={activeRecipes?.length || 0}
+                showTitle={false}
+                contentOrder="reversed"
+                machineStateOverride={machineHook}
+                styles={{
+                  titleVariant: 'h5',
+                  buttonHeight: '30px',
+                  buttonFontSize: '0.8rem',
+                  buttonGap: 0.8,
+                  recipesTextVariant: 'caption',
+                  stateBadge: { px: 1.5, py: 0.3, borderRadius: 1.5, fontSize: '0.65rem' },
                 }}
-              >
-                <Typography variant="h7" color={colors.primary[900]} mb="8px">
-                  TOTAL COUNT
-                </Typography>
-                <Typography variant="h2" color={colors.tealAccent[500]} fontWeight="bold" sx={{ lineHeight: 1 }}>
-                  {(() => {
-                    const latestData = rejects?.[0]?.data?.[rejects[0].data.length - 1];
-                    return latestData?.total_rejects_count?.toLocaleString() || '0';
-                  })()}
-                </Typography>
-                <Typography variant="body2" color={colors.primary[900]} mt="8px">
-                  pieces
-                </Typography>
-              </Box>
-
-              {/* Total Rejects Weight */}
-              <Box 
-                sx={{ 
-                  flex: 1,
-                  display: 'flex',
-                  flexDirection: 'column',
-                  justifyContent: 'center',
-                  alignItems: 'center'
-                }}
-              >
-                <Typography variant="h7" color={colors.primary[900]}  mb="8px">
-                  TOTAL WEIGHT
-                </Typography>
-                <Typography variant="h2" color={colors.tealAccent[500]} fontWeight="bold" sx={{ lineHeight: 1 }}>
-                  {(() => {
-                    const latestData = rejects?.[0]?.data?.[rejects[0].data.length - 1];
-                    const weightKg = (latestData?.total_rejects_weight_g || 0) / 1000;
-                    return weightKg.toLocaleString(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 });
-                  })()}
-                </Typography>
-                <Typography variant="body2" color={colors.primary[900]} mt="8px">
-                  kg
-                </Typography>
-              </Box>
-            </Box>
-          </Box>
-
-          {/* Piece Weight Distribution (Scatter) */}
-          <Box sx={{ backgroundColor: colors.primary[100], borderRadius: 1.5, overflow: "hidden" }} p="15px">
-            <Typography variant="h5" color={tokens(theme.palette.mode).tealAccent[500]}>Piece Weight Distribution</Typography>
-            <Box sx={{ height: "calc(100% - 30px)", position: "relative" }}>
-              {scatter && scatter.length > 0 && scatter[0]?.data?.length > 0 ? (
-                <ResponsiveScatterPlot
-                  data={scatter}
-                  {...sharedScatterProps}
-                  nodeComponent={ScatterNode}
-                  animate={false}
-                />
-              ) : (
-                <Box display="flex" alignItems="center" justifyContent="center" height="100%">
-                  <Typography variant="body2" color={colors.grey[500]}>
-                    No data available
-                  </Typography>
-                </Box>
-              )}
-            </Box>
+              />
+            </Paper>
           </Box>
         </Box>
 
-        {/* Line charts */}
-        <Box gridColumn="1 / span 10" gridRow="9 / span 4" display="grid" gridTemplateColumns="repeat(3, 1fr)" gap="20px">
-          <Box sx={{ backgroundColor: colors.primary[100], borderRadius: 1.5, overflow: "hidden" }} p="15px">
-            <Typography variant="h5" color={tokens(theme.palette.mode).tealAccent[500]}>Batches Processed</Typography>
-            {filteredThroughput.length > 0 ? (
-              <ResponsiveLine
-                data={filteredThroughput}
-                colors={serie => serie?.color || colors.primary[700]}
-                {...throughputProps}
-              />
-            ) : (
-              <Box display="flex" alignItems="center" justifyContent="center" height="calc(100% - 30px)">
-                <Typography variant="body2" color={colors.grey[500]}>No data</Typography>
-              </Box>
-            )}
+        {/* Bottom section: Table + Charts — fills remaining height */}
+        <Box sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+          {/* Active Orders table (takes natural height, pushes charts down) */}
+          <Box sx={{ mb: 2, flexShrink: 0 }}>
+            <ActiveOrdersTable
+              activeRecipes={activeRecipes}
+              colorMap={colorMap}
+              pausedGates={stablePausedGates}
+              machineState={machineState}
+            />
           </Box>
-          <Box sx={{ backgroundColor: colors.primary[100], borderRadius: 1.5, overflow: "hidden" }} p="15px">
-            <Typography variant="h5" color={tokens(theme.palette.mode).tealAccent[500]}>Pieces Processed</Typography>
-            {filteredPiecesProcessed.length > 0 ? (
-              <ResponsiveLine
-                data={filteredPiecesProcessed}
-                colors={serie => serie?.color || colors.primary[700]}
-                {...piecesProcessedProps}
-              />
-            ) : (
-              <Box display="flex" alignItems="center" justifyContent="center" height="calc(100% - 30px)">
-                <Typography variant="body2" color={colors.grey[500]}>No data</Typography>
-              </Box>
-            )}
-          </Box>
-          <Box sx={{ backgroundColor: colors.primary[100], borderRadius: 1.5, overflow: "hidden" }} p="15px">
-            <Typography variant="h5" color={tokens(theme.palette.mode).tealAccent[500]}>Weight Processed</Typography>
-            {filteredWeightProcessed.length > 0 ? (
-              <ResponsiveLine
-                data={filteredWeightProcessed}
-                colors={serie => serie?.color || colors.primary[700]}
-                {...weightProcessedProps}
-              />
-            ) : (
-              <Box display="flex" alignItems="center" justifyContent="center" height="calc(100% - 30px)">
-                <Typography variant="body2" color={colors.grey[500]}>No data</Typography>
-              </Box>
-            )}
+
+          {/* KPI charts — fills remaining space, shrinks when table grows */}
+          <Box sx={{ flex: 1, minHeight: 0, display: 'flex', gap: '12px', overflow: 'hidden' }}>
+            <MemoRejectsBox rejects={rejects} chartBoxSx={chartBoxSx} colors={colors} />
+            <MemoScatterChart scatter={scatter} scatterProps={sharedScatterProps} chartBoxSx={chartBoxSx} colors={colors} />
+            <MemoLineChart data={filteredPiecesProcessed} lineProps={piecesProcessedProps} lineColorFn={lineColorFn} chartBoxSx={chartBoxSx} colors={colors} />
+            <MemoPieChart data={pieBatchTotal} pieProps={sharedPieProps} title="Batch Total" label="Sum" value={batchTotalSum} chartBoxSx={chartBoxSx} colors={colors} />
+            <MemoPieChart data={pieGivePct} pieProps={sharedPieProps} title="Give-away (%)" label="Avg" value={giveawayPercentAvg} chartBoxSx={chartBoxSx} colors={colors} />
           </Box>
         </Box>
-
-        {/* Right column: Legend + Pies (4 rows) */}
-        <Box gridColumn="11 / span 2" gridRow="1 / span 12" display="grid" gridTemplateRows="auto 1fr 1fr 1fr" gap="10px">
-          {/* Legend row */}
-          <Box sx={{ backgroundColor: colors.primary[100], borderRadius: 1.5, overflow: "hidden", display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "flex-start", gap: "8px" }} p="10px">
-            {legendKeys.map((name) => {
-              const isTransitioning = transitioningRecipeNames.has(name);
-              return (
-                <Box
-                  key={name}
-                  display="flex" alignItems="center" gap="6px"
-                  onClick={() => toggleSeries(name)}
-                  sx={{
-                    cursor: 'pointer',
-                    opacity: (dashboardVisibleSeries?.[name] ?? true) ? 1 : 0.4,
-                    transition: 'all 0.2s',
-                    '&:hover': { transform: 'scale(1.05)' },
-                    border: (dashboardVisibleSeries?.[name] ?? true) ? 'none' : `1px solid ${colors.grey[300]}`,
-                    borderRadius: '4px',
-                    padding: '4px 8px',
-                    // Pulsing animation for transitioning recipes (uses synced timing)
-                    ...(isTransitioning && getSyncedAnimationStyle()),
-                  }}
-                >
-                  <Box width="10px" height="10px" borderRadius="50%" sx={{ backgroundColor: colorMap[name] || colors.primary[700] }} />
-                  <Typography variant="body2" fontSize="11px" color={colors.primary[800]}>{getDisplayName(name)}</Typography>
-                </Box>
-              );
-            })}
-          </Box>
-
-          {/* Batch total */}
-          <Box sx={{ backgroundColor: colors.primary[100], borderRadius: 1.5, overflow: "hidden", display: "flex", flexDirection: "column" }} p="15px">
-            <Typography variant="h5" color={tokens(theme.palette.mode).tealAccent[500]}>Batch total</Typography>
-            <Typography variant="h6" color={colors.primary[800]} sx={{ mb: "-10px" }}>Sum : {batchTotalSum}</Typography>
-            <Box sx={{ height: "calc(100%)", position: "relative", overflow: "hidden" }}>
-              {pieBatchTotal.length > 0 ? (
-                <ResponsivePie data={pieBatchTotal} {...sharedPieProps} />
-              ) : (
-                <Box display="flex" alignItems="center" justifyContent="center" height="100%">
-                  <Typography variant="body2" color={colors.grey[500]}>No data</Typography>
-                </Box>
-              )}
-            </Box>
-          </Box>
-
-          {/* Give-away (g/batch) */}
-          <Box sx={{ backgroundColor: colors.primary[100], borderRadius: 1.5, overflow: "hidden", display: "flex", flexDirection: "column" }} p="15px">
-            <Typography variant="h5" color={tokens(theme.palette.mode).tealAccent[500]}>Give-away (g/batch)</Typography>
-            <Typography variant="h6" color={colors.primary[800]} sx={{ mb: "-10px" }}>Sum : {giveawayGramSum}</Typography>
-            <Box sx={{ height: "calc(100%)", position: "relative", overflow: "hidden" }}>
-              {pieGiveG.length > 0 ? (
-                <ResponsivePie data={pieGiveG} {...sharedPieProps} />
-              ) : (
-                <Box display="flex" alignItems="center" justifyContent="center" height="100%">
-                  <Typography variant="body2" color={colors.grey[500]}>No data</Typography>
-                </Box>
-              )}
-            </Box>
-          </Box>
-
-          {/* Give-away (%) */}
-          <Box sx={{ backgroundColor: colors.primary[100], borderRadius: 1.5, overflow: "hidden", display: "flex", flexDirection: "column" }} p="15px">
-            <Typography variant="h5" color={tokens(theme.palette.mode).tealAccent[500]}>Give-away (%)</Typography>
-            <Typography variant="h6" color={colors.primary[800]} sx={{ mb: "-10px" }}>Avg : {giveawayPercentAvg}</Typography>
-            <Box sx={{ height: "calc(100%)", position: "relative", overflow: "hidden" }}>
-              {pieGivePct.length > 0 ? (
-                <ResponsivePie data={pieGivePct} {...sharedPieProps} />
-              ) : (
-                <Box display="flex" alignItems="center" justifyContent="center" height="100%">
-                  <Typography variant="body2" color={colors.grey[500]}>No data</Typography>
-                </Box>
-              )}
-            </Box>
-          </Box>
         </Box>
       </Box>
     </Box>

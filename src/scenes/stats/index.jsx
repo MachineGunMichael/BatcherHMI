@@ -22,6 +22,8 @@ import Header from "../../components/Header";
 import ServerOffline from "../../components/ServerOffline";
 import useMachineState from "../../hooks/useMachineState";
 import log from "../../services/logService";
+import PiecesTable from "./PiecesTable";
+import BatchesTable from "./BatchesTable";
 
 const API_BASE = process.env.REACT_APP_API_BASE || "http://localhost:5001";
 
@@ -69,12 +71,18 @@ const Stats = () => {
   const [assignments, setAssignments] = useState([]);
   const [pieceDistribution, setPieceDistribution] = useState(null);
   const [gateDwellData, setGateDwellData] = useState(null);
+  const [ackTimesData, setAckTimesData] = useState(null);
+  const [blockedTimesData, setBlockedTimesData] = useState(null);
   const [historyData, setHistoryData] = useState(null);
   const [pieceWeights, setPieceWeights] = useState([]);
   const [loading, setLoading] = useState(true);
   const [visibleRecipes, setVisibleRecipes] = useState({});
   const [allRecipes, setAllRecipes] = useState([]);
   
+  const [visibleMetrics, setVisibleMetrics] = useState({
+    Completion: true, Response: true, Blocked: true,
+  });
+
   // Separate visibility state for sunburst charts
   const [visiblePiecesCategories, setVisiblePiecesCategories] = useState({
     batched: true,
@@ -239,19 +247,21 @@ const Stats = () => {
   const fetchOrderDetails = useCallback(async (entry) => {
     if (!entry) return;
     const rid = entry.recipe_id;
-    const pid = entry.program_id;
+    const pid = entry.program_ids || entry.program_id;
     const orderParam = entry.order_id ? `?order_id=${entry.order_id}` : '';
     const base = `${API_BASE}/api/stats/orders/${rid}/program/${pid}`;
     const headers = getAuthHeaders();
 
     try {
-      const [statsRes, assignRes, histRes, histogramRes, dwellRes, piecesRes] = await Promise.all([
+      const [statsRes, assignRes, histRes, histogramRes, dwellRes, piecesRes, ackRes, blockedRes] = await Promise.all([
         fetch(`${base}${orderParam}`, { headers }),
         fetch(`${base}/assignments${orderParam}`, { headers }),
         fetch(`${base}/history${orderParam}`, { headers }),
         fetch(`${base}/pieces-histogram${orderParam}`, { headers }),
         fetch(`${base}/gate-dwell${orderParam}`, { headers }),
         fetch(`${base}/pieces${orderParam}`, { headers }),
+        fetch(`${base}/ack-times${orderParam}`, { headers }).catch(() => null),
+        fetch(`${base}/blocked-times${orderParam}`, { headers }).catch(() => null),
       ]);
 
       let statsData = null;
@@ -273,6 +283,10 @@ const Stats = () => {
       else setGateDwellData(null);
       if (piecesRes.ok) setPieceWeights(await piecesRes.json());
       else setPieceWeights({ scatterPoints: [], trendLine: [] });
+      if (ackRes && ackRes.ok) setAckTimesData(await ackRes.json());
+      else setAckTimesData(null);
+      if (blockedRes && blockedRes.ok) setBlockedTimesData(await blockedRes.json());
+      else setBlockedTimesData(null);
 
       if (statsData) {
         const batchedW = statsData.total_batched_weight_g || 0;
@@ -308,6 +322,8 @@ const Stats = () => {
     setAssignments([]);
     setPieceDistribution(null);
     setGateDwellData(null);
+    setAckTimesData(null);
+    setBlockedTimesData(null);
     setHistoryData(null);
     setPieceWeights({ scatterPoints: [], trendLine: [] });
     setVisibleRecipes({});
@@ -356,7 +372,7 @@ const Stats = () => {
     const end = formatTime(entry.last_batch);
     const batches = entry.total_batches != null ? `${entry.total_batches}` : '0';
     return (
-      <li {...props} key={`${entry.program_id}-${entry.recipe_id}-${entry.order_id || 0}`}>
+      <li {...props} key={`${entry.program_ids || entry.program_id}-${entry.recipe_id}-${entry.order_id || 0}`}>
         <Box sx={{ display: 'flex', width: '100%', fontSize: '0.85rem', gap: 0, alignItems: 'center' }}>
           <Box sx={{ minWidth: 280, flexShrink: 0 }}>{name}</Box>
           <Box sx={{ minWidth: 100, flexShrink: 0, textAlign: 'center', color: 'text.secondary' }}>{start}</Box>
@@ -457,19 +473,20 @@ const Stats = () => {
       : `recipe_${recipe.recipe_name}_${recipe.gates_assigned || 'unknown'}`;
   };
 
-  // Load program details when selection changes (also fires on mount with restored localStorage)
+  // Load program details when selection changes (also fires on mount with restored localStorage).
+  // Gate by activeTab to prevent both Program and Order fetches racing on remount.
   useEffect(() => {
-    if (selectedProgramId) {
+    if (activeTab === 1 && selectedProgramId) {
       fetchProgramDetails(selectedProgramId);
     }
-  }, [selectedProgramId]);
+  }, [selectedProgramId, activeTab]);
 
-  // Load order details when selection changes (also fires on mount with restored localStorage)
+  // Load order details when selection changes (also fires on mount with restored localStorage).
   useEffect(() => {
-    if (selectedOrderEntry) {
+    if (activeTab === 0 && selectedOrderEntry) {
       fetchOrderDetails(selectedOrderEntry);
     }
-  }, [selectedOrderEntry]);
+  }, [selectedOrderEntry, activeTab]);
 
   const getAuthHeaders = () => {
     const token = localStorage.getItem('token');
@@ -543,22 +560,27 @@ const Stats = () => {
         setPieceDistribution(null);
       }
 
-      // Fetch gate dwell times for this program
+      // Fetch gate dwell times and acknowledgment KPIs for this program
       try {
-        const dwellResponse = await fetch(`${API_BASE}/api/stats/programs/${programId}/gate-dwell`, {
-          headers: getAuthHeaders()
-        });
+        const [dwellResponse, ackResponse, blockedResponse] = await Promise.all([
+          fetch(`${API_BASE}/api/stats/programs/${programId}/gate-dwell`, { headers: getAuthHeaders() }),
+          fetch(`${API_BASE}/api/stats/programs/${programId}/ack-times`, { headers: getAuthHeaders() }).catch(() => null),
+          fetch(`${API_BASE}/api/stats/programs/${programId}/blocked-times`, { headers: getAuthHeaders() }).catch(() => null),
+        ]);
         if (dwellResponse.ok) {
-          const dwellData = await dwellResponse.json();
-          console.log("Fetched gate dwell data:", dwellData);
-          setGateDwellData(dwellData);
+          setGateDwellData(await dwellResponse.json());
         } else {
-          console.error("Failed to fetch gate dwell:", dwellResponse.status, dwellResponse.statusText);
           setGateDwellData(null);
         }
+        if (ackResponse && ackResponse.ok) setAckTimesData(await ackResponse.json());
+        else setAckTimesData(null);
+        if (blockedResponse && blockedResponse.ok) setBlockedTimesData(await blockedResponse.json());
+        else setBlockedTimesData(null);
       } catch (dwellError) {
-        console.error("Error fetching gate dwell data:", dwellError);
+        console.error("Error fetching gate dwell/ack/blocked data:", dwellError);
         setGateDwellData(null);
+        setAckTimesData(null);
+        setBlockedTimesData(null);
       }
 
       // Fetch per-minute history data for this program
@@ -694,8 +716,8 @@ const Stats = () => {
     return <Box m="20px"><Typography>Loading...</Typography></Box>;
   }
 
-  // Determine if we have a valid selection for displaying content
-  const hasActiveSelection = activeTab === 0 ? !!selectedOrderEntry : !!selectedProgramId;
+  // Determine if we have a valid selection for displaying content (only for Order/Program views)
+  const hasActiveSelection = activeTab === 0 ? !!selectedOrderEntry : activeTab === 1 ? !!selectedProgramId : false;
 
   return (
     <Box m="20px">
@@ -705,12 +727,12 @@ const Stats = () => {
         mt="48px" 
         display="flex" 
         flexDirection="column" 
-        gap={8}
+        gap={activeTab >= 2 ? 0 : 8}
         sx={{
-          overflowY: "auto",
-          maxHeight: "calc(100vh - 200px)",
-          pr: 2,
-          pb: 4
+          ...(activeTab >= 2
+            ? { overflow: "hidden", height: "calc(100vh - 160px)" }
+            : { overflowY: "auto", maxHeight: "calc(100vh - 200px)", pr: 2, pb: 4 }
+          ),
         }}
       >
         
@@ -719,15 +741,17 @@ const Stats = () => {
           <Tabs
             value={activeTab}
             onChange={handleTabChange}
+            variant="fullWidth"
             sx={{
-              mb: 3,
-              ml: -1,
+              mb: 2.5,
               '& .MuiTab-root': {
                 fontWeight: 'bold',
                 fontSize: '14px',
                 textTransform: 'none',
-                minWidth: 140,
                 color: colors.grey[500],
+                alignItems: 'flex-start',
+                justifyContent: 'flex-start',
+                pl: 1,
               },
               '& .Mui-selected': {
                 color: `${colors.tealAccent[500]} !important`,
@@ -741,6 +765,8 @@ const Stats = () => {
           >
             <Tab label="Order View" />
             <Tab label="Program View" />
+            <Tab label="Pieces" />
+            <Tab label="Batches" />
           </Tabs>
 
           {/* Order View Selection */}
@@ -805,7 +831,7 @@ const Stats = () => {
                     }
                   }}
                   isOptionEqualToValue={(a, b) =>
-                    a.order_id === b.order_id && a.recipe_id === b.recipe_id && a.program_id === b.program_id
+                    a.order_id === b.order_id && a.recipe_id === b.recipe_id && (a.program_ids || a.program_id) === (b.program_ids || b.program_id)
                   }
                   renderInput={(params) => (
                     <TextField {...params} label="Select Order / Recipe" color="secondary" size="small" />
@@ -2272,125 +2298,183 @@ const Stats = () => {
                 Gate Stats
               </Typography>
               
-              <Box
-                display="grid"
-                gridTemplateColumns="1fr 2fr"
-                gap={5}
-                sx={{
-                  width: "100%",
-                  minWidth: 0,
-                }}
-              >
-                {/* Bar Chart - Batches per Gate */}
-                <Box sx={{ width: "100%", minWidth: 0 }}>
-                  <Typography variant="h5" color={colors.tealAccent[500]} mb={1}>
-                    Batches per Gate
-                  </Typography>
-                  <Box height="400px" width="100%">
-                    <ResponsiveBar
-                      data={batchesPerGate}
-                      keys={['batches']}
-                      indexBy="gate"
-                      colors={({ data }) => data.recipeColor}
-                      valueFormat={value => value.toLocaleString()}
-                      theme={chartTheme}
-                      padding={0.3}
-                      margin={{ top: 20, right: 20, bottom: 60, left: 60 }}
-                      valueScale={{ type: 'linear' }}
-                      indexScale={{ type: 'band', round: true }}
-                      borderColor={{ from: 'color', modifiers: [['darker', 1.6]] }}
-                      axisTop={null}
-                      axisRight={null}
-                      axisBottom={{
-                        tickSize: 5,
-                        tickPadding: 5,
-                        tickRotation: 0,
-                        legend: 'Gate',
-                        legendPosition: 'middle',
-                        legendOffset: 45,
-                      }}
-                      axisLeft={{
-                        tickSize: 5,
-                        tickPadding: 5,
-                        tickRotation: 0,
-                        legend: 'Batches',
-                        legendPosition: 'middle',
-                        legendOffset: -50,
-                      }}
-                      labelSkipWidth={12}
-                      labelSkipHeight={12}
-                      enableGridY={false}
-                      labelTextColor="#ffffff"
-                    />
-                  </Box>
-                </Box>
+              {(() => {
+                const filteredAck = (ackTimesData || []).filter(({ recipe_name }) =>
+                  visibleRecipes[recipe_name] !== false
+                );
+                const filteredBlocked = (blockedTimesData || []).filter(({ recipe_name }) =>
+                  visibleRecipes[recipe_name] !== false
+                );
 
-                {/* BoxPlot Chart - Dwell Time Distribution */}
-                <Box sx={{ width: "100%", minWidth: 0 }}>
-                  <Typography variant="h5" color={colors.tealAccent[500]} mb={1}>
-                    Batch Completion Time
-                  </Typography>
-                  <Box height="400px" width="100%">
-                    <ResponsiveBoxPlot
-                      data={boxPlotData}
-                      margin={{ top: 20, right: 20, bottom: 60, left: 80 }}
-                      minValue={0}
-                      maxValue="auto"
-                      padding={0.7}
-                      innerPadding={0}
-                      enableGridX={false}
-                      enableGridY={true}
-                      axisTop={null}
-                      axisRight={null}
-                      axisBottom={{
-                        tickSize: 5,
-                        tickPadding: 5,
-                        tickRotation: 0,
-                        legend: 'Gate',
-                        legendPosition: 'middle',
-                        legendOffset: 45
-                      }}
-                      axisLeft={{
-                        tickSize: 5,
-                        tickPadding: 5,
-                        tickRotation: 0,
-                        legend: 'Time (seconds)',
-                        legendPosition: 'middle',
-                        legendOffset: -65,
-                        format: value => `${value}s`
-                      }}
-                      colors={(boxData) => {
-                        // Get recipe name from gate number
-                        const groupName = boxData.id || boxData.group;
-                        const recipeName = gateToRecipe[groupName];
-                        return recipeColorMap[recipeName] || colors.grey[500];
-                      }}
-                      borderRadius={2}
-                      borderWidth={2}
-                      borderColor={{
-                        from: 'color',
-                        modifiers: [['darker', 0.3]]
-                      }}
-                      medianWidth={3}
-                      medianColor={{
-                        from: 'color',
-                        modifiers: [['darker', 1]]
-                      }}
-                      whiskerEndSize={0.4}
-                      whiskerColor={{
-                        from: 'color',
-                        modifiers: [['darker', 0.3]]
-                      }}
-                      motionConfig="gentle"
-                      theme={chartTheme}
-                      enableLabel={false}
-                    />
+                const combinedBoxData = [
+                  ...boxPlotData.map(d => ({ ...d, subGroup: 'Completion' })),
+                  ...filteredAck.flatMap(({ gate, times }) =>
+                    times.map(value => ({ group: gate.toString(), subGroup: 'Response', value }))
+                  ),
+                  ...filteredBlocked.flatMap(({ gate, times }) =>
+                    times.map(value => ({ group: gate.toString(), subGroup: 'Blocked', value }))
+                  ),
+                ];
+
+                const subGroupColorModifier = {
+                  Completion: 'ff',
+                  Response: '88',
+                  Blocked: '44',
+                };
+
+                const metricLegend = [
+                  { key: 'Completion', label: 'Batch Completion Time', opacity: 'ff' },
+                  { key: 'Response', label: 'Operator Response Time', opacity: '88' },
+                  { key: 'Blocked', label: 'Gate Blocked Time', opacity: '44' },
+                ];
+
+                const visibleBoxData = combinedBoxData.filter(d => visibleMetrics[d.subGroup] !== false);
+                const activeSubGroups = metricLegend.filter(m => visibleMetrics[m.key] !== false).map(m => m.key);
+
+                return (
+                  <Box
+                    display="grid"
+                    gridTemplateColumns="2fr 1fr"
+                    gap={5}
+                    sx={{ width: "100%", minWidth: 0 }}
+                  >
+                    {/* Combined BoxPlot */}
+                    <Box sx={{ width: "100%", minWidth: 0 }}>
+                      <Typography variant="h5" color={colors.tealAccent[500]} mb={1}>
+                        Gate Time Distribution
+                      </Typography>
+                      <Box display="flex" gap={3} mb={1} ml={1}>
+                        {metricLegend.map(({ key, label, opacity }) => (
+                          <Box key={key} display="flex" alignItems="center" gap="6px"
+                            onClick={() => setVisibleMetrics(prev => ({ ...prev, [key]: !prev[key] }))}
+                            sx={{
+                              cursor: 'pointer',
+                              opacity: visibleMetrics[key] !== false ? 1 : 0.4,
+                              transition: 'all 0.2s',
+                              '&:hover': { transform: 'scale(1.05)' },
+                              border: visibleMetrics[key] !== false ? 'none' : `1px solid ${colors.grey[300]}`,
+                              borderRadius: '4px',
+                              padding: '4px 8px',
+                            }}
+                          >
+                            <Box sx={{
+                              width: 14, height: 14, borderRadius: '3px', flexShrink: 0,
+                              backgroundColor: `${colors.tealAccent[500]}${opacity}`,
+                              border: `1px solid ${colors.tealAccent[500]}`,
+                            }} />
+                            <Typography variant="caption" color={colors.primary[800]}>{label}</Typography>
+                          </Box>
+                        ))}
+                      </Box>
+                      <Box height="400px" width="100%">
+                        {visibleBoxData.length > 0 ? (
+                          <ResponsiveBoxPlot
+                            data={visibleBoxData}
+                            subGroupBy="subGroup"
+                            groups={[...new Set(combinedBoxData.map(d => d.group))].sort((a, b) => Number(a) - Number(b))}
+                            subGroups={activeSubGroups}
+                            margin={{ top: 10, right: 20, bottom: 60, left: 80 }}
+                            minValue={0}
+                            maxValue="auto"
+                            padding={0.3}
+                            innerPadding={4}
+                            enableGridX={false}
+                            enableGridY={true}
+                            axisTop={null}
+                            axisRight={null}
+                            axisBottom={{
+                              tickSize: 5, tickPadding: 5, tickRotation: 0,
+                              legend: 'Gate', legendPosition: 'middle', legendOffset: 45,
+                            }}
+                            axisLeft={{
+                              tickSize: 5, tickPadding: 5, tickRotation: 0,
+                              legend: 'Time (seconds)', legendPosition: 'middle', legendOffset: -65,
+                              format: value => `${value}s`,
+                            }}
+                            colors={(boxData) => {
+                              const gateName = boxData.group;
+                              const recipeName = gateToRecipe[gateName];
+                              const baseColor = recipeColorMap[recipeName] || colors.grey[500];
+                              const alpha = subGroupColorModifier[boxData.subGroup] || 'ff';
+                              return `${baseColor}${alpha}`;
+                            }}
+                            borderRadius={2}
+                            borderWidth={2}
+                            borderColor={(boxData) => {
+                              const gateName = boxData.group;
+                              const recipeName = gateToRecipe[gateName];
+                              return recipeColorMap[recipeName] || colors.grey[500];
+                            }}
+                            medianWidth={3}
+                            medianColor={{
+                              from: 'color',
+                              modifiers: [['darker', 1]],
+                            }}
+                            whiskerEndSize={0.4}
+                            whiskerColor={(boxData) => {
+                              const gateName = boxData.group;
+                              const recipeName = gateToRecipe[gateName];
+                              return recipeColorMap[recipeName] || colors.grey[500];
+                            }}
+                            motionConfig="gentle"
+                            theme={chartTheme}
+                            enableLabel={false}
+                          />
+                        ) : (
+                          <Typography variant="body2" color={colors.grey[500]} sx={{ pt: 4, textAlign: 'center' }}>
+                            No time distribution data available
+                          </Typography>
+                        )}
+                      </Box>
+                    </Box>
+
+                    {/* Bar Chart - Batches per Gate */}
+                    <Box sx={{ width: "100%", minWidth: 0 }}>
+                      <Typography variant="h5" color={colors.tealAccent[500]} mb={1}>
+                        Batches per Gate
+                      </Typography>
+                      <Box height="400px" width="100%" sx={{ mt: '37px' }}>
+                        <ResponsiveBar
+                          data={batchesPerGate}
+                          keys={['batches']}
+                          indexBy="gate"
+                          colors={({ data }) => data.recipeColor}
+                          valueFormat={value => value.toLocaleString()}
+                          theme={chartTheme}
+                          padding={0.3}
+                          margin={{ top: 10, right: 20, bottom: 60, left: 60 }}
+                          valueScale={{ type: 'linear' }}
+                          indexScale={{ type: 'band', round: true }}
+                          borderColor={{ from: 'color', modifiers: [['darker', 1.6]] }}
+                          axisTop={null}
+                          axisRight={null}
+                          axisBottom={{
+                            tickSize: 5, tickPadding: 5, tickRotation: 0,
+                            legend: 'Gate', legendPosition: 'middle', legendOffset: 45,
+                          }}
+                          axisLeft={{
+                            tickSize: 5, tickPadding: 5, tickRotation: 0,
+                            legend: 'Batches', legendPosition: 'middle', legendOffset: -50,
+                          }}
+                          labelSkipWidth={12}
+                          labelSkipHeight={12}
+                          enableGridY={false}
+                          labelTextColor="#ffffff"
+                        />
+                      </Box>
+                    </Box>
                   </Box>
-                </Box>
-              </Box>
+                );
+              })()}
             </Box>
           );
         })()}
+
+        {/* Pieces Tab */}
+        {activeTab === 2 && <PiecesTable />}
+
+        {/* Batches Tab */}
+        {activeTab === 3 && <BatchesTable />}
       </Box>
     </Box>
   );

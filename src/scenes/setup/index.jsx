@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useLayoutEffect } from "react";
 import {
   Box,
   Button,
@@ -59,6 +59,78 @@ import api from "../../services/api";
 import useMachineState from "../../hooks/useMachineState";
 import { getSyncedAnimationStyle } from "../../utils/animationSync";
 
+class WeightControlsInner extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { presetTare: '', currentTare: 0, applying: false };
+  }
+
+  componentDidMount() {
+    api.get('/machine/weight-tare')
+      .then(res => {
+        const val = res.data?.weight_tare_g ?? 0;
+        this.setState({ currentTare: val });
+      })
+      .catch(() => {});
+  }
+
+  handleApply = () => {
+    const raw = String(this.state.presetTare).replace(',', '.');
+    const val = Math.round((parseFloat(raw) || 0) * 10) / 10;
+    // Update UI immediately (optimistic)
+    this.setState({ currentTare: val, presetTare: '', applying: true });
+    api.post('/machine/weight-tare', { weight_tare_g: val })
+      .then(() => this.setState({ applying: false }))
+      .catch((e) => {
+        console.error('Failed to apply weight tare:', e);
+        this.setState({ applying: false });
+      });
+  };
+
+  render() {
+    const { colors } = this.props;
+    const { presetTare, currentTare, applying } = this.state;
+    return (
+      <Box sx={{ mt: 6 }}>
+        <Typography variant="h4" fontWeight="bold" sx={{ mb: 1, color: colors.tealAccent[500] }}>
+          Weight Controls
+        </Typography>
+
+        {/* <Typography variant="h6" sx={{ mb: 2 }}>
+          Preset weight tare (g)
+        </Typography> */}
+
+        <Box display="flex" gap={2} alignItems="center" sx={{ mt: 3 }}>
+          <TextField
+            label="Preset Weight Tare (g)"
+            type="number"
+            color="secondary"
+            size="small"
+            value={presetTare}
+            onChange={(e) => this.setState({ presetTare: e.target.value })}
+            inputProps={{ step: 0.1, min: 0 }}
+            sx={{ flex: 1 }}
+          />
+          <Button
+            variant="contained"
+            color="secondary"
+            disabled={applying}
+            onClick={this.handleApply}
+            sx={{ flex: 1 }}
+          >
+            Apply
+          </Button>
+        </Box>
+
+        <Typography variant="h6" sx={{ mt: 2 }}>
+          Current tare: <strong>{currentTare.toFixed(1)} g</strong>
+        </Typography>
+      </Box>
+    );
+  }
+}
+const WeightControls = (props) => <WeightControlsInner {...props} />;
+
 const Setup = () => {
   const theme = useTheme();
   const colors = tokens(theme.palette.mode);
@@ -78,14 +150,15 @@ const Setup = () => {
 
   // Helper: sort queue by priority: assigned > queued > halted
   // Preserves relative order within each group (stable sort)
-  // Uses getQueueItemStatus logic to check actual machine assignment
-  const sortQueueByStatus = (queue) => {
+  // Accepts an explicit activeRecipesList to avoid stale closure issues —
+  // the local `activeRecipes` state lags behind `backendActiveRecipes` by one render.
+  const sortQueueByStatus = (queue, activeRecipesList) => {
+    const source = activeRecipesList || activeRecipes;
     const assigned = [];
     const queued = [];
     const halted = [];
     for (const item of queue) {
-      // Check if this item is actually on the machine (same logic as getQueueItemStatus)
-      const existingActive = activeRecipes.find(r => {
+      const existingActive = source.find(r => {
         if (item.orderId) return r.orderId === item.orderId;
         return r.recipeName === item.recipeName && !r.orderId;
       });
@@ -104,6 +177,25 @@ const Setup = () => {
     }
     return [...assigned, ...queued, ...halted];
   };
+
+  // Scrollbar width compensation for split-table alignment
+  const orderListBodyRef = useRef(null);
+  const orderQueueBodyRef = useRef(null);
+  const [olScrollbarW, setOlScrollbarW] = useState(0);
+  const [oqScrollbarW, setOqScrollbarW] = useState(0);
+
+  useLayoutEffect(() => {
+    const olEl = orderListBodyRef.current;
+    if (olEl) {
+      const sw = olEl.offsetWidth - olEl.clientWidth;
+      if (sw !== olScrollbarW) setOlScrollbarW(sw);
+    }
+    const oqEl = orderQueueBodyRef.current;
+    if (oqEl) {
+      const sw = oqEl.offsetWidth - oqEl.clientWidth;
+      if (sw !== oqScrollbarW) setOqScrollbarW(sw);
+    }
+  });
 
   // Recipe database state
   const [recipes, setRecipes] = useState([]);
@@ -212,6 +304,7 @@ const Setup = () => {
     gateHandoffs, // Recent gate handoff events
     clearGateHandoffs,
   } = useMachineState();
+  const setupMachineHook = { state: backendMachineState, activeRecipes: backendActiveRecipes, isConnected: machineConnected };
   
   // Track transitioning gates (for visual indicator and edit permissions)
   const [transitioningGates, setTransitioningGates] = useState([]);
@@ -524,7 +617,7 @@ const Setup = () => {
         console.log('[Queue Debug] Setting queue to', cleanedQueue.length, 'items:', cleanedQueue.map(r => r.recipeName));
         // Skip the next sync since we're loading from backend
         skipNextSyncRef.current = true;
-        setAssignedRecipes(cleanedQueue);
+        setAssignedRecipes(sortQueueByStatus(cleanedQueue));
       }
     } catch (error) {
       console.error('Failed to load order queue:', error);
@@ -587,7 +680,9 @@ const Setup = () => {
   };
 
   // Sync frontend queue from backend order queue (received via SSE machine:state-changed)
-  // This is the most reliable sync mechanism - fires on EVERY backend queue change
+  // This is the most reliable sync mechanism - fires on EVERY backend queue change.
+  // IMPORTANT: pass backendActiveRecipes directly to sortQueueByStatus because
+  // the local activeRecipes state lags behind by one render cycle.
   const prevBackendQueueStrRef = useRef(null);
   useEffect(() => {
     if (!backendOrderQueue) return;
@@ -603,8 +698,8 @@ const Setup = () => {
         gatesAssigned: item.gatesAssigned || 0,
       }));
       
-      // Sort: queued/assigned on top, halted on bottom
-      const sortedQueue = sortQueueByStatus(cleanedQueue);
+      // Sort using backendActiveRecipes (current SSE data, not stale local state)
+      const sortedQueue = sortQueueByStatus(cleanedQueue, backendActiveRecipes);
       
       console.log('[Setup] Backend queue changed via SSE, syncing frontend:', sortedQueue.length, 'items');
       skipNextSyncRef.current = true;
@@ -612,6 +707,25 @@ const Setup = () => {
       setAssignedRecipes(sortedQueue);
     }
   }, [backendOrderQueue]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Re-sort queue whenever activeRecipes or assignedRecipes change.
+  // Uses backendActiveRecipes for the most up-to-date data (local activeRecipes can lag).
+  // Only actually updates state if the order is wrong (prevents infinite loop).
+  useEffect(() => {
+    if (assignedRecipes.length === 0) return;
+    const source = backendActiveRecipes && backendActiveRecipes.length > 0
+      ? backendActiveRecipes
+      : activeRecipes;
+    if (source.length === 0) return;
+    const sorted = sortQueueByStatus(assignedRecipes, source);
+    const sortedKeys = sorted.map(r => r.recipeName).join(',');
+    const currentKeys = assignedRecipes.map(r => r.recipeName).join(',');
+    if (sortedKeys !== currentKeys) {
+      skipNextSyncRef.current = true;
+      lastQueueSyncSourceRef.current = 'active_recipes_resort';
+      setAssignedRecipes(sorted);
+    }
+  }, [activeRecipes, backendActiveRecipes, assignedRecipes]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // NOTE: assignedRecipes persistence is handled by AppContext
   // NOTE: activeRecipes is NOT persisted to localStorage
@@ -2678,7 +2792,7 @@ const Setup = () => {
       <Header title="Setup" subtitle="Set up production" />
 
       <Box 
-        mt="70px"
+        mt="54px"
         sx={{
           overflowY: "auto",
           overflowX: "visible",
@@ -2704,6 +2818,9 @@ const Setup = () => {
                 fontSize: '14px',
                 textTransform: 'none',
                 color: colors.grey[500],
+                alignItems: 'flex-start',
+                justifyContent: 'flex-start',
+                pl: 1,
               },
               '& .Mui-selected': {
                 color: `${colors.tealAccent[500]} !important`,
@@ -3070,10 +3187,19 @@ const Setup = () => {
                       borderRadius: '8px',
                       overflow: 'hidden',
                       backgroundColor: theme.palette.mode === 'dark' ? colors.primary[300] : 'inherit',
+                      display: 'flex',
+                      flexDirection: 'column',
                     }}
                   >
-                    <TableContainer sx={{ maxHeight: 300 }}>
-                      <Table size="small" stickyHeader>
+                    <Box sx={{ flexShrink: 0, overflowX: 'hidden', backgroundColor: theme.palette.mode === 'dark' ? colors.primary[200] : colors.primary[200] }}>
+                      <Table size="small" sx={{ tableLayout: 'fixed', width: olScrollbarW ? `calc(100% - ${olScrollbarW}px)` : '100%' }}>
+                        <colgroup>
+                          <col style={{ width: '12%' }} />
+                          <col style={{ width: '22%' }} />
+                          <col style={{ width: 'auto' }} />
+                          <col style={{ width: '14%' }} />
+                          <col style={{ width: '16%' }} />
+                        </colgroup>
                         <TableHead>
                           <TableRow>
                             {['Order', 'Customer', 'Recipe', 'Batches', 'Due Date'].map(col => (
@@ -3087,6 +3213,17 @@ const Setup = () => {
                             ))}
                           </TableRow>
                         </TableHead>
+                      </Table>
+                    </Box>
+                    <Box ref={orderListBodyRef} sx={{ maxHeight: 258, overflowY: 'auto', overflowX: 'hidden' }}>
+                      <Table size="small" sx={{ tableLayout: 'fixed' }}>
+                        <colgroup>
+                          <col style={{ width: '12%' }} />
+                          <col style={{ width: '22%' }} />
+                          <col style={{ width: 'auto' }} />
+                          <col style={{ width: '14%' }} />
+                          <col style={{ width: '16%' }} />
+                        </colgroup>
                         <TableBody>
                           {orders.map((order) => (
                             <TableRow
@@ -3129,7 +3266,7 @@ const Setup = () => {
                           ))}
                         </TableBody>
                       </Table>
-                    </TableContainer>
+                    </Box>
                   </Paper>
 
                   {/* Destination Radio - Show only when there are empty gates */}
@@ -3610,12 +3747,12 @@ const Setup = () => {
         </Box>
 
           {/* Machine Controls (Right) */}
-          <Box sx={{ width: "50%" }}>
+          <Box sx={{ width: "50%", alignSelf: 'flex-start' }}>
             <MachineControls 
               layout="horizontal" 
               activeRecipesCount={activeRecipes.length}
+              machineStateOverride={setupMachineHook}
               onStop={() => {
-                // Recipes stay in Active Orders for operator to finish/skip individually
                 console.log('[MachineControls.onStop] Machine stopped. Recipes remain in Active Orders for operator cleanup.');
               }}
               styles={{
@@ -3627,6 +3764,7 @@ const Setup = () => {
                 },
               }}
             />
+            <WeightControls colors={colors} />
           </Box>
         </Box>
 
@@ -3642,81 +3780,60 @@ const Setup = () => {
 
           <Paper 
             elevation={0} 
-                      sx={{ 
+            sx={{ 
               border: `1px solid ${theme.palette.mode === 'dark' ? 'inherit' : colors.grey[300]}`,
               borderRadius: '8px',
               overflow: 'hidden',
               backgroundColor: theme.palette.mode === 'dark' ? colors.primary[300] : 'inherit',
+              display: 'flex',
+              flexDirection: 'column',
             }}
           >
-            <TableContainer sx={{ maxHeight: 440 }}>
-              <Table size="small" stickyHeader>
-                <TableHead>
-                  <TableRow>
-                    <TableCell sx={{ 
-                      fontWeight: 'bold',
-                      color: theme.palette.mode === 'dark' ? colors.grey[800] : colors.grey[800],
-                      borderBottom: `2px solid ${theme.palette.mode === 'dark' ? colors.grey[500] : colors.grey[300]}`,
-                      backgroundColor: theme.palette.mode === 'dark' ? colors.primary[200] : colors.primary[200],
-                      py: 1.5,
-                      width: 60
-                    }}>#</TableCell>
-                    <TableCell sx={{ 
-                      fontWeight: 'bold',
-                      color: theme.palette.mode === 'dark' ? colors.grey[800] : colors.grey[800],
-                      borderBottom: `2px solid ${theme.palette.mode === 'dark' ? colors.grey[500] : colors.grey[300]}`,
-                      backgroundColor: theme.palette.mode === 'dark' ? colors.primary[200] : colors.primary[200],
-                      py: 1.5
-                    }}>Order</TableCell>
-                    <TableCell sx={{ 
-                      fontWeight: 'bold',
-                      color: theme.palette.mode === 'dark' ? colors.grey[800] : colors.grey[800],
-                      borderBottom: `2px solid ${theme.palette.mode === 'dark' ? colors.grey[500] : colors.grey[300]}`,
-                      backgroundColor: theme.palette.mode === 'dark' ? colors.primary[200] : colors.primary[200],
-                      py: 1.5
-                    }}>Batches</TableCell>
-                    <TableCell sx={{ 
-                      fontWeight: 'bold',
-                      color: theme.palette.mode === 'dark' ? colors.grey[800] : colors.grey[800],
-                      borderBottom: `2px solid ${theme.palette.mode === 'dark' ? colors.grey[500] : colors.grey[300]}`,
-                      backgroundColor: theme.palette.mode === 'dark' ? colors.primary[200] : colors.primary[200],
-                      py: 1.5
-                    }}>Due Date</TableCell>
-                    <TableCell sx={{ 
-                      fontWeight: 'bold',
-                      color: theme.palette.mode === 'dark' ? colors.grey[800] : colors.grey[800],
-                      borderBottom: `2px solid ${theme.palette.mode === 'dark' ? colors.grey[500] : colors.grey[300]}`,
-                      backgroundColor: theme.palette.mode === 'dark' ? colors.primary[200] : colors.primary[200],
-                      py: 1.5
-                    }}>Status</TableCell>
-                    <TableCell sx={{ 
-                      fontWeight: 'bold',
-                      color: theme.palette.mode === 'dark' ? colors.grey[800] : colors.grey[800],
-                      borderBottom: `2px solid ${theme.palette.mode === 'dark' ? colors.grey[500] : colors.grey[300]}`,
-                      backgroundColor: theme.palette.mode === 'dark' ? colors.primary[200] : colors.primary[200],
-                      py: 1.5
-                    }}>Min Gates</TableCell>
-                    <TableCell sx={{ 
-                      fontWeight: 'bold',
-                      color: theme.palette.mode === 'dark' ? colors.grey[800] : colors.grey[800],
-                      borderBottom: `2px solid ${theme.palette.mode === 'dark' ? colors.grey[500] : colors.grey[300]}`,
-                      backgroundColor: theme.palette.mode === 'dark' ? colors.primary[200] : colors.primary[200],
-                      py: 1.5
-                    }}>Assigned</TableCell>
-                    <TableCell sx={{ 
-                      fontWeight: 'bold',
-                      color: theme.palette.mode === 'dark' ? colors.grey[800] : colors.grey[800],
-                      borderBottom: `2px solid ${theme.palette.mode === 'dark' ? colors.grey[500] : colors.grey[300]}`,
-                      backgroundColor: theme.palette.mode === 'dark' ? colors.primary[200] : colors.primary[200],
-                      py: 1.5,
-                      width: 120
-                    }}>Actions</TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>
+            {(() => {
+              const qHdrSx = {
+                fontWeight: 'bold',
+                color: theme.palette.mode === 'dark' ? colors.grey[800] : colors.grey[800],
+                borderBottom: `2px solid ${theme.palette.mode === 'dark' ? colors.grey[500] : colors.grey[300]}`,
+                backgroundColor: theme.palette.mode === 'dark' ? colors.primary[200] : colors.primary[200],
+                py: 1.5,
+              };
+              const qCol = (
+                <colgroup>
+                  <col style={{ width: '7%' }} />
+                  <col style={{ width: 'auto' }} />
+                  <col style={{ width: '9%' }} />
+                  <col style={{ width: '10%' }} />
+                  <col style={{ width: '10%' }} />
+                  <col style={{ width: '8%' }} />
+                  <col style={{ width: '8%' }} />
+                  <col style={{ width: '12%' }} />
+                </colgroup>
+              );
+              return (<>
+              <Box sx={{ flexShrink: 0, overflowX: 'hidden', backgroundColor: theme.palette.mode === 'dark' ? colors.primary[200] : colors.primary[200] }}>
+                <Table size="small" sx={{ tableLayout: 'fixed', width: oqScrollbarW ? `calc(100% - ${oqScrollbarW}px)` : '100%' }}>
+                  {qCol}
+                  <TableHead>
+                    <TableRow>
+                      <TableCell sx={qHdrSx}>#</TableCell>
+                      <TableCell sx={qHdrSx}>Order</TableCell>
+                      <TableCell sx={qHdrSx}>Batches</TableCell>
+                      <TableCell sx={qHdrSx}>Due Date</TableCell>
+                      <TableCell sx={qHdrSx}>Status</TableCell>
+                      <TableCell sx={qHdrSx}>Min Gates</TableCell>
+                      <TableCell sx={qHdrSx}>Assigned</TableCell>
+                      <TableCell sx={{ ...qHdrSx, textAlign: 'right' }}>Actions</TableCell>
+                    </TableRow>
+                  </TableHead>
+                </Table>
+              </Box>
+              <Box ref={orderQueueBodyRef} sx={{ maxHeight: 398, overflowY: 'auto', overflowX: 'hidden' }}>
+                <Table size="small" sx={{ tableLayout: 'fixed' }}>
+                  {qCol}
+                  <TableBody>
                   {assignedRecipes.length === 0 ? (
                     <TableRow>
-                      <TableCell colSpan={9} align="center" sx={{ py: 4 }}>
+                      <TableCell colSpan={8} align="center" sx={{ py: 4 }}>
                         <Typography color={colors.grey[500]}>No orders in queue</Typography>
                       </TableCell>
                     </TableRow>
@@ -3734,7 +3851,7 @@ const Setup = () => {
                       <React.Fragment key={i}>
                         {hasNonHaltedAbove && (
                           <TableRow>
-                            <TableCell colSpan={7} sx={{ 
+                            <TableCell colSpan={8} sx={{ 
                               py: 0.3, 
                               px: 2,
                               borderBottom: `2px dashed ${colors.orangeAccent[500]}40`,
@@ -4022,7 +4139,7 @@ const Setup = () => {
                         {/* Expandable details row */}
                         <TableRow>
                           <TableCell 
-                            colSpan={9} 
+                            colSpan={8} 
                             sx={{ py: 0, borderBottom: expandedQueueIndex === i ? `1px solid ${colors.grey[200]}` : 'none' }}
                           >
                             <Collapse in={expandedQueueIndex === i}>
@@ -4073,7 +4190,9 @@ const Setup = () => {
                   )}
                 </TableBody>
               </Table>
-            </TableContainer>
+            </Box>
+              </>);
+            })()}
           </Paper>
 
           {editAssignedError && (
@@ -4406,13 +4525,16 @@ const Setup = () => {
                             });
                           }
                           
+                          // Hide ALL buttons for replacing (incoming) recipe rows
+                          const isReplacingRow = isIncomingFromQueue && anyRecipeFinishing && !isRecipeFinishing;
+
                           // Button visibility
                           const isStopped = machineState === "idle" && activeRecipes.length > 0;
                           const canInteract = machineState !== "running";
-                          const showEdit = !isStopped && isNormalState;
-                          const showRemove = !isStopped && (isNormalState || (isRecipeFinishing && finishingGatesEmpty));
-                          const showFinish = isStopped || isNormalState;
-                          const showSkip = isStopped || isRecipeFinishing || isRemovedRecipe;
+                          const showEdit = !isReplacingRow && !isStopped && isNormalState;
+                          const showRemove = !isReplacingRow && !isStopped && (isNormalState || (isRecipeFinishing && finishingGatesEmpty));
+                          const showFinish = !isReplacingRow && (isStopped || isNormalState);
+                          const showSkip = !isReplacingRow && (isStopped || isRecipeFinishing || isRemovedRecipe);
                           
                           // Status label
                           const isRecipePaused = !!recipe.paused;
@@ -4433,9 +4555,11 @@ const Setup = () => {
                                   {statusLabel}
                                 </Typography>
                               )}
+                              {/* Fixed-width slot container prevents flex-shrink from misaligning buttons */}
+                              <Box display="flex" sx={{ width: 112, flexShrink: 0 }}>
                               {/* Slot 0: Pause/Resume */}
                               <Box sx={{ width: 28, display: 'flex', justifyContent: 'center' }}>
-                                {!isStopped && (
+                                {!isStopped && !isReplacingRow && (
                                   <Tooltip title={recipe.paused ? "Resume" : "Pause"}>
                                     <IconButton 
                                       size="small"
@@ -4528,6 +4652,7 @@ const Setup = () => {
                                   </Tooltip>
                                 ) : null}
                               </Box>
+                              </Box>{/* end fixed-width slot container */}
                             </Box>
                           );
                         })()}

@@ -25,6 +25,8 @@ class RecipeManager {
       FROM recipes
     `).all();
     
+    this.recipes.clear();
+
     for (const row of rows) {
       let spec = this.parseRecipeName(row.id, row.name);
       
@@ -226,30 +228,26 @@ class RecipeManager {
     if (!recipe) {
       if (!this.warnedGates.has(gate)) {
         this.warnedGates.add(gate);
+        console.warn(`[recipeManager] No recipe found for gate ${gate} — cannot check batch completion`);
+      }
+      // Safety: if no recipe but gate has accumulated extreme amounts, force complete
+      if (pieces > 200 || grams > 50000) {
+        console.warn(`[recipeManager] Gate ${gate} safety reset: ${pieces} pieces, ${grams}g with no recipe`);
+        return true;
       }
       return false;
     }
 
-    // Weight-based completion
+    // Weight-based completion (use >= batchMin; batchMax is a target, not a hard ceiling)
     let weightCondition = false;
     if (recipe.batchMin > 0) {
-      if (recipe.batchMax > 0) {
-        weightCondition = grams >= recipe.batchMin && grams <= recipe.batchMax;
-      } else {
-        weightCondition = grams >= recipe.batchMin;
-      }
+      weightCondition = grams >= recipe.batchMin;
     }
 
-    // Count-based completion
+    // Count-based completion (use >= for all types to prevent stuck gates)
     let countCondition = false;
     if (recipe.countType && recipe.countVal !== null) {
-      if (recipe.countType === 'exact') {
-        countCondition = pieces === recipe.countVal;
-      } else if (recipe.countType === 'min') {
-        countCondition = pieces >= recipe.countVal;
-      } else if (recipe.countType === 'max') {
-        countCondition = pieces >= recipe.countVal;
-      }
+      countCondition = pieces >= recipe.countVal;
     }
 
     // Determine completion (OR logic)
@@ -271,30 +269,19 @@ class RecipeManager {
    */
   isBatchCompleteWithParams(gate, pieces, grams, params) {
     const batchMin = params.batchMinWeight || 0;
-    const batchMax = params.batchMaxWeight || 0;
     const countType = params.countType || null;
     const countVal = params.countValue || null;
 
-    // Weight-based completion
+    // Weight-based completion (use >= batchMin; batchMax is a target, not a hard ceiling)
     let weightCondition = false;
     if (batchMin > 0) {
-      if (batchMax > 0) {
-        weightCondition = grams >= batchMin && grams <= batchMax;
-      } else {
-        weightCondition = grams >= batchMin;
-      }
+      weightCondition = grams >= batchMin;
     }
 
-    // Count-based completion
+    // Count-based completion (use >= for all types to prevent stuck gates)
     let countCondition = false;
     if (countType && countVal !== null && countType !== 'NA') {
-      if (countType === 'exact') {
-        countCondition = pieces === countVal;
-      } else if (countType === 'min') {
-        countCondition = pieces >= countVal;
-      } else if (countType === 'max') {
-        countCondition = pieces >= countVal;
-      }
+      countCondition = pieces >= countVal;
     }
 
     // Determine completion (OR logic)
