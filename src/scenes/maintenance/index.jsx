@@ -258,7 +258,7 @@ const Maintenance = () => {
 
   // Single SSE connection for both gate overlay and machine state
   useEffect(() => {
-    const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:5001/api";
+    const API_BASE = process.env.REACT_APP_API_URL || "/api";
     const baseUrl = API_BASE.replace(/\/api\/?$/, "");
     const es = new EventSource(`${baseUrl}/api/stream/dashboard?mode=live`);
     const onTick = (ev) => {

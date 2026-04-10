@@ -1,9 +1,9 @@
 // src/scenes/kpi/index.jsx
 import React, { useMemo, useEffect, useState, useCallback, useRef } from "react";
 import { Box, Typography, useTheme, Slider } from "@mui/material";
-import { ResponsiveLine } from "@nivo/line";
+import { ResponsiveLineCanvas } from "@nivo/line";
 import { ResponsivePie } from "@nivo/pie";
-import { ResponsiveScatterPlot } from "@nivo/scatterplot";
+import { ResponsiveScatterPlotCanvas } from "@nivo/scatterplot";
 import { ResponsiveBoxPlot } from "@nivo/boxplot";
 import Header from "../../components/Header";
 import ServerOffline from "../../components/ServerOffline";
@@ -40,17 +40,6 @@ const sanitizeLineSeries = (arr) => {
         .filter(p => p.x !== undefined && p.x !== null && Number.isFinite(p.y))
     }))
     .filter(s => s.data.length > 0);
-};
-
-/* ---------- Custom scatter node ---------- */
-const ScatterNode = ({ node }) => {
-  const r = (node?.size ?? 3) / 2;
-  const a = typeof node?.data?.alpha === 'number' ? node.data.alpha : 1;
-  return (
-    <g transform={`translate(${node.x}, ${node.y})`}>
-      <circle r={r} fill={node.color} fillOpacity={a} stroke="none" />
-    </g>
-  );
 };
 
 const LegendBox = React.memo(({ chartBoxSx, legendKeys, colorMap, colors, dashboardVisibleSeries, transitioningRecipeNames, toggleSeries, getDisplayName }) => {
@@ -126,7 +115,7 @@ const MemoKPILineChart = React.memo(({ data, lineProps, lineColorFn, chartBoxSx,
     <Box sx={{ ...chartBoxSx, flex: 1 }} p="15px">
       <Typography variant="h5" color={colors.tealAccent[500]}>{title}</Typography>
       {data.length > 0 ? (
-        <ResponsiveLine data={data} colors={lineColorFn} {...lineProps} animate={false} />
+        <ResponsiveLineCanvas data={data} colors={lineColorFn} {...lineProps} />
       ) : (
         <Box display="flex" alignItems="center" justifyContent="center" height="calc(100% - 30px)">
           <Typography variant="body2" color={colors.grey[500]}>No data</Typography>
@@ -158,7 +147,7 @@ const MemoKPIScatterChart = React.memo(({ scatter, scatterProps, chartBoxSx, col
       <Typography variant="h5" color={colors.tealAccent[500]}>Piece Weight Distribution</Typography>
       <Box sx={{ height: "calc(100% - 30px)", position: "relative" }}>
         {scatter && scatter.length > 0 && scatter[0]?.data?.length > 0 ? (
-          <ResponsiveScatterPlot data={scatter} {...scatterProps} nodeComponent={ScatterNode} animate={false} />
+          <ResponsiveScatterPlotCanvas data={scatter} {...scatterProps} />
         ) : (
           <Box display="flex" alignItems="center" justifyContent="center" height="100%">
             <Typography variant="body2" color={colors.grey[500]}>No data available</Typography>

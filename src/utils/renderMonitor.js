@@ -187,7 +187,7 @@ if (typeof window !== 'undefined') {
       const mem = performance.memory || {};
       const heap = Math.round((mem.usedJSHeapSize || 0) / 1048576);
       const total = Math.round((mem.totalJSHeapSize || 0) / 1048576);
-      const dom = document.querySelectorAll('*').length;
+      const dom = document.getElementsByTagName('*').length;
       const dHeap = heap - prevHeap;
       const dDom = dom - prevDom;
       const ts = new Date().toLocaleTimeString();

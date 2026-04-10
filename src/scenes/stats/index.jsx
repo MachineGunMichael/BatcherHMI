@@ -25,7 +25,7 @@ import log from "../../services/logService";
 import PiecesTable from "./PiecesTable";
 import BatchesTable from "./BatchesTable";
 
-const API_BASE = process.env.REACT_APP_API_BASE || "http://localhost:5001";
+const API_BASE = process.env.REACT_APP_API_BASE || "";
 
 const Stats = () => {
   const theme = useTheme();

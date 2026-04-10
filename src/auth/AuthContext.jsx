@@ -11,7 +11,7 @@ const AuthContext = createContext();
 
 // Helper function to check server connectivity
 const checkServerConnectivity = async () => {
-  const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:5001';
+  const API_URL = process.env.REACT_APP_API_URL || '';
   
   try {
     const controller = new AbortController();

@@ -1,4 +1,4 @@
-const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:5001';
+const API_URL = process.env.REACT_APP_API_URL || '';
 
 // Helper function to handle fetch errors
 const handleResponse = async (response) => {

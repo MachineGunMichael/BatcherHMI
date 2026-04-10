@@ -190,7 +190,7 @@ export function useMachineState({ disabled = false } = {}) {
 
     const connectSSE = () => {
       try {
-        let baseURL = process.env.REACT_APP_API_URL || 'http://localhost:5001/api';
+        let baseURL = process.env.REACT_APP_API_URL || '/api';
         baseURL = baseURL.replace(/\/api\/?$/, '');
         const url = `${baseURL}/api/machine/stream`;
         

@@ -1,5 +1,5 @@
 export async function fetchKpiHistory(range = '15m') {
-  const base = process.env.REACT_APP_API_URL || 'http://localhost:5001';
+  const base = process.env.REACT_APP_API_URL || '';
   const token = localStorage.getItem('token');
   const res = await fetch(`${base}/api/kpi/history?range=${encodeURIComponent(range)}`, {
     headers: token ? { Authorization: `Bearer ${token}` } : {}
@@ -9,7 +9,7 @@ export async function fetchKpiHistory(range = '15m') {
 }
 
 export function openAppStream(onMessage, onError) {
-  const base = process.env.REACT_APP_API_URL || 'http://localhost:5001';
+  const base = process.env.REACT_APP_API_URL || '';
   const es = new EventSource(`${base}/api/stream`);
   es.onmessage = (evt) => {
     try {

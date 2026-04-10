@@ -15,7 +15,7 @@ import {
 import CheckIcon from "@mui/icons-material/Check";
 import { tokens } from "../../theme";
 
-const API_BASE = process.env.REACT_APP_API_BASE || "http://localhost:5001";
+const API_BASE = process.env.REACT_APP_API_BASE || "";
 
 const PiecesTable = () => {
   const theme = useTheme();

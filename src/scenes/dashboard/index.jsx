@@ -3,9 +3,9 @@ import React, { useMemo, useState, useRef, useCallback, useEffect } from "react"
 import { Box, Typography, useTheme, Paper, IconButton, Tooltip } from "@mui/material";
 import PauseIcon from "@mui/icons-material/Pause";
 import PlayArrowIcon from "@mui/icons-material/PlayArrow";
-import { ResponsiveLine } from "@nivo/line";
+import { ResponsiveLineCanvas } from "@nivo/line";
 import { ResponsivePie } from "@nivo/pie";
-import { ResponsiveScatterPlot } from "@nivo/scatterplot";
+import { ResponsiveScatterPlotCanvas } from "@nivo/scatterplot";
 import Header from "../../components/Header";
 import MachineControls from "../../components/MachineControls";
 import ServerOffline from "../../components/ServerOffline";
@@ -37,17 +37,6 @@ const sanitizeLineSeries = (arr) => {
         .filter(p => p.x !== undefined && p.x !== null && Number.isFinite(p.y))
     }))
     .filter(s => s.data.length > 0);
-};
-
-/* ---------- Scatter node ---------- */
-const ScatterNode = ({ node }) => {
-  const r = (node?.size ?? 3) / 2;
-  const a = typeof node?.data?.alpha === 'number' ? node.data.alpha : 1;
-  return (
-    <g transform={`translate(${node.x}, ${node.y})`}>
-      <circle r={r} fill={node.color} fillOpacity={a} stroke="none" />
-    </g>
-  );
 };
 
 /* ---------- Gate annotations grid (no machine image) ---------- */
@@ -370,7 +359,7 @@ const MemoScatterChart = React.memo(({ scatter, scatterProps, chartBoxSx, colors
       <Typography variant="h5" color={colors.tealAccent[500]}>Piece Weight Distribution</Typography>
       <Box sx={{ flex: 1, minHeight: 0, position: "relative" }}>
         {scatter && scatter.length > 0 && scatter[0]?.data?.length > 0 ? (
-          <ResponsiveScatterPlot data={scatter} {...scatterProps} nodeComponent={ScatterNode} animate={false} />
+          <ResponsiveScatterPlotCanvas data={scatter} {...scatterProps} />
         ) : (
           <Box display="flex" alignItems="center" justifyContent="center" height="100%">
             <Typography variant="body2" color={colors.grey[500]}>No data</Typography>
@@ -388,7 +377,7 @@ const MemoLineChart = React.memo(({ data, lineProps, lineColorFn, chartBoxSx, co
       <Typography variant="h5" color={colors.tealAccent[500]}>Pieces Processed</Typography>
       <Box sx={{ flex: 1, minHeight: 0, position: "relative" }}>
         {data.length > 0 ? (
-          <ResponsiveLine data={data} colors={lineColorFn} {...lineProps} enableArea areaOpacity={0.15} areaBaselineValue={0} animate={false} />
+          <ResponsiveLineCanvas data={data} colors={lineColorFn} {...lineProps} enableArea areaOpacity={0.15} areaBaselineValue={0} />
         ) : (
           <Box display="flex" alignItems="center" justifyContent="center" height="100%">
             <Typography variant="body2" color={colors.grey[500]}>No data</Typography>

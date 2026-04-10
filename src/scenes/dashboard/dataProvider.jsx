@@ -16,43 +16,37 @@ export const BUCKET_SEC = 60;    // bucket size in seconds for aggregation
 export const FETCH_THROTTLE_MIN = 0.5; // Only fetch if time jumped by > 3 seconds (reduced for better slider responsiveness)
 // ======================================================================
 
-/** ---------------- Sticky, per-second reservoir for LIVE scatter (smooth, capped, persistent) ---------------- */
+/** ---------------- Sticky reservoir for LIVE scatter (smooth, capped, persistent) ---------------- */
 const MAX_SCATTER_POINTS = 1000;
 const HORIZON_MS = 60 * 60 * 1000;    // last 60 minutes
-const FADE_WINDOW_MS = 5 * 60 * 1000; // last 5 min fade
-const CORE_BUDGET = Math.floor(MAX_SCATTER_POINTS * 0.8); // 80% core evenly across time
-const OUTLIER_BUDGET = MAX_SCATTER_POINTS - CORE_BUDGET;  // 20% outliers budget
 const BUCKET_INTERVAL_MS = 5000; // 5-second buckets (720 buckets in 60 minutes)
-const CORE_PER_BUCKET = Math.max(1, Math.floor(CORE_BUDGET / (HORIZON_MS / BUCKET_INTERVAL_MS))); // ~2 per 5-sec bucket
-const SCATTER_LS_KEY = "scatter_live_v3"; // Changed key for new bucket structure
+const MAX_PER_BUCKET = Math.max(2, Math.ceil(MAX_SCATTER_POINTS / (HORIZON_MS / BUCKET_INTERVAL_MS)));
+const SCATTER_LS_KEY = "scatter_live_v4";
+// --- Removed: fade/alpha, core/outlier split, quantile computation ---
+// const FADE_WINDOW_MS = 5 * 60 * 1000;
+// const CORE_BUDGET = Math.floor(MAX_SCATTER_POINTS * 0.8);
+// const OUTLIER_BUDGET = MAX_SCATTER_POINTS - CORE_BUDGET;
+// const CORE_PER_BUCKET = Math.max(1, Math.floor(CORE_BUDGET / (HORIZON_MS / BUCKET_INTERVAL_MS)));
 
 class StickyMinuteReservoir {
-  constructor({ horizonMs, fadeMs, bucketIntervalMs }) {
+  constructor({ horizonMs, bucketIntervalMs }) {
     this.horizonMs = horizonMs;
-    this.fadeMs = fadeMs;
     this.bucketIntervalMs = bucketIntervalMs;
-    this.buckets = new Map(); // bucketKey -> { core:[], outliers:[] }
-    this.seen = new Set();    // dedupe ids
-    this.stats = [];          // rolling weights for q10/q90
-    this.q10 = null; this.q90 = null;
-    this.totalCore = 0; this.totalOutliers = 0;
+    this.buckets = new Map(); // bucketKey -> point[]
+    this.seen = new Set();
+    this.totalPoints = 0;
   }
   bucketKey(t) { return Math.floor(t / this.bucketIntervalMs); }
 
-  pushWeightForStats(w) {
-    if (!Number.isFinite(w)) return;
-    this.stats.push(w);
-    if (this.stats.length > 1000) {
-      this.stats.splice(0, this.stats.length - 1000);
-    }
-  }
+  // --- Kept for API compat but no-ops; quantile logic commented out ---
+  pushWeightForStats(_w) { /* no-op */ }
+  /*
   recomputeQuantiles() {
     if (this.stats.length < 50) return;
     if (!this._quantileCounter) this._quantileCounter = 0;
     this._quantileCounter++;
     if (this._quantileCounter < 10) return;
     this._quantileCounter = 0;
-    
     const s = [...this.stats].sort((a,b)=>a-b);
     const i10 = Math.floor((s.length - 1) * 0.10);
     const i90 = Math.floor((s.length - 1) * 0.90);
@@ -61,9 +55,11 @@ class StickyMinuteReservoir {
   _isOutlier(w) {
     return this.q10 != null && this.q90 != null && (w <= this.q10 || w >= this.q90);
   }
-  _getBucket(mk) {
-    let b = this.buckets.get(mk);
-    if (!b) { b = { core: [], outliers: [] }; this.buckets.set(mk, b); }
+  */
+
+  _getBucket(bk) {
+    let b = this.buckets.get(bk);
+    if (!b) { b = []; this.buckets.set(bk, b); }
     return b;
   }
   _dropAged(nowMs) {
@@ -72,10 +68,8 @@ class StickyMinuteReservoir {
       if (bk < oldestBucket) {
         const b = this.buckets.get(bk);
         if (b) {
-          for (const p of b.core) this.seen.delete(p.id);
-          for (const p of b.outliers) this.seen.delete(p.id);
-          this.totalCore -= b.core.length;
-          this.totalOutliers -= b.outliers.length;
+          for (const p of b) this.seen.delete(p.id);
+          this.totalPoints -= b.length;
         }
         this.buckets.delete(bk);
       }
@@ -87,24 +81,18 @@ class StickyMinuteReservoir {
       if (!raw) return;
       const obj = JSON.parse(raw);
       if (!obj || !Array.isArray(obj.rows)) return;
-      const rows = obj.rows;
-      for (const r of rows) {
+      for (const r of obj.rows) {
         if (!Number.isFinite(r.t)) continue;
         if (nowMs - r.t > this.horizonMs) continue;
         const id = r.id ?? `${r.t}-${r.g ?? ''}-${Math.round((r.w ?? 0)*10)}`;
         if (this.seen.has(id)) continue;
+        if (this.totalPoints >= MAX_SCATTER_POINTS) break;
         const bk = this.bucketKey(r.t);
         const b = this._getBucket(bk);
-        const p = { id, t: r.t, weight_g: r.w ?? 0, gate: r.g ?? 0, isOutlier: !!r.o };
-        if (p.isOutlier) {
-          if (this.totalOutliers < OUTLIER_BUDGET) {
-            b.outliers.push(p); this.totalOutliers++; this.seen.add(id);
-          }
-        } else {
-          if (b.core.length < CORE_PER_BUCKET && this.totalCore < CORE_BUDGET) {
-            b.core.push(p); this.totalCore++; this.seen.add(id);
-          }
-        }
+        if (b.length >= MAX_PER_BUCKET) continue;
+        b.push({ id, t: r.t, weight_g: r.w ?? 0, gate: r.g ?? 0 });
+        this.totalPoints++;
+        this.seen.add(id);
       }
     } catch {}
   }
@@ -112,69 +100,44 @@ class StickyMinuteReservoir {
     try {
       const rows = [];
       const oldestBucket = this.bucketKey(nowMs - this.horizonMs);
-      for (const [bk, b] of this.buckets) {
+      for (const [bk, pts] of this.buckets) {
         if (bk < oldestBucket) continue;
-        for (const p of b.core) rows.push({ id: p.id, t: p.t, w: p.weight_g, g: p.gate, o: 0 });
-        for (const p of b.outliers) rows.push({ id: p.id, t: p.t, w: p.weight_g, g: p.gate, o: 1 });
+        for (const p of pts) rows.push({ id: p.id, t: p.t, w: p.weight_g, g: p.gate });
       }
       localStorage.setItem(SCATTER_LS_KEY, JSON.stringify({ rows }));
     } catch {}
   }
   clear() {
-    // Clear all data from the reservoir (used when recipe changes)
     this.buckets.clear();
     this.seen.clear();
-    this.stats = [];
-    this.q10 = null;
-    this.q90 = null;
-    this.totalCore = 0;
-    this.totalOutliers = 0;
-    // Also clear localStorage
-    try {
-      localStorage.removeItem(SCATTER_LS_KEY);
-    } catch {}
+    this.totalPoints = 0;
+    try { localStorage.removeItem(SCATTER_LS_KEY); } catch {}
     console.log('📋 [RESERVOIR] Cleared scatter reservoir');
   }
   addPoint({ id, t, weight_g, gate }, nowMs) {
     if (!Number.isFinite(t)) return;
     if (nowMs - t > this.horizonMs) return;
     if (id != null && this.seen.has(id)) return;
+    if (this.totalPoints >= MAX_SCATTER_POINTS) return;
 
     const bk = this.bucketKey(t);
-    const isOut = this._isOutlier(weight_g);
-    const p = { id: id ?? `${t}-${gate ?? ''}-${Math.round(weight_g*10)}`, t, weight_g, gate, isOutlier: isOut };
     const b = this._getBucket(bk);
-
-    if (isOut) {
-      if (this.totalOutliers >= OUTLIER_BUDGET) return; // keep view stable
-      b.outliers.push(p); this.totalOutliers++; this.seen.add(p.id);
-    } else {
-      if (b.core.length >= CORE_PER_BUCKET || this.totalCore >= CORE_BUDGET) return;
-      b.core.push(p); this.totalCore++; this.seen.add(p.id);
-    }
+    if (b.length >= MAX_PER_BUCKET) return;
+    const p = { id: id ?? `${t}-${gate ?? ''}-${Math.round(weight_g*10)}`, t, weight_g, gate };
+    b.push(p);
+    this.totalPoints++;
+    this.seen.add(p.id);
   }
   snapshot(nowMs) {
     this._dropAged(nowMs);
     const start = this.bucketKey(nowMs - this.horizonMs);
     const end   = this.bucketKey(nowMs);
-    const fadeStart = this.horizonMs - this.fadeMs;
-    const annotate = (p) => {
-      const age = nowMs - p.t;
-      let alpha = 1;
-      if (age > fadeStart) {
-        const over = Math.min(this.fadeMs, age - fadeStart);
-        alpha = Math.max(0, 1 - (over / this.fadeMs));
-      }
-      return { ...p, alpha };
-    };
     const out = [];
     for (let bk = start; bk <= end; bk++) {
       const b = this.buckets.get(bk);
-      if (!b) continue;
-      for (const p of b.core) out.push(annotate(p));
-      for (const p of b.outliers) out.push(annotate(p));
+      if (b) for (const p of b) out.push(p);
     }
-    return out; // time-ordered by bucket + insertion order
+    return out;
   }
 }
 
@@ -466,15 +429,12 @@ function toRejectsSeries({ m3Combined, color }) {
   return color ? [{ id: "Total", color, data: byTs }] : [];
 }
 
-/** 👉 UPDATED: include id & alpha; x is numeric ms */
 function toScatterSeries(m1Recent) {
   return [{
     id: "Pieces",
     data: (m1Recent || []).map(p => ({
-      x: p.t ?? p.x, // p.t is numeric ms now
+      x: p.t ?? p.x,
       y: Number(p.weight_g ?? p.y ?? 0),
-      id: p.id ?? `${p.t}-${p.weight_g}`, // stable id
-      alpha: p.alpha ?? 1, // fading support
     }))
   }];
 }
@@ -652,9 +612,8 @@ export function useDashboardData() {
           
           // init sticky live reservoir and hydrate persisted points
           if (!reservoirRef.current) {
-            reservoirRef.current = new StickyMinuteReservoir({ 
-              horizonMs: HORIZON_MS, 
-              fadeMs: FADE_WINDOW_MS,
+            reservoirRef.current = new StickyMinuteReservoir({
+              horizonMs: HORIZON_MS,
               bucketIntervalMs: BUCKET_INTERVAL_MS
             });
             reservoirRef.current.hydrateFromStorage(Date.now());
@@ -714,7 +673,6 @@ export function useDashboardData() {
 
         // Build timeline from throughput total data
         const tl = buildTimelineFromCombined(throughputData?.total || []);
-        setXTicks(tl);
 
         // Convert history API format to internal format
         const m3ByRecipe = {};
@@ -734,7 +692,6 @@ export function useDashboardData() {
             weight_processed_g: wMap.get(r.t) || 0
           }));
         });
-        setM3ByRecipe(m3ByRecipe);
 
         // Build combined data, filtering rejects based on program start time
         const combinedData = (throughputData?.total || []).map(r => {
@@ -743,7 +700,6 @@ export function useDashboardData() {
           const weightProcessedRow = (weightProcessedData?.total || []).find(w => w.t === r.t);
           const rejectsRow = (rejectsData || []).find(re => re.t === r.t);
           
-          // Filter rejects: zero out data from before current program start (live mode only)
           let rejectsPerMin = rejectsRow?.v || 0;
           let totalRejectsCount = rejectsRow?.total_rejects_count || 0;
           let totalRejectsWeightG = rejectsRow?.total_rejects_weight_g || 0;
@@ -751,7 +707,6 @@ export function useDashboardData() {
           if (mode === 'live' && programStartTimeRef.current) {
             const itemTime = typeof r.t === 'number' ? r.t : new Date(r.t).getTime();
             if (itemTime < programStartTimeRef.current) {
-              // Data from before current program - zero out rejects
               rejectsPerMin = 0;
               totalRejectsCount = 0;
               totalRejectsWeightG = 0;
@@ -769,11 +724,10 @@ export function useDashboardData() {
             total_rejects_weight_g: totalRejectsWeightG
           };
         });
-        setM3Combined(combinedData);
 
-        // ---------- M1 scatter window seed ----------
+        // ---------- M1 scatter (compute snapshot, don't setState yet) ----------
+        let m1Snapshot = null;
         if (mode === "live") {
-          // ---------- LIVE: Seed reservoir from window ----------
           const res = reservoirRef.current;
           if (res) {
             const seed = [];
@@ -792,46 +746,34 @@ export function useDashboardData() {
                 res.pushWeightForStats(p.weight_g);
                 res.addPoint({ id: p.id ?? `${p.t}-${p.gate}-${Math.round(p.weight_g*10)}`, t: p.t, weight_g: p.weight_g, gate: p.gate }, Date.now());
               });
-            setM1Recent(res.snapshot(Date.now()));
+            m1Snapshot = res.snapshot(Date.now());
           }
         } else {
-          // ---------- REPLAY: keep existing scatter sampling code as-is ----------
           const scatter = [];
           Object.values(m1Data || {}).forEach(list => {
             (list || []).forEach(p => scatter.push({ t: p.t, weight_g: Number(p.weight_g || 0) }));
           });
-
-          // Sample if too many points - preserve outliers
           let sampledScatter = scatter;
           const MAX_POINTS = 500;
           if (scatter.length > MAX_POINTS) {
             const outlierCount = Math.floor(MAX_POINTS * 0.2);
             const topCount = Math.floor(outlierCount / 2);
             const bottomCount = outlierCount - topCount;
-
             const sortedByWeight = [...scatter].sort((a, b) => a.weight_g - b.weight_g);
             const bottomOutliers = sortedByWeight.slice(0, bottomCount);
             const topOutliers = sortedByWeight.slice(-topCount);
-
             const outlierKey = new Set([...bottomOutliers, ...topOutliers].map(p => `${p.t}-${p.weight_g}`));
             const middlePoints = scatter.filter(p => !outlierKey.has(`${p.t}-${p.weight_g}`));
-
             const middleTarget = MAX_POINTS - outlierCount;
             const step = Math.max(1, Math.floor(middlePoints.length / middleTarget));
             const sampledMiddle = middlePoints.filter((_, i) => i % step === 0);
-
             sampledScatter = [...bottomOutliers, ...topOutliers, ...sampledMiddle];
           }
-
-          // Sort by time for display/seed and convert to numeric ms
-          const sampledScatterNumeric = sampledScatter
+          m1Snapshot = sampledScatter
             .map(p => ({ t: typeof p.t === 'number' ? p.t : Date.parse(p.t), weight_g: p.weight_g }))
             .filter(p => Number.isFinite(p.t))
             .sort((a, b) => a.t - b.t);
-          
-          setM1Recent(sampledScatterNumeric);
         }
-        // ---------- end M1 seed ----------
 
         // M2 overlay (pieces and grams per gate — now with main/buffer compartments)
         const overlayMap = {};
@@ -845,41 +787,26 @@ export function useDashboardData() {
             grams: item.grams || 0,
           };
         });
-        setOverlayByGate(overlayMap);
 
-        // Get assignments at current time
+        // ── Async phase: fetch all remaining data BEFORE setting any state ──
         const assigns = await getJSON(API.assignmentsAt(to.toISOString()));
         if (aborted) return;
 
         const assignMap = {};
-        const assignmentsArray = assigns?.assignments || [];
-        
-        assignmentsArray.forEach(r => { 
-          assignMap[Number(r.gate)] = r.recipe_name; 
+        (assigns?.assignments || []).forEach(r => {
+          assignMap[Number(r.gate)] = r.recipe_name;
         });
-        setAssignmentsByGate(assignMap);
 
-        // Extract unique recipes from SQLite assignments (SOURCE OF TRUTH)
         const activeRecipeNames = Array.from(new Set(Object.values(assignMap).filter(Boolean)));
-        
-        // Use liveActiveRecipes from tick if available (has orderId, gates, etc.)
+
         const tickRecipes = liveActiveRecipesRef.current || [];
         const newColorMap = tickRecipes.length > 0
           ? buildColorMap(activeRecipeNames, PALETTE, TOTAL_COLOR, tickRecipes)
           : buildColorMap(activeRecipeNames, PALETTE, TOTAL_COLOR);
-        setColorMap(prev => {
-          const merged = { ...prev, ...newColorMap };
-          return merged;
-        });
-        
-        // M3 data: keep all recipes from the API (no filtering to assignments).
-        // The chart rendering only shows recipes present in colorMap.
-        // No need to override setM3ByRecipe — already set above (line ~727).
 
-        // Fetch giveaway data from batch_completions, scoped by order_id when available
+        let cumulativePies = [];
         if (activeRecipeNames.length > 0) {
           try {
-            const tickRecipes = liveActiveRecipesRef.current || [];
             const orderLookup = {};
             tickRecipes.forEach(r => { if (r.orderId) orderLookup[r.recipeName] = r.orderId; });
             const recipeOrders = activeRecipeNames.map(name => ({
@@ -896,16 +823,13 @@ export function useDashboardData() {
               body: JSON.stringify({ recipeOrders }),
             });
             if (!resp.ok) throw new Error(`pies-cumulative → ${resp.status}`);
-            const cumulativePies = await resp.json();
-            if (!aborted) setM4Breakdown(cumulativePies || []);
+            cumulativePies = (await resp.json()) || [];
           } catch (e) {
             console.warn('⚠️ Cumulative pies fetch failed:', e.message);
           }
-        } else {
-          setM4Breakdown([]);
         }
 
-        // Fetch gate timing data for current program (boxplots)
+        let gateTimingResult = null;
         const pid = currentProgramIdRef.current;
         if (pid) {
           try {
@@ -914,23 +838,24 @@ export function useDashboardData() {
               getJSON(`/api/stats/programs/${pid}/ack-times`),
               getJSON(`/api/stats/programs/${pid}/blocked-times`),
             ]);
-            if (!aborted) {
-              setGateTimingData({
-                dwell: dwellData || [],
-                ack: ackData || [],
-                blocked: blockedData || [],
-              });
-            }
+            gateTimingResult = { dwell: dwellData || [], ack: ackData || [], blocked: blockedData || [] };
           } catch (e) {
             console.warn('⚠️ Gate timing fetch failed:', e.message);
           }
         }
-        
-        if (process.env.NODE_ENV !== 'production') {
-          console.log('✅ Data fetch complete:',
-            `{m3Recipes: ${Object.keys(m3ByRecipe).length}, m1Points: ${mode === "live" ? (reservoirRef.current?.totalCore + reservoirRef.current?.totalOutliers || 0) : 'seeded'}, xTicks: ${tl.length}, overlayGates: ${Object.keys(overlayMap).length}, assignments: ${Object.keys(assignMap).length}}`
-          );
-        }
+
+        if (aborted) return;
+
+        // All state set synchronously — React batches into a single render
+        setXTicks(tl);
+        setM3ByRecipe(m3ByRecipe);
+        setM3Combined(combinedData);
+        if (m1Snapshot) setM1Recent(m1Snapshot);
+        setOverlayByGate(overlayMap);
+        setAssignmentsByGate(assignMap);
+        setColorMap(prev => ({ ...prev, ...newColorMap }));
+        setM4Breakdown(cumulativePies);
+        if (gateTimingResult) setGateTimingData(gateTimingResult);
       } catch (err) {
         console.error("❌ Failed to fetch data window:", err);
       } finally {
@@ -973,9 +898,8 @@ export function useDashboardData() {
 
     // Ensure reservoir exists (live)
     if (!reservoirRef.current) {
-      reservoirRef.current = new StickyMinuteReservoir({ 
-        horizonMs: HORIZON_MS, 
-        fadeMs: FADE_WINDOW_MS,
+      reservoirRef.current = new StickyMinuteReservoir({
+        horizonMs: HORIZON_MS,
         bucketIntervalMs: BUCKET_INTERVAL_MS
       });
       reservoirRef.current.hydrateFromStorage(Date.now());
@@ -1246,13 +1170,13 @@ export function useDashboardData() {
     };
     attachListeners(es);
 
-    // Smooth renderer: flush reservoir → React state every 5s + persist ~10s
+    // Flush reservoir → React state every 5s + persist ~10s (single timer)
     let lastFlushCount = -1;
     const flushTimer = setInterval(() => {
-      if (!isPageVisible()) return; // skip React updates while backgrounded
+      if (!isPageVisible()) return;
       const now = Date.now();
       if (res) {
-        const currentCount = res.totalCore + res.totalOutliers;
+        const currentCount = res.totalPoints;
         if (currentCount !== lastFlushCount) {
           setM1Recent(res.snapshot(now));
           lastFlushCount = currentCount;
@@ -1264,26 +1188,20 @@ export function useDashboardData() {
       }
     }, 5000);
 
-    const qTimer = setInterval(() => {
-      res?.recomputeQuantiles();
-    }, 5000);
-
     // Visibility change: flush all pending data and trigger fresh fetch when tab becomes visible
     const onVisibilityChange = () => {
       if (!isPageVisible()) return;
       flushPendingOverlay();
       const now = Date.now();
       if (res) {
-        const currentCount = res.totalCore + res.totalOutliers;
+        const currentCount = res.totalPoints;
         if (currentCount !== lastFlushCount) {
           setM1Recent(res.snapshot(now));
           lastFlushCount = currentCount;
         }
       }
-      // Sync ref-only updates that accumulated while hidden
       setProgramStartTime(prev => prev === programStartTimeRef.current ? prev : programStartTimeRef.current);
       if (currentProgramIdRef.current) setCurrentProgramId(currentProgramIdRef.current);
-      // Trigger a fresh data fetch by updating currentTime
       setCurrentTime(now);
       lastFetchTimeRef.current = now;
     };
@@ -1294,7 +1212,6 @@ export function useDashboardData() {
       removeListeners(es);
       es.close();
       clearInterval(flushTimer);
-      clearInterval(qTimer);
       clearInterval(staleCheck);
       if (overlayFlushTimer) clearTimeout(overlayFlushTimer);
     };
